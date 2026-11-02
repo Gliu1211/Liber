@@ -16,6 +16,10 @@ conversation tables hold hashes, positions and token counts, never content.
 
 Tables are created with `create_all` at startup, and columns added since an older version are
 added in place (`add_missing_columns`). Alembic migrations come once the schema settles (§8).
+
+Checkpoints (docs/decisions/0008): commits never copy the write-ahead log into the database
+file themselves (`configure_sqlite`); `checkpoint_regularly`, a background task the app runs,
+does it instead, so that work never lands on the request path.
 """
 
 import asyncio
@@ -26,11 +30,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+import structlog
 from sqlalchemy import Connection, DateTime, Table, Text, bindparam, create_engine, event, inspect, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 T = TypeVar("T")
+
+log = structlog.get_logger(__name__)
 
 # The only request headers worth keeping: they change how the API behaves. Never credentials.
 RECORDED_REQUEST_HEADERS = frozenset({"anthropic-version", "anthropic-beta", "content-type", "user-agent"})
@@ -189,10 +196,16 @@ def configure_sqlite(dbapi_connection: Any, connection_record: Any) -> None:
     WAL journaling with synchronous=NORMAL is the usual setup for an application database:
     commits append to a log instead of syncing the whole file to disk, which keeps the request
     path fast. A crash can't corrupt the database; a power loss can lose the last few writes.
+
+    wal_autocheckpoint=0: by default the commit that takes the log past 1000 pages also copies
+    the log back into the database file (a checkpoint, ~10 ms), and that commit can be a
+    request's. Every connection here can serve a request, so none of them checkpoint;
+    checkpoint_regularly does it in the background (docs/decisions/0008).
     """
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA wal_autocheckpoint=0")
     cursor.close()
 
 
@@ -259,8 +272,41 @@ class Store:
         )
         return await self.run(lambda db: list(db.scalars(query)))
 
+    async def checkpoint(self) -> tuple[int, int, int]:
+        """Copy the write-ahead log into the database file, in a worker thread.
+
+        PASSIVE: copies what it can without waiting for other connections, which carry on
+        reading and writing meanwhile, so a request running at the same time isn't held up.
+        Returns SQLite's (busy, pages in the log, pages copied). Once every page is copied, the
+        next commit starts the log over from the beginning, which is what keeps it from growing.
+        """
+
+        def run_checkpoint() -> tuple[int, int, int]:
+            # No transaction is open here (Python's sqlite3 only opens one before a write), which
+            # SQLite requires: a connection inside a transaction can't checkpoint.
+            with self.engine.connect() as connection:
+                busy, log_pages, copied = connection.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)").one()
+            return busy, log_pages, copied
+
+        return await asyncio.to_thread(run_checkpoint)
+
     async def close(self) -> None:
+        # The last connection to close also checkpoints and deletes the log (SQLite does this).
         await asyncio.to_thread(self.engine.dispose)
+
+
+async def checkpoint_regularly(store: Store, every_seconds: float) -> None:
+    """Checkpoint the store every `every_seconds` until cancelled. The app runs this in its lifespan.
+
+    The log then holds about `every_seconds` worth of writes. A failed checkpoint is logged and
+    tried again next time: nothing is lost meanwhile, the log just grows a little longer.
+    """
+    while True:
+        await asyncio.sleep(every_seconds)
+        try:
+            await store.checkpoint()
+        except Exception:
+            log.exception("wal_checkpoint_failed")
 
 
 # --- Queries used by session/chain.py, inside its transaction -------------------------------

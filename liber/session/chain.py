@@ -108,6 +108,38 @@ def root_hash(system: Any, tools: Any) -> str:
     return sha256_hex(canonical_json({"system": system_blocks, "tools": tool_definitions}))
 
 
+def has_numbers(value: Any) -> bool:
+    """Does a decoded JSON value hold a number, true or false anywhere?
+
+    parse() records this per message, because Python's == treats 1, 1.0 and True as equal while
+    their canonical JSON differs (see same_json).
+    """
+    if isinstance(value, dict):
+        return any(has_numbers(item) for item in value.values())
+    if isinstance(value, list):
+        return any(has_numbers(item) for item in value)
+    return isinstance(value, int | float)  # bool is a subclass of int, so True and False count too
+
+
+def same_json(a: Any, b: Any) -> bool:
+    """Do two decoded JSON values have the same canonical form? (Without computing it.)
+
+    Like ==, except that 1, 1.0 and True are all different, as are 0.0 and -0.0, because
+    canonical_json writes them differently. Key order doesn't matter, as in canonical form.
+    It walks the values in Python, so parse() uses it only for messages with numbers in them and
+    plain == (which runs in C) for the rest.
+    """
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(same_json(value, b[key]) for key, value in a.items())
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same_json(x, y) for x, y in zip(a, b, strict=True))
+    if isinstance(a, float):
+        return repr(a) == repr(b)  # the JSON spelling: tells 0.0 from -0.0, and NaN equals NaN
+    return bool(a == b)
+
+
 def message_hash(previous_hash: str, message: dict[str, Any], block_hashes: list[str]) -> str:
     """h_i = H(h_{i-1} || canonical(message_i)).
 

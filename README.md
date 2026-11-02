@@ -77,6 +77,7 @@ Settings are environment variables prefixed with `LIBER_` (see `liber/config.py`
 | `LIBER_DATA_DIR` | `~/.liber` | Holds `liber.db` (and, later, offloaded content). |
 | `LIBER_RECORD_BODIES` | `true` | Store request/response bodies. Usage and latency are always stored. |
 | `LIBER_UPSTREAM_READ_TIMEOUT` | `600` | Longest silence (seconds) tolerated while streaming. |
+| `LIBER_WAL_CHECKPOINT_SECONDS` | `1.0` | How often a background task copies SQLite's write-ahead log into `liber.db`. Requests never do it ([ADR 0008](docs/decisions/0008-wal-checkpoints-in-the-background.md)). |
 | `LIBER_LOG_LEVEL` | `INFO` | Log level. |
 
 ## Development
@@ -105,6 +106,10 @@ send, through Liber's model functions and its real request path, and writes:
 records the baseline, with the Makefile's baseline target, in a dedicated PR that explains the
 new numbers (§12). Until it exists, the gate only warns. To add a session, see
 `tests/fixtures/README.md`.
+
+`uv run python scripts/bench_request_path.py` times the request path beyond what the gate
+checks: p95 and max of each Tier 1 replay run, and a synthetic ~1 MB, 401-message conversation.
+It reports and doesn't gate.
 
 Tests run fully offline. A fake upstream is plugged into the proxy's httpx client, plus a real
 uvicorn server on localhost for the streaming-timing tests. No API key is needed.

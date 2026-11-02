@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     upstream_connect_timeout: float = 10.0
     upstream_read_timeout: float = 600.0
 
+    # How often a background task copies SQLite's write-ahead log into the database file.
+    # Requests never do it themselves (docs/decisions/0008). SQLite's own default waits for
+    # 1000 pages (~4 MB); a second of Liber's writes is usually far less than that.
+    wal_checkpoint_seconds: float = 1.0
+
     log_level: str = "INFO"
 
     @property
