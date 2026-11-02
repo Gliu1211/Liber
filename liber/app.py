@@ -18,7 +18,6 @@ failure in it is logged and the request still goes through.
 """
 
 import asyncio
-import contextlib
 import json
 import time
 from collections.abc import AsyncIterator, Callable
@@ -43,7 +42,7 @@ from liber.proxy.forward import (
     streaming_response,
 )
 from liber.proxy.sse import CapturedReply, ReplyCapture
-from liber.session.store import RequestRecord, Store, checkpoint_regularly, recordable_headers
+from liber.session.store import RequestRecord, Store, checkpointing, recordable_headers
 
 log = structlog.get_logger(__name__)
 
@@ -66,16 +65,15 @@ def create_app(settings: Settings | None = None, upstream_transport: httpx.Async
         await store.create_tables()
         app.state.store = store
         app.state.client = create_upstream_client(settings, upstream_transport)
-        checkpoints = asyncio.create_task(checkpoint_regularly(store, settings.wal_checkpoint_seconds))
         try:
-            yield
+            async with checkpointing(store, settings.wal_checkpoint_seconds):
+                try:
+                    yield
+                finally:
+                    # Shutdown: finish recording in-flight exchanges before closing the database.
+                    await wait_for_pending_writes(app)
+                    await app.state.client.aclose()
         finally:
-            # Shutdown: finish recording in-flight exchanges before closing the database.
-            await wait_for_pending_writes(app)
-            await app.state.client.aclose()
-            checkpoints.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await checkpoints
             await store.close()  # the last connection to close checkpoints what's left
 
     # docs/redoc/openapi are switched off: those paths belong to the upstream API, and the proxy

@@ -10,6 +10,9 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Also used by the Tier 1 harness, which must not depend on the developer's LIBER_* variables.
+DEFAULT_WAL_CHECKPOINT_SECONDS = 1.0
+
 
 def _default_data_dir() -> Path:
     return Path.home() / ".liber"
@@ -42,7 +45,8 @@ class Settings(BaseSettings):
     # How often a background task copies SQLite's write-ahead log into the database file.
     # Requests never do it themselves (docs/decisions/0008). SQLite's own default waits for
     # 1000 pages (~4 MB); a second of Liber's writes is usually far less than that.
-    wal_checkpoint_seconds: float = 1.0
+    # Must be > 0: zero would make the background task checkpoint in a tight loop.
+    wal_checkpoint_seconds: float = Field(default=DEFAULT_WAL_CHECKPOINT_SECONDS, gt=0)
 
     log_level: str = "INFO"
 

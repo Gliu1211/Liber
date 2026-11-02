@@ -26,12 +26,12 @@ import tempfile
 from pathlib import Path
 
 from liber import pipeline
-from liber.config import Settings
+from liber.config import DEFAULT_WAL_CHECKPOINT_SECONDS
 from liber.evals.metrics import p95
 from liber.evals.replay import SessionFixture, load_sessions, replay
 from liber.evals.tier1 import DEFAULT_SESSIONS, WARMUP_BODY
 from liber.model.anthropic import RecentRequests
-from liber.session.store import Store, checkpoint_regularly
+from liber.session.store import Store, checkpointing
 
 LAST_TURNS = 20  # turns of the ~1 MB session that are measured (all of them ~1 MB)
 
@@ -42,12 +42,11 @@ async def time_request_path(bodies: list[bytes]) -> list[float]:
         store = Store(Path(directory) / "liber.db")
         await store.create_tables()
         recent = RecentRequests()
-        checkpoints = asyncio.create_task(checkpoint_regularly(store, Settings().wal_checkpoint_seconds))
         try:
-            await pipeline.prepare(store, WARMUP_BODY, recent)
-            return [(await pipeline.prepare(store, body, recent)).overhead_ms or 0.0 for body in bodies]
+            async with checkpointing(store, DEFAULT_WAL_CHECKPOINT_SECONDS):
+                await pipeline.prepare(store, WARMUP_BODY, recent)
+                return [(await pipeline.prepare(store, body, recent)).overhead_ms or 0.0 for body in bodies]
         finally:
-            checkpoints.cancel()
             await store.close()
 
 
@@ -55,7 +54,8 @@ def large_session(exchanges: int = 40, tool_rounds: int = 4, file_lines: int = 8
     """A Claude Code-shaped session: per exchange, a task, tool rounds with thinking, an answer.
 
     Same shape as tests/fixtures/requests/build_long_session.py, scaled up: the defaults give
-    401 messages and ~1 MB, with a ~11 KB system prompt and 15 tool definitions.
+    401 messages and ~1 MB, with a ~11 KB system prompt and 15 tool definitions. Every tool call
+    and tool result holds a number or a boolean.
     """
     messages: list[dict[str, object]] = []
     tool_number = 0
@@ -85,14 +85,19 @@ def large_session(exchanges: int = 40, tool_rounds: int = 4, file_lines: int = 8
                             "type": "tool_use",
                             "id": tool_id,
                             "name": "read_file",
-                            "input": {"path": f"src/module_{exchange}/part_{round_number}.py"},
+                            # Numbers, as in Claude Code's tool calls: these messages take parse()'s
+                            # slower type-checking comparison (ADR 0007), so it's measured too.
+                            "input": {
+                                "path": f"src/module_{exchange}/part_{round_number}.py",
+                                "offset": 0,
+                                "limit": 200,
+                            },
                         },
                     ],
                 }
             )
-            messages.append(
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": code}]}
-            )
+            result = {"type": "tool_result", "tool_use_id": tool_id, "content": code, "is_error": False}
+            messages.append({"role": "user", "content": [result]})
         messages.append({"role": "assistant", "content": [{"type": "text", "text": f"Done with task {exchange}."}]})
     messages.append({"role": "user", "content": "Great. Now summarise every change."})
     request = {

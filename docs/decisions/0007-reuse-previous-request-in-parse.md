@@ -69,23 +69,36 @@ pick costs only reuse, never correctness, because `parse()` checks everything it
 concurrent requests can't interleave there. A failure in any of them is caught like any other:
 the client's bytes are forwarded (hard rule 1, tested).
 
-**What this relies on:** `previous.original` still holds what its hashes were computed from.
-`parse()` and `render()` never modify the request (tested since Session 2). If something did, the
-comparison would almost always fail and the message would simply be hashed again.
+**What this relies on (a requirement for Session 4):** `previous.original` still holds what its
+hashes were computed from. `parse()` and `render()` never modify the request (tested since
+Session 2). Usually a modification would only make the comparison fail and the message be
+hashed again. But if a modified block happened to equal what the client sends next, stale
+hashes would be reused. So `plan/apply.py` must build new blocks and never edit the client's
+blocks in place, which the validator's separate copy already assumes.
+
+**Deep nesting:** `has_numbers` and `same_json` loop over a to-do list instead of recursing, so
+JSON nested as deeply as `json.loads` allows doesn't make a request fall back (tested at 600
+levels; a recursive version failed at ~330).
 
 ## Results
-Same machine, same protocol before and after: `scripts/bench_request_path.py` (request path set
-up like the app, results not retained; "before" ran it without the two lines that create the
-cache and the checkpoint task, which didn't exist yet) and `make eval` (the gate's numbers).
+Same machine, back to back, same inputs. "Before" is the Session 3 commit run from a git
+worktree. Two tools: `scripts/bench_request_path.py`, which sets the request path up like the app
+and keeps no results; for "before" it ran without the two lines that create the cache and the
+checkpoint task, which didn't exist yet. And `make eval`, the gate's own numbers. The ~1 MB
+session's tool calls and results carry numbers and booleans, so the slower `same_json`
+comparison is included.
 
 | | before | after |
 |---|---|---|
 | `parse()` on the 101-message fixture's last turn (best of 30) | 2.8 ms | 0.85 ms |
-| `parse()` on the ~1 MB request's last turn (best of 30) | 14.7 ms | 3.5 ms |
-| Tier 1 replay p95 (bench, median of 10 runs) | 7.0 ms | 5.5 ms |
-| Tier 1 `p95_overhead_ms` (`make eval`, median of 5) | 7.0 ms | see PROGRESS / PR |
-| ~1 MB request, p95 over the last 20 turns (3 runs) | 35-44 ms | 22-29 ms |
-| ~1 MB request, mean over the last 20 turns (3 runs) | 29-32 ms | 16-20 ms |
+| `parse()` on the ~1 MB request's last turn (best of 30, no numbers) | 14.7 ms | 3.5 ms |
+| Tier 1 `p95_overhead_ms` (`make eval`, 5 runs: median, range) | 6.35 (6.14-6.73) ms | 5.41 (4.75-5.79) ms |
+| Tier 1 replay p95 (bench, 10 runs: median) | 6.69 ms | 5.38 ms |
+| ~1 MB request, p95 over its last 20 turns (bench, 3 runs) | 35.4 / 39.6 / 45.7 ms | 25.9 / 18.6 / 19.0 ms |
+| ~1 MB request, mean over its last 20 turns (bench, 3 runs) | 25.4 / 26.5 / 33.5 ms | 23.8 / 17.2 / 19.0 ms |
+
+Timings on this machine vary by about ±20% between runs, so compare medians. ADR 0008 covers
+the max columns.
 
 All Tier 1 metrics other than timing are unchanged, and the per-request trace (outcomes,
 known/new messages, `rendered_sha256`, token estimates) is identical apart from `overhead_ms`.
@@ -106,3 +119,7 @@ known/new messages, `rendered_sha256`, token estimates) is identical apart from 
   4. Option 2 above.
 - More long-lived objects make Python's full (generation 2) garbage collections slower. Those
   collections are now the main source of single slow requests (see ADR 0008).
+- A conversation keeps one entry, so two requests that start alike (a retry or an edited prompt
+  next to the original, or a side request with the same opening) take turns replacing each
+  other. Reuse then stops where they diverge. That costs speed only; revisit if it shows up in
+  measurements, e.g. by replacing an entry only with a request at least as long.

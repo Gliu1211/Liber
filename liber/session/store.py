@@ -18,13 +18,14 @@ Tables are created with `create_all` at startup, and columns added since an olde
 added in place (`add_missing_columns`). Alembic migrations come once the schema settles (§8).
 
 Checkpoints (docs/decisions/0008): commits never copy the write-ahead log into the database
-file themselves (`configure_sqlite`); `checkpoint_regularly`, a background task the app runs,
-does it instead, so that work never lands on the request path.
+file themselves (`configure_sqlite`); a background task the app runs (`checkpointing`) does it
+instead, so that work never lands on the request path.
 """
 
 import asyncio
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -295,14 +296,35 @@ class Store:
         await asyncio.to_thread(self.engine.dispose)
 
 
-async def checkpoint_regularly(store: Store, every_seconds: float) -> None:
-    """Checkpoint the store every `every_seconds` until cancelled. The app runs this in its lifespan.
+@asynccontextmanager
+async def checkpointing(store: Store, every_seconds: float) -> AsyncIterator[None]:
+    """Checkpoint `store` in the background while the `async with` block runs.
+
+    The app wraps its whole lifetime in this (liber/app.py). On leaving the block, a checkpoint
+    already in progress is allowed to finish, so the store is never closed under it.
+    """
+    stop = asyncio.Event()
+    task = asyncio.create_task(checkpoint_regularly(store, every_seconds, stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        await task
+
+
+async def checkpoint_regularly(store: Store, every_seconds: float, stop: asyncio.Event) -> None:
+    """Checkpoint the store every `every_seconds` until `stop` is set.
 
     The log then holds about `every_seconds` worth of writes. A failed checkpoint is logged and
     tried again next time: nothing is lost meanwhile, the log just grows a little longer.
     """
     while True:
-        await asyncio.sleep(every_seconds)
+        try:
+            # Wait out the interval, unless told to stop first.
+            await asyncio.wait_for(stop.wait(), timeout=every_seconds)
+            return
+        except TimeoutError:
+            pass
         try:
             await store.checkpoint()
         except Exception:

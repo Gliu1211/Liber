@@ -34,17 +34,21 @@ Option 2.
 - `Store.checkpoint()` runs `PRAGMA wal_checkpoint(PASSIVE)` on its own connection in a worker
   thread and returns SQLite's `(busy, pages in the log, pages copied)`. It runs outside a
   transaction, as SQLite requires; Python's `sqlite3` only opens one before a write.
-- `checkpoint_regularly(store, every_seconds)` loops forever: sleep, checkpoint, and log
-  failures and carry on. The app's lifespan starts it (`LIBER_WAL_CHECKPOINT_SECONDS`, default
-  1 s) and cancels it at shutdown, before `Store.close()`. SQLite checkpoints and removes the log
-  when the last connection closes.
-- The Tier 1 harness (`tier1.run_request_path`) runs the same task at the same interval, so the
-  gate measures the request path as the app runs it.
+- `checkpoint_regularly(store, every_seconds, stop)` loops: wait one interval (or stop), then
+  checkpoint; a failure is logged and the loop carries on. `async with checkpointing(store,
+  every_seconds)` runs it for the length of a block. On leaving the block it sets `stop` and
+  waits for a checkpoint already in progress, so the store is never closed under one. The app
+  wraps its lifetime in it (`LIBER_WAL_CHECKPOINT_SECONDS`, default 1 s, must be > 0), and closes
+  the store afterwards; SQLite checkpoints and removes the log when the last connection closes.
+- The Tier 1 harness (`tier1.run_request_path`) runs the same task at the default interval (not
+  the developer's environment), so the gate measures the request path as the app runs it.
 
 **Why the log stays bounded:** once a checkpoint has copied every page, the next commit writes
 from the start of the log again (tested). So the log holds about one interval of writes. Its file
 keeps its largest size on disk (SQLite reuses the space rather than shrinking it), and goes away
-on shutdown.
+on shutdown. If one burst (say a 10 MB recorded body) leaves a large file behind and that
+matters, `PRAGMA journal_size_limit` in `configure_sqlite` makes SQLite shrink it after a
+checkpoint. Not set for now.
 
 **Does a background checkpoint slow a request it overlaps?** Measured by replaying Tier 1 with
 the checkpointer running far more often than in production (GC disabled to isolate the effect):
@@ -52,8 +56,13 @@ p95 rose ~1 ms with a checkpoint every 20 ms and ~2 ms every 5 ms. At one per se
 are rare, and an overlap costs ~1-2 ms instead of the ~11 ms of a checkpoint inside the commit.
 
 ## Results
+Measured with ADR 0007's protocol (before = the Session 3 commit, same inputs, back to back).
 - Tier 1, request path set up like the app (`scripts/bench_request_path.py`, 10 runs): the
-  regular ~11-14 ms request in every run is gone; median max per run 13.7 ms → 6.2 ms.
+  regular ~12-14 ms request in every run is gone. Max per run: median 13.4 ms → 6.5 ms. Before,
+  9 of 10 runs had a max of 12.2-15.1 ms; after, 8 of 10 stay at or under 8 ms. Both sides
+  have one or two GC runs (26.2 ms before; 25.8 and 28.9 ms after).
+- `make eval`'s `summary.max_overhead_ms` (5 runs): median 28.7 → 25.4 ms. It is dominated by
+  the garbage collections below, so it barely moves.
 - **What still makes single requests slow:** Python's full (generation 2) garbage collections,
   20-120 ms depending on how many objects the process holds. Every request over ~13 ms in 20
   Tier 1 runs coincided with one. They happen in only some runs, so p95 doesn't see them, but
@@ -65,6 +74,6 @@ are rare, and an overlap costs ~1-2 ms instead of the ~11 ms of a checkpoint ins
 - Another process that opens `liber.db` (the `sqlite3` shell, a future `liber` command) uses
   SQLite's defaults and may checkpoint on its own. That's harmless.
 - If the background task stops, the log grows until the next restart, and nothing is lost. The
-  loop catches every error except cancellation at shutdown.
+  loop catches every error and only ends when told to stop.
 - A long-running read would stop `PASSIVE` from copying everything, so the log couldn't start
   over. Liber has no long reads today; the dashboard (§10) should keep its reads short.

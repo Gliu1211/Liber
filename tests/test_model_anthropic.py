@@ -256,6 +256,34 @@ def test_reuse_on_the_next_request_of_a_conversation(earlier: dict[str, Any], da
     assert_reuse_changes_nothing(later, parse(earlier))
 
 
+# Values that == says are equal but canonical JSON (and the model) tells apart.
+EQUAL_TO_PYTHON = ([0, 0.0, -0.0, False], [1, 1.0, True])
+
+
+def respelled(value: Any, data: st.DataObject) -> Any:
+    """`value` with dict keys reordered and each 0/1/true/false maybe swapped for an ==-equal one."""
+    if isinstance(value, dict):
+        keys = data.draw(st.permutations(list(value)))
+        return {key: respelled(value[key], data) for key in keys}
+    if isinstance(value, list):
+        return [respelled(item, data) for item in value]
+    if isinstance(value, int | float) and value in (0, 1):
+        return data.draw(st.sampled_from(EQUAL_TO_PYTHON[int(value)]))
+    return value
+
+
+@settings(max_examples=300, deadline=None)
+@given(requests, st.data())
+def test_reuse_when_the_resent_history_is_spelled_differently(earlier: dict[str, Any], data: st.DataObject) -> None:
+    # The same history as far as == can tell: keys in another order (still the same message, but
+    # rendered in the new order) and numbers that == can't tell apart (a different message).
+    keep = data.draw(st.integers(0, len(earlier["messages"])))
+    later = json.loads(json.dumps(earlier))
+    later["messages"] = [respelled(message, data) for message in later["messages"][:keep]]
+
+    assert_reuse_changes_nothing(later, parse(earlier))
+
+
 def turns_of(session_name: str) -> list[dict[str, Any]]:
     [session] = [s for s in load_sessions(FIXTURES / "sessions") if s.name == session_name]
     return [json.loads(request.body) for request in replay(session)]

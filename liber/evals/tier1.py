@@ -36,12 +36,12 @@ from pathlib import Path
 from typing import Any
 
 from liber import pipeline
-from liber.config import Settings
+from liber.config import DEFAULT_WAL_CHECKPOINT_SECONDS
 from liber.evals.metrics import Metric, p95, ratio, write_results, write_trace
 from liber.evals.replay import ReplayedRequest, load_sessions, replay
 from liber.model.anthropic import RecentRequests, parse, render
 from liber.model.items import Plan
-from liber.session.store import Store, checkpoint_regularly
+from liber.session.store import Store, checkpointing
 
 OVERHEAD_BUDGET_MS = 10.0  # §3: steps 2-5 must add only a few milliseconds
 DEFAULT_SESSIONS = Path("tests/fixtures/sessions")
@@ -110,12 +110,11 @@ async def run_request_path(requests: list[ReplayedRequest]) -> list[pipeline.Pre
         store = Store(Path(directory) / "liber.db")
         await store.create_tables()
         recent = RecentRequests()
-        checkpoints = asyncio.create_task(checkpoint_regularly(store, Settings().wal_checkpoint_seconds))
         try:
-            await pipeline.prepare(store, WARMUP_BODY, recent)
-            return [await pipeline.prepare(store, request.body, recent) for request in requests]
+            async with checkpointing(store, DEFAULT_WAL_CHECKPOINT_SECONDS):
+                await pipeline.prepare(store, WARMUP_BODY, recent)
+                return [await pipeline.prepare(store, request.body, recent) for request in requests]
         finally:
-            checkpoints.cancel()
             await store.close()
 
 

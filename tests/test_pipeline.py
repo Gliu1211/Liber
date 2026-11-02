@@ -192,6 +192,23 @@ async def test_the_same_request_twice_hashes_nothing(store: Store, monkeypatch: 
     assert (retry.session_id, retry.known_messages, retry.new_messages) == (first.session_id, 5, 0)
 
 
+async def test_deeply_nested_json_is_still_handled(store: Store) -> None:
+    # json.loads accepts ~1000 levels; the walks parse() adds must not give up sooner (a
+    # recursive walk failed at ~330). 300 x (dict + list) = 600 levels.
+    deep: Any = "bottom"
+    for _ in range(300):
+        deep = {"level": [deep, 1]}
+    request = json.loads(TOOL_LOOP.read_bytes())
+    request["messages"][1]["content"][2]["input"] = deep
+    raw = json.dumps(request).encode()
+    recent = RecentRequests()
+
+    first = await pipeline.prepare(store, raw, recent)
+    retry = await pipeline.prepare(store, raw, recent)  # compares the nested message with the cached one
+
+    assert (first.outcome, retry.outcome) == ("passthrough", "passthrough"), (first.error, retry.error)
+
+
 async def test_a_failure_in_the_recent_requests_cache_forwards_the_original(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:

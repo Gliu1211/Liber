@@ -14,10 +14,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from liber.app import create_app
 from liber.config import Settings
-from liber.session.store import RequestRecord, Store, checkpoint_regularly
+from liber.session.store import RequestRecord, Store, checkpointing
 
 SQLITE_DEFAULT_AUTOCHECKPOINT_PAGES = 1000
 
@@ -75,14 +76,35 @@ async def test_checkpoints_keep_running_after_a_failure(store: Store, monkeypatc
         return 0, 0, 0
 
     monkeypatch.setattr(store, "checkpoint", flaky_checkpoint)
-    task = asyncio.create_task(checkpoint_regularly(store, every_seconds=0.001))
-    try:
-        async with asyncio.timeout(2):  # fails the test if the loop died after the first error
-            await third_call.wait()
-    finally:
-        task.cancel()
+    async with checkpointing(store, every_seconds=0.001), asyncio.timeout(2):
+        await third_call.wait()  # times out (and fails the test) if the loop died after the first error
 
     assert calls >= 3
+
+
+async def test_leaving_the_block_waits_for_a_checkpoint_in_progress(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Otherwise the app could close the store under a running checkpoint at shutdown.
+    started, finished = asyncio.Event(), asyncio.Event()
+
+    async def slow_checkpoint() -> tuple[int, int, int]:
+        started.set()
+        await asyncio.sleep(0.05)
+        finished.set()
+        return 0, 0, 0
+
+    monkeypatch.setattr(store, "checkpoint", slow_checkpoint)
+    async with checkpointing(store, every_seconds=0.001):
+        await started.wait()
+
+    assert finished.is_set()
+
+
+def test_the_checkpoint_interval_must_be_positive() -> None:
+    # 0 would make the background task checkpoint in a tight loop.
+    with pytest.raises(ValidationError):
+        Settings(wal_checkpoint_seconds=0)
 
 
 async def test_the_app_checkpoints_in_the_background_until_shutdown(
