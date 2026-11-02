@@ -199,3 +199,48 @@ async def test_violations_are_recorded(app: FastAPI, client: httpx.AsyncClient) 
     assert row.violations is not None
     [violation] = json.loads(row.violations)
     assert violation.startswith("first_is_user: messages[0]")
+
+
+# --- Review findings ----------------------------------------------------------------------------
+
+
+async def test_a_render_that_edits_shared_blocks_in_place_is_caught(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # render() passes the client's block objects through. A bug that edits one of them in place
+    # must not be able to fool the validator, so it compares against a separate copy.
+    def mutating_render(parsed: Any, plan: Any) -> dict[str, Any]:
+        thinking = parsed.original["messages"][1]["content"][0]
+        thinking["thinking"] = "rewritten"
+        return dict(parsed.original)
+
+    monkeypatch.setattr(pipeline, "render", mutating_render)
+    raw = TOOL_LOOP.read_bytes()
+
+    prepared = await pipeline.prepare(store, raw)
+
+    assert prepared.outcome == "fallback"
+    assert prepared.body is raw
+    assert "thinking_unchanged" in {v.rule for v in prepared.violations}
+
+
+async def test_errors_never_quote_the_request(store: Store) -> None:
+    # The recorded error must not leak conversation text, even with body recording off.
+    raw = json.dumps({"model": "m", "messages": [{"role": "my secret token abc", "content": "x"}]}).encode()
+
+    prepared = await pipeline.prepare(store, raw)
+
+    assert prepared.outcome == "fallback"
+    assert prepared.error is not None and "secret" not in prepared.error
+
+
+async def test_unexpected_exception_text_is_not_recorded(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    def leaky(*args: Any, **kwargs: Any) -> Any:
+        raise KeyError("some conversation text")
+
+    monkeypatch.setattr(pipeline, "render", leaky)
+
+    prepared = await pipeline.prepare(store, TOOL_LOOP.read_bytes())
+
+    assert prepared.error is not None
+    assert "KeyError" in prepared.error and "conversation text" not in prepared.error

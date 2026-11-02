@@ -26,7 +26,8 @@ rest was per-statement overhead: every SQL statement went to aiosqlite's thread 
    SQLite uses WAL journaling with `synchronous=NORMAL`.
 
 ## Decision
-Option 3. `Store.run(work)` runs `work(db)` in one transaction on a worker thread.
+Option 3. `Store.run(work, busy_timeout_ms=..., immediate=...)` runs `work(db)` in one
+transaction on a worker thread.
 `session/chain.py:find_and_register` issues three to five plain SQL statements: one SELECT
 (deepest known node joined with its branch), then one INSERT or UPDATE per table. The `IN` list
 of hashes is a single expanding bind parameter, so the compiled query is cached.
@@ -35,16 +36,24 @@ Related request-path changes made for the same budget:
 - `Item` is a frozen dataclass. Pydantic validation of ~250 items per request was the largest
   share of `parse()`.
 - `canonical_json` reuses one `JSONEncoder`.
-- The thinking-block check tries object identity before comparing by content.
+- (The validator later went back to comparing against a separately decoded copy of the
+  request: it costs ~0.5 ms but catches render bugs that edit shared objects in place.)
 
 Result on the same benchmark: identification about 1.5 ms (2.3 ms including the thread hop).
-Steps 2-5 together: p95 about 5.5-6.6 ms, mean about 4 ms.
+Steps 2-5 together: p95 about 5.5-6.8 ms, mean about 4 ms.
 
 ## Consequences
 - Two fewer dependencies (`aiosqlite`, `greenlet`). The Store's public methods are still
   `async`, so callers didn't change.
-- SQLite allows one writer at a time. Concurrent writes (request records vs identification)
-  wait on sqlite3's busy timeout (5 s default), which is ample for a local proxy.
+- SQLite allows one writer at a time. Identification must not wait long for it:
+  - it starts its transaction with `BEGIN IMMEDIATE` (so the lookup and the inserts are one
+    atomic unit, even against another process) with a 100 ms busy timeout;
+  - it waits at most 250 ms for the in-process lock;
+  - if either runs out, it raises `StoreBusy` and the request is forwarded untouched
+    (`liber_outcome = fallback`), so a busy database costs a request at most about a third of a
+    second, not the 5 to 15 s the review measured before this was added.
+
+  Background writes (request records) keep a 5 s timeout.
 - WAL adds `liber.db-wal` and `liber.db-shm` files next to the database. `synchronous=NORMAL`
   means a power loss (not a crash) can lose the last few commits. That's acceptable for records
   that rebuild themselves on the next request.

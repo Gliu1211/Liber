@@ -22,6 +22,7 @@ order and spacing, `cache_control` markers (Claude Code moves its marker to the 
 every turn), and the string-vs-block spelling of the same text.
 """
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -30,6 +31,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Connection
+from sqlalchemy.exc import OperationalError
 
 from liber.session.store import (
     BranchRecord,
@@ -132,29 +134,56 @@ class Identity:
     new_messages: int  # messages after it, registered by this request
     new_session: bool = False
     new_branch: bool = False
-    parent_branch_id: str | None = None  # for a new branch: the branch it forked from
-    fork_depth: int = 0  # for a new branch: messages it shares with its parent
+    parent_branch_id: str | None = None  # the branch's parent (None for a session's first branch)
+    fork_depth: int = 0  # messages the branch shares with its parent (0 for a first branch)
 
 
 def new_id() -> str:
     return uuid.uuid4().hex
 
 
+class StoreBusy(Exception):
+    """The database is busy; this request goes through without Liber rather than wait (§3 budget)."""
+
+
+# How long a request may wait to be identified before Liber steps aside. Identification normally
+# takes a few milliseconds; long waits only happen when something else holds the database.
+LOCK_WAIT_SECONDS = 0.25
+SQLITE_BUSY_TIMEOUT_MS = 100
+
+
 async def identify(store: Store, parsed: "ParsedRequest") -> Identity:
     """Find the request's conversation (longest known prefix), then register what is new.
 
-    The database work is one transaction on a worker thread (Store.run), under a lock so two
-    simultaneous requests can't both decide to create the same branch.
+    Atomic in two ways: an in-process lock lets one request at a time decide on branches, and
+    the database work is a single BEGIN IMMEDIATE transaction (safe even against another process).
+    Neither wait is allowed to be long: if the database is busy, StoreBusy is raised and the
+    pipeline forwards the request untouched.
     """
     if not parsed.chain_hashes:
         return Identity(session_id=None, branch_id=None, known_messages=0, new_messages=0)
     now = datetime.now(UTC)
-    async with store.lock:
-        return await store.run(lambda db: find_and_register(db.connection(), parsed, now))
+    try:
+        async with asyncio.timeout(LOCK_WAIT_SECONDS):
+            await store.lock.acquire()
+    except TimeoutError:
+        raise StoreBusy("another request is still being identified") from None
+    try:
+        return await store.run(
+            lambda db: find_and_register(db.connection(), parsed, now),
+            busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
+            immediate=True,
+        )
+    except OperationalError as exc:
+        if "locked" in str(exc.orig) or "busy" in str(exc.orig):
+            raise StoreBusy("the database is locked by another writer") from exc
+        raise
+    finally:
+        store.lock.release()
 
 
 def find_and_register(db: Connection, parsed: "ParsedRequest", now: datetime) -> Identity:
-    """The body of identify(): a few plain SQL statements inside one transaction."""
+    """The body of identify(): a few plain SQL statements inside its transaction."""
     hashes = parsed.chain_hashes
     new_session = new_branch = False
     deepest = deepest_known_node(db, hashes)

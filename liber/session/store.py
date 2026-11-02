@@ -169,9 +169,18 @@ def add_missing_columns(connection: Connection) -> None:
     for table in Base.metadata.sorted_tables:
         existing = {column["name"] for column in inspector.get_columns(table.name)}
         for column in table.columns:
-            if column.name not in existing:
-                column_type = column.type.compile(dialect=connection.dialect)
-                connection.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {column.name} {column_type}"))
+            if column.name in existing:
+                continue
+            if not column.nullable:
+                # Existing rows would have no value for it: that needs a real migration.
+                raise RuntimeError(
+                    f"{table.name}.{column.name} is missing from {connection.engine.url.database} and is "
+                    "required; this database needs a migration (or delete it to start fresh)"
+                )
+            column_type = column.type.compile(dialect=connection.dialect)
+            connection.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {column.name} {column_type}"))
+        for index in table.indexes:  # create_all skips indexes of tables that already exist
+            index.create(connection, checkfirst=True)
 
 
 def configure_sqlite(dbapi_connection: Any, connection_record: Any) -> None:
@@ -206,12 +215,23 @@ class Store:
         # One conversation update at a time (see session/chain.py:identify).
         self.lock = asyncio.Lock()
 
-    async def run(self, work: Callable[[Session], T]) -> T:
-        """Run `work(db)` in one transaction on a worker thread; commit if it returns normally."""
-        return await asyncio.to_thread(self._run_now, work)
+    async def run(self, work: Callable[[Session], T], busy_timeout_ms: int = 5000, immediate: bool = False) -> T:
+        """Run `work(db)` in one transaction on a worker thread; commit if it returns normally.
 
-    def _run_now(self, work: Callable[[Session], T]) -> T:
+        busy_timeout_ms: how long to wait if another connection holds SQLite's write lock.
+        immediate: take the write lock at the start (BEGIN IMMEDIATE) instead of at the first
+        write, so everything `work` reads stays true until it commits, even across processes.
+        """
+        return await asyncio.to_thread(self._run_now, work, busy_timeout_ms, immediate)
+
+    def _run_now(self, work: Callable[[Session], T], busy_timeout_ms: int = 5000, immediate: bool = False) -> T:
         with self._sessions() as db, db.begin():
+            connection = db.connection()
+            # Set on every transaction: pooled connections are shared by callers with different needs.
+            connection.exec_driver_sql(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+            if immediate:
+                # Python's sqlite3 would otherwise start the transaction only at the first write.
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
             return work(db)
 
     async def create_tables(self) -> None:
@@ -286,7 +306,7 @@ def deepest_known_node(db: Connection, hashes: list[str]) -> KnownNode | None:
         .limit(1)
     )
     row = db.execute(query, {"hashes": hashes}).first()
-    return KnownNode(*row) if row is not None else None
+    return KnownNode(**row._mapping) if row is not None else None  # by column name, not position
 
 
 def touch_branch(db: Connection, branch_id: str, now: datetime, new_head: tuple[str, int] | None) -> None:

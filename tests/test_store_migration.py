@@ -9,6 +9,8 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from liber.session.store import RequestRecord, Store
 
 SESSION_1_REQUESTS_TABLE = """
@@ -39,3 +41,15 @@ async def test_columns_added_since_session_1_are_created(tmp_path: Path) -> None
     await store.close()
 
     assert [row.liber_outcome for row in rows] == [None, "passthrough"]  # old row kept, new row has the column
+
+
+async def test_a_missing_required_column_is_a_clear_error(tmp_path: Path) -> None:
+    # Adding a NOT NULL column to existing rows needs a real migration; don't fake it.
+    db_path = tmp_path / "liber.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE requests (id INTEGER PRIMARY KEY, created_at DATETIME, path TEXT)")
+
+    store = Store(db_path)
+    with pytest.raises(RuntimeError, match=r"requests\.method"):
+        await store.create_tables()
+    await store.close()

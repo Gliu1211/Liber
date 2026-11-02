@@ -12,12 +12,13 @@ wrong, the pipeline forwards the client's original request instead (hard rule 1)
     alternation        user and assistant messages alternate (system messages aside)
     system_placement   a mid-conversation system message is not first, follows a user turn,
                        and is last or followed by an assistant turn (effort-only ones are exempt)
-    empty_content      no empty messages, no empty text blocks
-    tool_pairing       each tool_use has its tool_result in the very next message, and vice versa
+    empty_content      no empty messages, no empty or whitespace-only text blocks
+    tool_pairing       each tool_use has its tool_result in the very next message, and vice versa;
+                       no repeated ids
     tool_results_first in a user message, tool_result blocks come before anything else
     cache_breakpoints  at most 4 cache_control markers
   relative to the client's original request:
-    thinking_unchanged thinking / redacted_thinking blocks are byte-for-byte the client's
+    thinking_unchanged thinking blocks are exactly the client's, in place; only the oldest may go
     in_flight_loop     the tool loop in progress is exactly the client's
 
 Rules were checked against the current API docs (2026-11). The API rejects non-alternating
@@ -33,8 +34,6 @@ docs/decisions/0004-preserved-thinking-and-history-edits.md.
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
-
-from liber.session.chain import canonical_json
 
 ROLES = ("user", "assistant", "system")
 THINKING_TYPES = ("thinking", "redacted_thinking")
@@ -187,8 +186,12 @@ def check_empty_content(messages: list[dict[str, Any]]) -> list[Violation]:
             violations.append(Violation("empty_content", f"messages[{i}] has empty content"))
             continue
         for j, block in enumerate(blocks_of(message)):
-            if block.get("type") == "text" and not block.get("text"):
-                violations.append(Violation("empty_content", f"messages[{i}].content[{j}] is an empty text block"))
+            if block.get("type") == "text" and not str(block.get("text", "")).strip():
+                violations.append(
+                    Violation(
+                        "empty_content", f"messages[{i}].content[{j}] is an empty (or whitespace-only) text block"
+                    )
+                )
     return violations
 
 
@@ -196,9 +199,14 @@ def check_tool_pairing(messages: list[dict[str, Any]]) -> list[Violation]:
     """Pairing is positional: results answer the calls of the message right before them."""
     violations = []
     for i, message in enumerate(messages):
+        calls, results = tool_use_ids(message), tool_result_ids(message)
+        for ids, what in ((calls, "tool_use"), (results, "tool_result")):
+            if len(ids) != len(set(ids)):
+                violations.append(Violation("tool_pairing", f"messages[{i}] repeats a {what} id"))
+
         following = messages[i + 1] if i + 1 < len(messages) else None
         answered = set(tool_result_ids(following))
-        for tool_id in tool_use_ids(message):
+        for tool_id in calls:
             if tool_id not in answered:
                 violations.append(
                     Violation(
@@ -207,7 +215,7 @@ def check_tool_pairing(messages: list[dict[str, Any]]) -> list[Violation]:
                 )
         preceding = messages[i - 1] if i > 0 else None
         called = set(tool_use_ids(preceding))
-        for tool_id in tool_result_ids(message):
+        for tool_id in results:
             if tool_id not in called:
                 violations.append(
                     Violation(
@@ -253,33 +261,40 @@ def check_cache_breakpoints(request: dict[str, Any]) -> list[Violation]:
     return []
 
 
+def thinking_groups(messages: list[Any]) -> list[tuple[int, list[dict[str, Any]]]]:
+    """(message index, its thinking/redacted_thinking blocks) for each message that has any."""
+    groups = []
+    for index, message in enumerate(messages):
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            group = [b for b in content if isinstance(b, dict) and b.get("type") in THINKING_TYPES]
+            if group:
+                groups.append((index, group))
+    return groups
+
+
 def check_thinking_unchanged(messages: list[dict[str, Any]], original_messages: list[Any]) -> list[Violation]:
-    client_blocks = [
-        block
-        for message in original_messages
-        if isinstance(message, dict) and isinstance(message.get("content"), list)
-        for block in message["content"]
-        if isinstance(block, dict) and block.get("type") in THINKING_TYPES
-    ]
-    # Fast path: render passes untouched blocks through as the very same objects, so most checks
-    # are an identity lookup. Anything else is compared by content.
-    client_ids = {id(block) for block in client_blocks}
-    client_texts: set[str] | None = None  # built only if needed
-    violations = []
-    for i, message in enumerate(messages):
-        for j, block in enumerate(blocks_of(message)):
-            if block.get("type") not in THINKING_TYPES or id(block) in client_ids:
-                continue
-            if client_texts is None:
-                client_texts = {canonical_json(b) for b in client_blocks}
-            if canonical_json(block) not in client_texts:
-                violations.append(
-                    Violation(
-                        "thinking_unchanged",
-                        f"messages[{i}].content[{j}] is a {block['type']} block the client never sent",
-                    )
+    """Thinking blocks must be the client's own, unedited, in the same messages and order.
+
+    Preserved thinking (docs/decisions/0004) binds each block to what came before it, so the
+    only change allowed is dropping whole messages' worth of thinking from the *front*: the
+    rendered thinking must be the tail end of the client's.
+    """
+    rendered = thinking_groups(messages)
+    client = [group for _, group in thinking_groups(original_messages)]
+    if len(rendered) > len(client):
+        return [Violation("thinking_unchanged", "the request has thinking blocks the client never sent")]
+    expected = client[len(client) - len(rendered) :]  # the tail of the client's thinking
+    for (index, group), client_group in zip(rendered, expected, strict=True):
+        # == on dicts compares every field exactly, signature included.
+        if group != client_group:
+            return [
+                Violation(
+                    "thinking_unchanged",
+                    f"messages[{index}]: thinking differs from the client's (edited, moved, or dropped out of order)",
                 )
-    return violations
+            ]
+    return []
 
 
 def check_in_flight_loop(messages: list[dict[str, Any]], original_messages: list[Any]) -> list[Violation]:

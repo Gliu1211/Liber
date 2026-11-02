@@ -4,7 +4,10 @@ Conversations are a tree of messages, like git commits. A request is matched aga
 longest stored prefix; what follows is new. These tests walk through the cases D7 names.
 """
 
+import asyncio
 import copy
+import sqlite3
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -12,7 +15,7 @@ from typing import Any
 import pytest
 
 from liber.model.anthropic import parse
-from liber.session.chain import Identity, canonical_json, content_hash, identify
+from liber.session.chain import Identity, StoreBusy, canonical_json, content_hash, identify
 from liber.session.store import Store
 
 SYSTEM = "You are a helpful assistant."
@@ -218,3 +221,83 @@ async def test_registered_items_match_the_parsed_items(store: Store) -> None:
     assert [s.kind for s in stored] == ["text", "text", "tool_use", "tool_result"]
     assert stored[3].depends_on == stored[2].id
     assert stored[3].tool_use_id == "toolu_1"
+
+
+# --- Review findings: more tree shapes, concurrency, locking ------------------------------------
+
+
+async def test_a_fork_of_a_fork(store: Store) -> None:
+    main = await see(store, request("u1", "a1", "u2", "a2", "u3"))
+    fork = await see(store, request("u1", "a1", "u2 alt", "a2", "u3"))
+    fork_of_fork = await see(store, request("u1", "a1", "u2 alt", "a2", "u3 alt"))
+
+    assert fork.parent_branch_id == main.branch_id
+    assert fork_of_fork.parent_branch_id == fork.branch_id
+    assert fork_of_fork.fork_depth == 4
+    assert len({main.branch_id, fork.branch_id, fork_of_fork.branch_id}) == 3
+
+
+async def test_rewinding_to_an_earlier_point_then_diverging(store: Store) -> None:
+    main = await see(store, request("u1", "a1", "u2", "a2", "u3"))
+    rewind = await see(store, request("u1", "a1", "u2"))  # e.g. a retry from an earlier turn
+    diverge = await see(store, request("u1", "a1", "u2", "a2 different", "u3"))
+
+    assert (rewind.branch_id, rewind.known_messages, rewind.new_messages) == (main.branch_id, 3, 0)
+    assert diverge.new_branch and diverge.parent_branch_id == main.branch_id
+    assert diverge.fork_depth == 3
+
+
+async def test_a_retry_after_a_fork_stays_on_the_fork(store: Store) -> None:
+    await see(store, request("u1", "a1", "u2"))
+    fork = await see(store, request("u1", "a1", "u2 alt"))
+    retry = await see(store, request("u1", "a1", "u2 alt"))
+
+    assert (retry.branch_id, retry.new_branch, retry.new_messages) == (fork.branch_id, False, 0)
+
+
+async def test_concurrent_identical_requests_make_one_conversation(store: Store) -> None:
+    body = request("u1", "a1", "u2")
+
+    first, second = await asyncio.gather(see(store, body), see(store, copy.deepcopy(body)))
+
+    assert first.session_id == second.session_id and first.branch_id == second.branch_id
+    assert len(await store.list_sessions()) == 1
+    assert len(await store.list_items(first.session_id)) == 3
+
+
+async def test_concurrent_different_continuations_branch_cleanly(store: Store) -> None:
+    base = await see(store, request("u1", "a1", "u2"))
+
+    a, b = await asyncio.gather(
+        see(store, request("u1", "a1", "u2", "a2", "path A")),
+        see(store, request("u1", "a1", "u2", "a2", "path B")),
+    )
+
+    # One of them extends the existing branch, the other forks after the shared a2.
+    assert {a.branch_id, b.branch_id} >= {base.branch_id}
+    assert a.branch_id != b.branch_id
+    assert sorted([a.new_branch, b.new_branch]) == [False, True]
+
+
+def test_cache_control_inside_a_tool_input_is_real_data() -> None:
+    # Only the API's own marker positions are cleaned; a tool's input is the user's data.
+    plain = {"type": "tool_use", "id": "t", "name": "x", "input": {"a": 1}}
+    with_key = {"type": "tool_use", "id": "t", "name": "x", "input": {"a": 1, "cache_control": "on"}}
+
+    assert content_hash(plain) != content_hash(with_key)
+
+
+async def test_a_busy_database_makes_identification_give_up_quickly(store: Store, tmp_path: Path) -> None:
+    # Another process (e.g. a future `liber plan` command) holds SQLite's write lock.
+    blocker = sqlite3.connect(tmp_path / "liber.db", isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.perf_counter()
+        results = await asyncio.gather(*(see(store, request(f"u{i}")) for i in range(3)), return_exceptions=True)
+        elapsed = time.perf_counter() - started
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+    assert all(isinstance(result, StoreBusy) for result in results)
+    assert elapsed < 1.0, f"waited {elapsed:.2f}s"

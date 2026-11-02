@@ -32,6 +32,8 @@ KIND_BY_BLOCK_TYPE = {
     "redacted_thinking": Kind.THINKING,
 }
 
+ROLE_VALUES = {role.value for role in Role}
+
 # Rough token estimates for blocks whose JSON length says little about their token count.
 IMAGE_TOKENS_ESTIMATE = 1600  # a typical ~1 megapixel image
 BINARY_DOCUMENT_TOKENS_ESTIMATE = 3000  # a short PDF
@@ -39,6 +41,10 @@ BINARY_DOCUMENT_TOKENS_ESTIMATE = 3000  # a short PDF
 
 class UnsupportedPlan(Exception):
     """render() was given plan operations it can't apply yet."""
+
+
+class RequestShapeError(ValueError):
+    """The request isn't shaped like a Messages API request. Messages never quote its content."""
 
 
 @dataclass(frozen=True)
@@ -65,12 +71,12 @@ class ParsedRequest:
 
 
 def parse(request: Any) -> ParsedRequest:
-    """Split a Messages API request into items. Raises ValueError if it isn't request-shaped."""
+    """Split a Messages API request into items. Raises RequestShapeError if it isn't request-shaped."""
     if not isinstance(request, dict):
-        raise ValueError("the request is not a JSON object")
+        raise RequestShapeError("the request is not a JSON object")
     messages = request.get("messages")
     if not isinstance(messages, list):
-        raise ValueError("the request has no `messages` list")
+        raise RequestShapeError("the request has no `messages` list")
 
     root = chain.root_hash(request.get("system"), request.get("tools"))
     frames: list[MessageFrame] = []
@@ -111,14 +117,16 @@ def parse(request: Any) -> ParsedRequest:
 def read_message(index: int, message: Any) -> tuple[Role, list[dict[str, Any]], bool]:
     """A message's role, its content as a list of blocks, and whether it was written as a string."""
     if not isinstance(message, dict) or "content" not in message:
-        raise ValueError(f"messages[{index}] is not a message object with content")
-    role = Role(str(message.get("role")))  # ValueError for a missing role or one Liber doesn't know
+        raise RequestShapeError(f"messages[{index}] is not a message object with content")
+    if message.get("role") not in ROLE_VALUES:
+        raise RequestShapeError(f"messages[{index}] has a missing or unknown role")  # not echoed: it's client data
+    role = Role(message["role"])
     content = message["content"]
     if isinstance(content, str):
         return role, [{"type": "text", "text": content}], True
     if isinstance(content, list) and all(isinstance(block, dict) for block in content):
         return role, content, False
-    raise ValueError(f"messages[{index}].content must be a string or a list of content blocks")
+    raise RequestShapeError(f"messages[{index}].content must be a string or a list of content blocks")
 
 
 def pairing_id(block: dict[str, Any], kind: Kind) -> str | None:

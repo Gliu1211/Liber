@@ -22,13 +22,14 @@ a non-empty plan produced a request that passed validation.
 import json
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import structlog
 
-from liber.model.anthropic import parse, render
+from liber.model.anthropic import RequestShapeError, parse, render
 from liber.model.items import Plan
 from liber.model.validate import Violation, validate
-from liber.session.chain import identify
+from liber.session.chain import StoreBusy, identify
 from liber.session.store import Store
 
 log = structlog.get_logger(__name__)
@@ -40,11 +41,12 @@ class Prepared:
 
     body: bytes
     outcome: str = "fallback"  # "passthrough", "rendered" or "fallback"
+    request: Any = None  # the decoded client request (None if it wasn't JSON), for recording
     session_id: str | None = None
     branch_id: str | None = None
     known_messages: int | None = None
     new_messages: int | None = None
-    error: str | None = None  # why it fell back (an exception or a round-trip mismatch)
+    error: str | None = None  # why it fell back (an exception type, or a round-trip mismatch)
     violations: list[Violation] = field(default_factory=list)
     overhead_ms: float | None = None
 
@@ -55,6 +57,11 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
     prepared = Prepared(body=raw_body)
     try:
         request = json.loads(raw_body)
+        prepared.request = request
+        # A second, independent copy for validation: render() passes the client's block objects
+        # through, so comparing against those same objects could not catch a render bug that
+        # edits one in place.
+        reference = json.loads(raw_body)
         parsed = parse(request)
         identity = await identify(store, parsed)
         prepared.session_id, prepared.branch_id = identity.session_id, identity.branch_id
@@ -62,11 +69,11 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
 
         plan = Plan()  # the session's applied plan; plans are stored from Session 4
         rendered = render(parsed, plan)
-        prepared.violations = validate(rendered, original=request)
+        prepared.violations = validate(rendered, original=reference)
 
         if prepared.violations:
             pass  # stay on "fallback": the violations say why
-        elif plan.is_empty and rendered != request:
+        elif plan.is_empty and rendered != reference:
             prepared.error = "round trip changed the request under an empty plan (a parse/render bug)"
         elif plan.is_empty:
             prepared.outcome = "passthrough"  # nothing changed: send the client's exact bytes
@@ -74,8 +81,7 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
             prepared.outcome = "rendered"
             prepared.body = json.dumps(rendered, ensure_ascii=False, separators=(",", ":")).encode()
     except Exception as exc:
-        # The body is the conversation, never credentials, so the message is safe to keep.
-        prepared.error = f"{type(exc).__name__}: {exc}"
+        prepared.error = describe_failure(exc)
 
     prepared.overhead_ms = round((time.perf_counter() - started) * 1000, 3)
     if prepared.outcome == "fallback":
@@ -86,3 +92,15 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
             session_id=prepared.session_id,
         )
     return prepared
+
+
+def describe_failure(exc: Exception) -> str:
+    """The exception type, plus its message only when Liber wrote it.
+
+    Other exceptions' messages can quote pieces of the conversation (a KeyError names a key,
+    a ValueError may repeat a value), and errors are stored and logged even when body
+    recording is off.
+    """
+    if isinstance(exc, json.JSONDecodeError | RequestShapeError | StoreBusy):
+        return f"{type(exc).__name__}: {exc}"  # positions and Liber's own wording, no content
+    return type(exc).__name__

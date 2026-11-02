@@ -202,3 +202,49 @@ def test_violations_are_readable() -> None:
     [violation] = validate(request)
 
     assert str(violation).startswith("alternation: messages[1]")
+
+
+# --- Review findings: order of thinking blocks, whitespace, duplicate ids -----------------------
+
+
+def test_moved_thinking_blocks_are_caught() -> None:
+    # Preserved thinking binds each block to everything before it: reordering is an edit.
+    original = load("long_session_101.json")
+    rendered = copy.deepcopy(original)
+    first, second = rendered["messages"][1]["content"][0], rendered["messages"][3]["content"][0]
+    rendered["messages"][1]["content"][0], rendered["messages"][3]["content"][0] = second, first
+
+    assert "thinking_unchanged" in rules(validate(rendered, original=original))
+
+
+def test_duplicated_thinking_block_is_caught() -> None:
+    original = load("long_session_101.json")
+    rendered = copy.deepcopy(original)
+    rendered["messages"][3]["content"][0] = copy.deepcopy(rendered["messages"][1]["content"][0])
+
+    assert "thinking_unchanged" in rules(validate(rendered, original=original))
+
+
+def test_thinking_may_only_be_dropped_from_the_front() -> None:
+    original = load("long_session_101.json")
+    front_dropped = copy.deepcopy(original)
+    del front_dropped["messages"][1]["content"][0]  # the oldest thinking block
+    middle_dropped = copy.deepcopy(original)
+    del middle_dropped["messages"][41]["content"][0]  # a thinking block in the middle
+
+    assert validate(front_dropped, original=original) == []
+    assert "thinking_unchanged" in rules(validate(middle_dropped, original=original))
+
+
+def test_whitespace_only_text_is_empty() -> None:
+    request = load("simple_text.json")
+    request["messages"][1]["content"] = [{"type": "text", "text": "  \n "}]
+
+    assert "empty_content" in rules(validate(request))
+
+
+def test_duplicate_tool_use_ids_are_caught() -> None:
+    request = load("tool_loop_in_flight.json")
+    request["messages"][3]["content"][2]["id"] = "toolu_fixture_02"  # two calls, one id
+
+    assert "tool_pairing" in rules(validate(request))

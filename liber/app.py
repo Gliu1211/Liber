@@ -23,6 +23,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 import structlog
@@ -87,11 +88,10 @@ async def proxy_messages(request: Request) -> Response:
     settings: Settings = app.state.settings
     started = time.perf_counter()
     body = await request.body()
-    record = start_record(request, body, settings.record_bodies)
 
     # §3 steps 2-5. prepare() never raises; on any problem it hands back the client's own bytes.
     prepared = await prepare(app.state.store, body)
-    note_preparation(record, prepared)
+    record = start_record(request, body, prepared, settings.record_bodies)
 
     try:
         upstream = await open_upstream(app.state.client, request, prepared.body)
@@ -143,11 +143,11 @@ def log_forwarding_failure(path: str, exc: Exception) -> None:
 # --- Recording helpers ------------------------------------------------------------------------
 
 
-def start_record(request: Request, body: bytes, keep_body: bool) -> RequestRecord:
+def start_record(request: Request, body: bytes, prepared: Prepared, keep_body: bool) -> RequestRecord:
     """Start a `requests` row with what is known before forwarding. Never raises."""
     path = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     try:
-        model, stream = request_summary(body)
+        model, stream = request_summary(prepared.request)
         return RequestRecord(
             created_at=datetime.now(UTC),
             method=request.method,
@@ -156,34 +156,27 @@ def start_record(request: Request, body: bytes, keep_body: bool) -> RequestRecor
             stream=stream,
             request_headers=recordable_headers(request.headers.items()),
             request_body=body.decode("utf-8", errors="replace") if keep_body else None,
+            # What the pipeline decided (§3 steps 2-5).
+            session_id=prepared.session_id,
+            branch_id=prepared.branch_id,
+            known_messages=prepared.known_messages,
+            new_messages=prepared.new_messages,
+            liber_outcome=prepared.outcome,
+            liber_error=prepared.error,
+            violations=json.dumps([str(v) for v in prepared.violations]) if prepared.violations else None,
+            overhead_ms=prepared.overhead_ms,
         )
     except Exception:
         log.exception("recording_failed", path=path)
         return RequestRecord(created_at=datetime.now(UTC), method=request.method, path=path)
 
 
-def note_preparation(record: RequestRecord, prepared: Prepared) -> None:
-    """Copy what the pipeline decided onto the request's row."""
-    record.session_id = prepared.session_id
-    record.branch_id = prepared.branch_id
-    record.known_messages = prepared.known_messages
-    record.new_messages = prepared.new_messages
-    record.liber_outcome = prepared.outcome
-    record.liber_error = prepared.error
-    record.violations = json.dumps([str(v) for v in prepared.violations]) if prepared.violations else None
-    record.overhead_ms = prepared.overhead_ms
-
-
-def request_summary(body: bytes) -> tuple[str | None, bool | None]:
-    """The model name and stream flag from a request body; Nones if it isn't usable JSON."""
-    try:
-        parsed = json.loads(body)
-    except (ValueError, RecursionError):  # not JSON, invalid UTF-8, or absurdly deep nesting
+def request_summary(decoded: Any) -> tuple[str | None, bool | None]:
+    """The model name and stream flag of a decoded request body; Nones if it isn't an object."""
+    if not isinstance(decoded, dict):
         return None, None
-    if not isinstance(parsed, dict):
-        return None, None
-    model = parsed.get("model")
-    stream = parsed.get("stream", False)  # the API's default is non-streaming
+    model = decoded.get("model")
+    stream = decoded.get("stream", False)  # the API's default is non-streaming
     return (
         model if isinstance(model, str) else None,
         stream if isinstance(stream, bool) else None,

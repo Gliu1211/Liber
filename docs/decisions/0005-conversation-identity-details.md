@@ -33,8 +33,10 @@ branches. Implementing it raised questions D7 leaves open: what exactly is hashe
    branch that contains it, which is correct: it is literally the same content at the same
    point.
 6. **Concurrency:** identification runs under an `asyncio.Lock` (one conversation update at a
-   time), and node and item inserts are `ON CONFLICT DO NOTHING`. They're content-addressed, so
-   a duplicate is the same row.
+   time, in this process) inside a `BEGIN IMMEDIATE` transaction (atomic across processes too).
+   Both waits are short, and a busy database means the request goes through untouched (ADR
+   0003). Node and item inserts are `ON CONFLICT DO NOTHING`; they're content-addressed, so a
+   duplicate is the same row.
 7. **Nothing changed → original bytes:** with an empty plan, the pipeline forwards the client's
    exact bytes, not a re-serialization. It still renders and compares, and a mismatch is
    recorded as a parse/render bug (fallback).
