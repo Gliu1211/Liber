@@ -214,10 +214,35 @@ A background asyncio task (same process in v1) that processes new items:
 
 ## 12. Evaluation and tracing
 
-- **Benchmark harness:** replay recorded multi-turn sessions with checkable tasks under three conditions — full context, client auto-compaction, Liber selective compaction.
-- **Metrics:** task success, input tokens, cache read/write tokens, estimated cost, latency.
-- **Tracing:** every plan application and compaction decision is logged with before/after token counts; Langfuse export is optional.
-- Target resume line: "cut context tokens X% while retaining Y% task success across N tasks."
+Evaluation is **continuous**, not a final step. It runs as a loop: **trace → eval → diagnose → fix → gate.**
+
+### Tier 1 — Offline gate (every change, every PR, deterministic, free)
+Runs against recorded fixture sessions with a fake model; no network, no API keys.
+
+| Metric | Gate |
+|---|---|
+| Validity rate: rendered requests passing the validator | must be 100% |
+| Round-trip identity: empty plan reproduces the original request | must be 100% |
+| Fallback rate: requests forwarded unmodified due to errors | must not increase |
+| Token reduction on fixture sessions with standard plans | must not drop more than tolerance |
+| Prefix stability: requests whose bytes up to the frozen/live boundary are unchanged after a minor compaction | must be 100% |
+| Request-path overhead (p95, steps 2–5 of §3) | must stay under budget (default 10 ms) |
+
+Results are written to `evals/results/latest.json` and compared to the committed `evals/baseline.json` by `scripts/eval_gate.py`. Any metric outside tolerance fails the gate.
+
+**Baseline rule:** the baseline only changes in a dedicated PR that runs `make eval-baseline` and explains why the new numbers are correct. Never edit the baseline to make a failing change pass.
+
+### Tier 2 — Quality evals (manual or scheduled, real models, costs money)
+- **Task success replay:** recorded multi-turn sessions with checkable tasks, run under full context, client auto-compaction, and Liber.
+- **Summary faithfulness:** "needle" facts planted early in a session must stay answerable after compaction; an LLM judge scores each summary for omissions and errors.
+- **Cost:** real cache read/write tokens from `usage`.
+- Tier 2 is a **release gate**, not a merge gate: results are tracked over time in `evals/history/`, and a regression blocks a release until diagnosed.
+
+### Tracing and diagnosis
+- Every plan application and compaction decision is logged with before/after token counts, the plan version, and the validator result; Langfuse export is optional.
+- When an eval regresses, the PR (or an issue) includes a short diagnosis: which fixture failed, which trace shows why, and what the fix changes.
+
+Target resume line: "cut context tokens X% while retaining Y% task success across N tasks."
 
 ---
 
@@ -250,16 +275,76 @@ liber/
   evals/              harness, metrics, replay
 tests/
   fixtures/           recorded requests/responses (scrubbed of keys)
+evals/
+  baseline.json       committed Tier 1 baseline (protected)
+  results/            generated, git-ignored
+  history/            Tier 2 results over time
+scripts/eval_gate.py  compares results to baseline
+docs/PROGRESS.md      session handoff log
+docs/decisions/       ADRs
+.claude/              settings, hooks, reviewer subagent
+Makefile              setup, check, fmt, eval targets
 ```
 
 ---
 
 ## 14. Roadmap
 
-- **v1:** passthrough proxy → context model + validator → plans + frozen blocks → worker → dashboard → evals.
+- **v1:** passthrough proxy → context model + validator → Tier 1 eval gate → plans + frozen blocks → worker → dashboard → Tier 2 quality evals. Every step after the gate exists must pass it.
 - **v2:** `recall` tool loop (D3c), OpenAI adapter (D2), embedding-based topic map, smarter auto-rules.
 
-## 15. Open questions
+## 15. Engineering practices and agent harness
+
+Most code in this repo is written by coding agents in stateless sessions. The harness is designed so that quality comes from **deterministic checks and enforced workflow**, not from instructions an agent might forget.
+
+### Principles
+1. **One command, everywhere.** `make check` is the single definition of "done". Agents (via the Stop hook), the owner (locally), and CI all run the same command.
+2. **Deterministic guardrails over prose.** Anything that must never happen is enforced by a hook, a test, or CI, not only written in `CLAUDE.md`.
+3. **Progressive disclosure.** `CLAUDE.md` stays short and points here; agents read only the sections their task needs, which keeps their context focused.
+4. **Small, reviewable units.** One task = one session = one PR. Conventional-commit titles (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`).
+5. **Tests first from acceptance criteria.** Each session prompt lists acceptance criteria; they become failing tests before implementation.
+6. **Work isn't graded by its author.** An independent `reviewer` subagent with fresh context reviews every diff against this document before the PR.
+7. **Explicit handoff between sessions.** Sessions share no memory, so state lives in the repo: `docs/PROGRESS.md` (log) and `docs/decisions/` (ADRs).
+8. **Reproducible environment.** Dependencies are locked with `uv`; Python version pinned; CI uses the lockfile.
+9. **Least privilege.** Agents can't read `.env` files, edit protected files, or run destructive git/shell commands (enforced in `.claude/settings.json` and hooks).
+10. **Observability by default.** Structured logs (structlog) and per-request traces (§12) so failures can be diagnosed from evidence.
+
+### `make check` (the quality gate)
+| Step | Tool | Purpose |
+|---|---|---|
+| Format check | `ruff format --check` | consistent style, no diffs in review |
+| Lint | `ruff check` | bugs and smells |
+| Types | `mypy` on `liber/` | catches interface drift between modules |
+| Tests | `pytest` (unit, property via Hypothesis, integration with fake upstream) | behavior |
+| Eval gate | `scripts/eval_gate.py` | Tier 1 metrics vs baseline (§12); skipped until the harness exists |
+
+### The inner loop
+1. **Implement** the smallest next piece.
+2. **Check:** `make check`.
+3. **Diagnose** failures from the output before changing code; don't guess.
+4. **Fix** and return to step 2.
+5. **Stop** only when `make check` passes.
+
+### Enforcement (`.claude/`)
+| Hook | Event | What it enforces |
+|---|---|---|
+| `stop_check.sh` | Stop | Runs `make check`; blocks finishing (exit 2) and feeds the failure back while it fails. At most 3 blocks per failing streak, so it can never loop forever. |
+| `guard.py` | PreToolUse (Edit/Write/Bash) | Blocks edits to protected files (`evals/baseline.json`, `.env*`, `.claude/`, `uv.lock` by hand) and destructive commands (`rm -rf` outside the repo, `git push --force`, `git reset --hard`, reading `.env`). |
+| `format.sh` | PostToolUse (Edit/Write) | Auto-formats edited Python files with ruff; never blocks. |
+
+The `reviewer` subagent (`.claude/agents/reviewer.md`) checks a diff for: violations of the hard rules, divergence from this document, missing tests for acceptance criteria, and code the owner couldn't explain.
+
+CI (`.github/workflows/ci.yml`) runs `make check` on every push and PR, so the gate holds even if a hook is skipped.
+
+### Handoff artifacts
+- `docs/PROGRESS.md` — append-only session log: date, task, what was done, decisions, open issues, next step.
+- `docs/decisions/NNNN-title.md` — ADRs for any decision not already in §2 (template in `0000-template.md`).
+- PR description — "How it works" walkthrough, acceptance criteria checklist, anything stubbed or provisional.
+
+### The owner's role
+- Approves plans for multi-module tasks, reviews every PR line by line, and merges. Core modules (`model/`, `session/`, `plan/`) get the closest review; rewriting parts by hand is encouraged.
+
+## 16. Open questions
 
 - Summary quality checks (how to detect a summary that lost something important).
 - Whether to merge small frozen blocks during minor compaction or only in major.

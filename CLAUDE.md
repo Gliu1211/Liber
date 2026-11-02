@@ -1,26 +1,39 @@
-# Liber — Instructions for every session
+# Liber — Agent entry point
 
-Read `ARCHITECTURE.md` fully before writing code. It is the source of truth. Decisions marked **Provisional** may be challenged in the PR description, but implement them unless they're clearly wrong.
+Liber is a local API proxy that lets users choose what stays in an LLM's context. This file is short on purpose; follow the links for depth.
 
-## Hard rules
+**Read before any code:** `ARCHITECTURE.md` (source of truth) and `docs/PROGRESS.md` (where the last session left off).
 
-1. **Never break the user's session.** If any Liber step fails (parse, render, validate), forward the original request unmodified and log the failure.
-2. **Never store or log credentials.** Pass `x-api-key` / `authorization` through untouched. Scrub them from fixtures and logs.
+## Hard rules (also enforced by hooks and CI where possible)
+
+1. **Never break the user's session.** Any Liber failure → forward the original request unmodified and log it.
+2. **Never store or log credentials.** Pass `x-api-key` / `authorization` through untouched; scrub fixtures.
 3. **Bind to 127.0.0.1** by default.
-4. **No LLM or extra network calls on the request path.** Summaries, topics, and exact token counts happen in the background worker.
-5. **Never auto-edit frozen blocks** (D5). Only a major compaction (D6) may rebuild them.
+4. **No LLM or extra network calls on the request path.** Background worker only.
+5. **Never auto-edit frozen blocks** (D5); only a major compaction (D6) rebuilds them.
 6. **Never modify thinking blocks or the in-flight tool loop** (§5).
-7. **Tests run offline** against recorded fixtures. No real API keys in CI.
+7. **Tests and Tier 1 evals run offline.** No real API keys in tests or CI.
+8. **Never edit `evals/baseline.json` to make a change pass.** Baseline updates are their own PR (§12).
 
-## Learning mode (the owner must be able to explain every line in an interview)
+## Workflow for every session (ARCHITECTURE.md §15)
 
-- Prefer plain, readable code over clever abstractions. No metaprogramming, no framework magic beyond FastAPI/SQLAlchemy/pydantic basics.
-- Every module starts with a docstring explaining **why** it exists and which ARCHITECTURE.md section/decision it implements.
-- Non-obvious lines get a short comment explaining the reason, not the mechanics.
-- Every PR description includes a **"How it works"** walkthrough: the data flow through the new code in plain English, plus any tradeoffs you made.
+1. **Orient:** read `docs/PROGRESS.md`, the sections your task names, and the existing code you'll touch.
+2. **Plan:** for anything touching more than one module, write a short plan (files, interfaces, tests) before editing.
+3. **Tests first:** turn the task's acceptance criteria into failing tests.
+4. **Loop:** implement the smallest piece → `make check` → diagnose from the output → fix → repeat. A Stop hook runs `make check` and blocks finishing while it fails.
+5. **Independent review:** run the `reviewer` subagent on your diff; fix real findings or explain why not.
+6. **Hand off:** append an entry to `docs/PROGRESS.md` (done, decisions, open issues, next step). Record any new design decision as an ADR in `docs/decisions/`.
+7. **PR:** one task per PR, conventional-commit title, description with a **"How it works"** walkthrough.
 
-## Conventions
+## Learning mode (the owner must be able to explain every line)
 
-- Python 3.11+, async throughout. FastAPI, httpx, pydantic v2, SQLAlchemy 2.0 (SQLite), structlog, pytest + pytest-asyncio, ruff.
-- Layout per ARCHITECTURE.md §13. Stay inside the modules your task names; keep changes to shared models minimal and call them out in the PR.
-- Done = tests pass, ruff clean, PR with the "How it works" section and a list of anything stubbed or provisional.
+- Plain, readable code; no metaprogramming or framework magic beyond FastAPI/SQLAlchemy/pydantic basics.
+- Each module starts with a docstring: why it exists and which ARCHITECTURE.md section it implements.
+- Comment the *reason* for non-obvious lines, not the mechanics.
+
+## Commands
+
+- `make setup` — install with uv (locked dependencies)
+- `make check` — format check, lint, type check, tests, Tier 1 eval gate (same as CI)
+- `make fmt` — auto-format
+- `make eval` / `make eval-baseline` — run Tier 1 evals / rewrite the baseline (baseline PRs only)
