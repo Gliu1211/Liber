@@ -1,0 +1,49 @@
+{
+ "description": "Plain chat: string and block content, a string system prompt, no tools.",
+ "request": {
+  "model": "claude-opus-5-5",
+  "max_tokens": 1024,
+  "stream": true,
+  "system": "You are a friendly assistant.",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi! Can you help me plan a short trip?"
+   },
+   {
+    "role": "assistant",
+    "content": "Of course. Where would you like to go, and for how long?"
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Lisbon, three days, in May."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "Day 1: Alfama and the castle. Day 2: Belém. Day 3: Sintra."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "Is Sintra worth a full day?"
+   },
+   {
+    "role": "assistant",
+    "content": "Yes: Pena Palace, the Moorish castle and Quinta da Regaleira fill a day."
+   },
+   {
+    "role": "user",
+    "content": "Great, thanks — café recommendations near Alfama?"
+   }
+  ]
+ }
+}

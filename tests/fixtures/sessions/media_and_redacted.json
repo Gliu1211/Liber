@@ -1,0 +1,96 @@
+{
+ "description": "Images, a text document and a base64 PDF, redacted_thinking, and a citations field on a text block.",
+ "request": {
+  "model": "claude-opus-5-5",
+  "max_tokens": 4096,
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image",
+      "source": {
+       "type": "base64",
+       "media_type": "image/png",
+       "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      }
+     },
+     {
+      "type": "text",
+      "text": "What is in this image?"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "redacted_thinking",
+      "data": "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwSessionFixture"
+     },
+     {
+      "type": "text",
+      "text": "A single red pixel."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "document",
+      "source": {
+       "type": "text",
+       "media_type": "text/plain",
+       "data": "Palette: red #ff0000, green #00ff00."
+      },
+      "title": "palette.txt",
+      "citations": {
+       "enabled": true
+      }
+     },
+     {
+      "type": "text",
+      "text": "Which palette entry matches?"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "The red entry.",
+      "citations": [
+       {
+        "type": "char_location",
+        "cited_text": "red #ff0000",
+        "document_index": 0,
+        "document_title": "palette.txt",
+        "start_char_index": 9,
+        "end_char_index": 20
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "document",
+      "source": {
+       "type": "base64",
+       "media_type": "application/pdf",
+       "data": "JVBERi0xLjQKJcfsj6IKMSAwIG9iago8PD4+CmVuZG9iagp0cmFpbGVyCjw8Pj4KJSVFT0YK"
+      }
+     },
+     {
+      "type": "text",
+      "text": "And this PDF?"
+     }
+    ]
+   }
+  ]
+ }
+}

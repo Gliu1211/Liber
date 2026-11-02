@@ -5,12 +5,13 @@ summarize, offload, or delete individual items) instead of relying on the client
 auto-compaction. The design lives in [ARCHITECTURE.md](ARCHITECTURE.md); progress is logged in
 [docs/PROGRESS.md](docs/PROGRESS.md).
 
-**Status:** Session 2. Liber forwards every request to the Anthropic API, streams the answer
+**Status:** Session 3. Liber forwards every request to the Anthropic API, streams the answer
 back as it arrives, and records each `POST /v1/messages` exchange (token usage, cache reads and
 writes, latency) in a local SQLite database. It also recognises which conversation each
 request belongs to (a tree of sessions and branches), splits it into items (one per content
 block), and checks it against the API's rules. It doesn't edit anything yet: every request
-still goes upstream byte for byte. Edit plans arrive in Session 4.
+still goes upstream byte for byte. A Tier 1 eval harness measures all of this offline. Edit
+plans arrive in Session 4.
 
 ## Setup
 
@@ -86,7 +87,24 @@ Settings are environment variables prefixed with `LIBER_` (see `liber/config.py`
 | `make check` | Format check, lint, type check (mypy strict), tests, Tier 1 eval gate. Same as CI. |
 | `make fmt` | Auto-format and auto-fix lint |
 | `make test` | Tests only |
-| `make eval` | Tier 1 offline evals (from Session 3) |
+| `make eval` | Tier 1 offline evals: replay the session fixtures, write `evals/results/latest.json` |
+
+### Tier 1 evals (the merge gate's numbers)
+
+`make eval` replays every session in `tests/fixtures/sessions/` as the requests a client would
+send, through Liber's model functions and its real request path, and writes:
+
+- `evals/results/latest.json`: seven metrics (validity, round trip, fallbacks, token reduction,
+  prefix stability, render determinism, p95 overhead), each with a direction and a tolerance.
+  Definitions are in [ADR 0006](docs/decisions/0006-tier1-metric-definitions.md).
+- `evals/results/latest.trace.jsonl`: one line per replayed request (outcome, validator result,
+  token estimates, overhead), for diagnosing a failing metric.
+
+`make check` runs it, then `scripts/eval_gate.py` compares the results with the committed
+`evals/baseline.json` and fails if any metric got worse than its tolerance allows. Only the owner
+records the baseline, with the Makefile's baseline target, in a dedicated PR that explains the
+new numbers (§12). Until it exists, the gate only warns. To add a session, see
+`tests/fixtures/README.md`.
 
 Tests run fully offline. A fake upstream is plugged into the proxy's httpx client, plus a real
 uvicorn server on localhost for the streaming-timing tests. No API key is needed.

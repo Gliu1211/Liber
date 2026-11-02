@@ -1,0 +1,315 @@
+{
+ "description": "Coding agent: thinking with signatures, sequential and parallel tool calls, string/block/error tool results, three exchanges, ends mid tool loop.",
+ "cache_marker": "last",
+ "request": {
+  "model": "claude-opus-5-5",
+  "max_tokens": 32000,
+  "stream": true,
+  "thinking": {
+   "type": "adaptive"
+  },
+  "system": [
+   {
+    "type": "text",
+    "text": "You are a careful coding agent.",
+    "cache_control": {
+     "type": "ephemeral"
+    }
+   }
+  ],
+  "tools": [
+   {
+    "name": "bash",
+    "description": "Run a shell command.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "command": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "command"
+     ]
+    }
+   },
+   {
+    "name": "read_file",
+    "description": "Read a file.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   },
+   {
+    "name": "edit_file",
+    "description": "Replace text in a file.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "old": {
+       "type": "string"
+      },
+      "new": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "path",
+      "old",
+      "new"
+     ]
+    },
+    "cache_control": {
+     "type": "ephemeral"
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Fix the failing test in tests/test_math.py."
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Run the tests to see the failure.",
+      "signature": "EqQBCgIYAhIMsessionFixtureSig0001"
+     },
+     {
+      "type": "text",
+      "text": "Running the tests."
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_sess_01",
+      "name": "bash",
+      "input": {
+       "command": "pytest -q"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_sess_01",
+      "content": "FAILED tests/test_math.py::test_add - assert 3 == 4",
+      "is_error": true
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Read the code and the test together.",
+      "signature": "EqQBCgIYAhIMsessionFixtureSig0002"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_sess_02",
+      "name": "read_file",
+      "input": {
+       "path": "src/math.py"
+      }
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_sess_03",
+      "name": "read_file",
+      "input": {
+       "path": "tests/test_math.py"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_sess_02",
+      "content": [
+       {
+        "type": "text",
+        "text": "def add(a, b):\n    return a - b\n"
+       }
+      ]
+     },
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_sess_03",
+      "content": "def test_add():\n    assert add(1, 3) == 4\n"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "add() subtracts. Change it to a + b.",
+      "signature": "EqQBCgIYAhIMsessionFixtureSig0003"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_sess_04",
+      "name": "edit_file",
+      "input": {
+       "path": "src/math.py",
+       "old": "a - b",
+       "new": "a + b"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_sess_04",
+      "content": "ok"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Re-run to confirm.",
+      "signature": "EqQBCgIYAhIMsessionFixtureSig0004"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_sess_05",
+      "name": "bash",
+      "input": {
+       "command": "pytest -q"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_sess_05",
+      "content": "1 passed"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "Fixed: add() returned a - b."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "Thanks. Now add a test for negative numbers."
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Add test_add_negative next to test_add.",
+      "signature": "EqQBCgIYAhIMsessionFixtureSig0005"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_sess_06",
+      "name": "edit_file",
+      "input": {
+       "path": "tests/test_math.py",
+       "old": "    assert add(1, 3) == 4\n",
+       "new": "    assert add(1, 3) == 4\n\n\ndef test_add_negative():\n    assert add(-2, -3) == -5\n"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_sess_06",
+      "content": "ok"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "Added test_add_negative."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Run the whole suite."
+     },
+     {
+      "type": "text",
+      "text": "<system-reminder>Keep output short.</system-reminder>"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "thinking",
+      "thinking": "Run everything.",
+      "signature": "EqQBCgIYAhIMsessionFixtureSig0006"
+     },
+     {
+      "type": "tool_use",
+      "id": "toolu_sess_07",
+      "name": "bash",
+      "input": {
+       "command": "pytest -q"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "toolu_sess_07",
+      "content": "12 passed in 0.31s"
+     }
+    ]
+   }
+  ]
+ }
+}
