@@ -1,0 +1,11 @@
+{
+  "model": "claude-opus-5-5",
+  "max_tokens": 2048,
+  "system": [{"type": "text", "text": "You are concise.", "cache_control": {"type": "ephemeral"}}],
+  "messages": [
+    {"role": "user", "content": "Summarise the plan."},
+    {"role": "assistant", "content": [{"type": "text", "text": "1. Parse. 2. Render. 3. Validate."}]},
+    {"role": "user", "content": "And the risks?"},
+    {"role": "system", "content": "Terse mode enabled - keep responses under 40 words."}
+  ]
+}

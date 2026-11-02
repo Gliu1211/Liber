@@ -68,7 +68,7 @@ Follow CLAUDE.md. Task: the Tier 1 offline eval harness (ARCHITECTURE.md §12 Ti
 Build:
 - liber/evals/tier1.py runnable as `python -m liber.evals.tier1 --out evals/results/latest.json`, writing the JSON format documented in scripts/eval_gate.py.
 - Fixture sessions: at least 5 recorded/synthetic multi-turn sessions (scrubbed), including tool loops, thinking blocks, and a long session (100+ messages).
-- Metrics: validity_rate, round_trip_identity, fallback_rate, token_reduction (0 for now, plans arrive in Session 4), prefix_stability (1.0 placeholder until Session 4), p95_overhead_ms. Each with direction and a sensible tolerance.
+- Metrics: validity_rate, round_trip_identity, fallback_rate, token_reduction (0 for now, plans arrive in Session 4), prefix_stability (1.0 placeholder until Session 4), render_determinism (ADR 0004 A2: render each fixture twice, bytes must match), p95_overhead_ms. Each with direction and a sensible tolerance.
 - Per-request trace records (plan version, validator result, before/after token estimates) written alongside results for diagnosis.
 - Do NOT create evals/baseline.json; the owner creates it after review (the guard hook blocks it).
 
@@ -83,7 +83,7 @@ Acceptance criteria:
 ## Session 4 — Edit plans, frozen blocks, break points
 
 ```
-Follow CLAUDE.md. Task: edit plans and compaction (ARCHITECTURE.md D5, D6, D8, §4, §5, §6, §7). Work in liber/plan/ and liber/cache/. Write a plan first; this touches several modules.
+Follow CLAUDE.md. Task: edit plans and compaction (ARCHITECTURE.md D5, D6, D8, §4, §5, §6, §7, and ADR 0004 — read it fully first). Work in liber/plan/ and liber/cache/, plus the minimal changes to render/validate/recording. Write a plan first; this touches several modules.
 
 Build:
 - Versioned plans: pending vs applied, immutable versions, undo.
@@ -93,12 +93,17 @@ Build:
 - Content-addressed cache and blob store.
 - CLI: `liber plan create|apply|undo|show`.
 - Extend the Tier 1 harness: standard plans per fixture so token_reduction and prefix_stability are real numbers.
+- Preserved thinking (ADR 0004): on every request Liber edits, merge the `thinking-binding-controls-2026-08-01` beta into the client's anthropic-beta header and add `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`, with the A3 edge cases (client already set the field; Sonnet/Haiku 5.5 non-adaptive thinking → strip later thinking or skip; unknown model → skip). Apply plans only at clean turn boundaries (A1). Record `input_transformations` from responses, including the streaming `message_start` event (A4). Count dropped reasoning in cost.py.
 
 Acceptance criteria:
 - Appending a frozen block leaves the system prompt and earlier frozen blocks byte-identical (prefix_stability = 1.0).
 - Undo restores the previous render exactly.
 - Edits before the frozen/live boundary are classified major; others minor.
 - Every rendered request in every fixture passes the validator.
+- Edited requests carry the beta and `drop_block`; the client's existing anthropic-beta values and thinking fields are preserved; unedited requests stay byte-identical.
+- A client that set `prefix_mismatch_behavior: "error"` gets its original request forwarded, with the reason recorded.
+- A plan pending during an in-flight tool loop is not applied until the next clean turn boundary.
+- `input_transformations` is recorded for streaming and non-streaming responses.
 - `make check` passes (the eval gate will show the new metrics; if they legitimately move the baseline, say so in the PR so the owner can update it).
 ```
 
@@ -110,12 +115,14 @@ Acceptance criteria:
 Follow CLAUDE.md. Task: background worker (ARCHITECTURE.md §9, D9, D10). Work in liber/worker/.
 
 Build an asyncio worker started from the app lifespan: exact token counts via Anthropic's token-counting endpoint (verify against current docs), summaries and topic labels via a configurable cheap model, all cached by content hash, retries with backoff, never on the request path. Replace Session 4's stub summaries. Conversation text is passed to the model as quoted data only.
+Add the `carry_forward_reasoning` setting (default off, ADR 0004 A5): when on, the summarizer also reads the thinking text of the turns it summarizes and adds a short, clearly labeled "earlier decisions and why" section to the frozen block as plain text. Everything else about the summary must be identical whether the flag is on or off, so Tier 2 can compare them fairly.
 
 Acceptance criteria:
 - Fake model client in tests; no network.
 - Identical content is never summarized twice (cache hit test).
 - A worker failure never affects the request path (test).
 - Prompt-injection fixture (conversation text instructing the summarizer) does not change the summarizer's instructions or output format.
+- With `carry_forward_reasoning` off, summaries never include thinking text; with it on, the only difference is the labeled notes section (test with a fake model).
 - `make check` passes.
 ```
 
@@ -141,10 +148,17 @@ Acceptance criteria:
 ```
 Follow CLAUDE.md. Task: Tier 2 quality evals (ARCHITECTURE.md §12 Tier 2). Work in liber/evals/.
 
-Build `python -m liber.evals.tier2` (manual, uses real models, reads the API key from the environment, never runs in CI): task-success replay under full context / simulated client auto-compaction / Liber; needle-fact faithfulness with an LLM judge; real cache read/write costs from usage. Write results to evals/history/<date>.json and a markdown report comparing runs over time.
+Build `python -m liber.evals.tier2` (manual, uses real models, reads the API key from the environment, never runs in CI) implementing ARCHITECTURE.md §12 Tier 2:
+- The four-condition ablation: A full context, B Liber with thinking dropped, C Liber with carry_forward_reasoning, D simulated client auto-compaction. B and C share identical summaries apart from the notes. Configurable repeats per condition (default 3); report mean and spread.
+- Fixtures include at least one reasoning-dependent task (a dead end ruled out only in the thinking).
+- Per condition: task success, input/output tokens, thinking dropped (from input_transformations), cache read/write tokens, cost.
+- Requests send `prefix_mismatch_behavior: "error"` so unintended binding breaks surface as 400s; report them by failing path.
+- Needle-fact faithfulness with an LLM judge.
+Write results to evals/history/<date>.json and a markdown report with the three comparisons (A vs B, C vs B, B/C vs D) and trends over time.
 
 Acceptance criteria:
 - Runs end-to-end against a fake client in tests.
 - Refuses to run without an explicit --live flag.
+- The report computes the three comparisons correctly on a fixed fake dataset.
 - `make check` passes.
 ```

@@ -71,6 +71,7 @@ Model APIs are stateless: the client resends the **entire** conversation on ever
   `messages[0] = user: [frozen_1, frozen_2, …, frozen_k, <original first live user content>]`
 - This keeps strict user/assistant alternation without inventing synthetic assistant messages, and appending `frozen_{k+1}` leaves the system prompt and `frozen_1…k` byte-identical (cache still hits up to there).
 - Each frozen block is clearly labeled, e.g. `<liber:summary block="3" covers="msgs 12–40">…</liber:summary>`.
+- Because this edits history, the thinking after the edit point is dropped once per compaction (ADR 0004). Rendering must be byte-identical across requests (A2) so later reasoning stays valid.
 
 ### D9 — Token counting · Provisional
 - Ground truth for totals: the `usage` fields in every API response (`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`).
@@ -144,7 +145,8 @@ The rendered request must satisfy the Messages API rules. At minimum:
 - First message is from the user; roles alternate.
 - Every `tool_use` in an assistant message has its matching `tool_result` in the following user message, and vice versa.
 - No empty messages or empty content.
-- **Never modify thinking / redacted_thinking blocks**, and never edit the in-flight tool loop (the latest assistant turn with tool calls plus its results). *(Verify current rules on thinking blocks against docs.claude.com.)*
+- **Never modify thinking / redacted_thinking blocks**, and never edit the in-flight tool loop (the latest assistant turn with tool calls plus its results).
+- **Preserved thinking (ADR 0004):** on current models a thinking block is only valid if everything before it is unchanged. Any request Liber edits must carry the `thinking-binding-controls-2026-08-01` beta and `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` (merged into the client's headers and `thinking` fields), unless ADR 0004 A3 says to strip or skip instead. Otherwise forward the original.
 - Preserve the client's `cache_control` markers where their target still exists; drop markers on content that was removed; never exceed the API's maximum number of breakpoints; add one breakpoint at the end of the frozen region when there is room. *(Verify the current breakpoint limit.)*
 
 Compaction boundaries:
@@ -157,7 +159,7 @@ If validation fails → forward the original request and record the failure.
 
 ## 6. Edit policy and break points
 
-Edits move from pending to applied only at a **break point**:
+Edits move from pending to applied only at a **break point**, and only when the request ends at a **clean turn boundary**: its latest message is a user turn with no `tool_result` blocks (ADR 0004 A1). Otherwise the plan stays pending until the next clean boundary. The break points are:
 1. **User clicks Apply** in the dashboard.
 2. **Threshold:** context exceeds a configurable share of the window (default 70%). v1 behavior: notify and propose a plan in the dashboard; auto-apply is **opt-in**.
 3. **Idle:** the session has been idle longer than the provider's cache lifetime (configurable, default 5 minutes) — the cache is already gone, so applying edits costs nothing extra. Pending edits are applied on the next request.
@@ -226,6 +228,7 @@ Runs against recorded fixture sessions with a fake model; no network, no API key
 | Fallback rate: requests forwarded unmodified due to errors | must not increase |
 | Token reduction on fixture sessions with standard plans | must not drop more than tolerance |
 | Prefix stability: requests whose bytes up to the frozen/live boundary are unchanged after a minor compaction | must be 100% |
+| Render determinism: the same history + plan version renders to identical bytes (ADR 0004 A2) | must be 100% |
 | Request-path overhead (p95, steps 2–5 of §3) | must stay under budget (default 10 ms) |
 
 Results are written to `evals/results/latest.json` and compared to the committed `evals/baseline.json` by `scripts/eval_gate.py`. Any metric outside tolerance fails the gate.
@@ -233,7 +236,18 @@ Results are written to `evals/results/latest.json` and compared to the committed
 **Baseline rule:** the baseline only changes in a dedicated PR that runs `make eval-baseline` and explains why the new numbers are correct. Never edit the baseline to make a failing change pass.
 
 ### Tier 2 — Quality evals (manual or scheduled, real models, costs money)
-- **Task success replay:** recorded multi-turn sessions with checkable tasks, run under full context, client auto-compaction, and Liber.
+- **Task success replay (four-condition ablation, ADR 0004 A5):**
+
+  | Condition | Represents |
+  |---|---|
+  | A. Full context, no compaction | upper bound |
+  | B. Liber, thinking dropped | Liber's default |
+  | C. Liber + `carry_forward_reasoning` | the carry-forward notes |
+  | D. Client's own auto-compaction | the status quo |
+
+  A vs B = cost of dropping thinking; C vs B = how much carry-forward recovers; B/C vs D = whether Liber beats the status quo. B and C use identical summaries apart from the notes. Each condition runs several times (outputs vary); report mean and spread. Fixtures include reasoning-dependent tasks (e.g. a debugging session where a dead end was ruled out only in the thinking).
+- **Per condition:** task success, input and output tokens, thinking dropped (from `input_transformations`), and cost.
+- **Binding checks:** Tier 2 sends `prefix_mismatch_behavior: "error"`, so an unintended binding break shows up as a 400 naming the failing block.
 - **Summary faithfulness:** "needle" facts planted early in a session must stay answerable after compaction; an LLM judge scores each summary for omissions and errors.
 - **Cost:** real cache read/write tokens from `usage`.
 - Tier 2 is a **release gate**, not a merge gate: results are tracked over time in `evals/history/`, and a regression blocks a release until diagnosed.
