@@ -35,6 +35,11 @@ class SSEParser:
 
     An event is complete only when its terminating blank line has arrived, so a chunk may yield
     zero, one, or many events, and any incomplete tail is kept for the next call.
+
+    Handles `\\n` and `\\r\\n` line endings. Two things the SSE spec also allows are not handled,
+    because the Anthropic API never sends them: lone `\\r` line endings and a leading byte-order
+    mark. If another upstream does, events are missed (and recorded usage is empty), but the
+    bytes are still relayed to the client unchanged.
     """
 
     def __init__(self) -> None:
@@ -210,7 +215,7 @@ class ReplyCapture:
     """
 
     def __init__(self, content_type: str, content_encoding: str | None) -> None:
-        self._is_stream = content_type.startswith("text/event-stream")
+        self._is_stream = content_type.lower().startswith("text/event-stream")  # media types ignore case
         # Liber asks upstream for an uncompressed body (docs/decisions/0001); if it gets a
         # compressed one anyway, the bytes are still relayed, just not parsed.
         self._encoding = content_encoding if content_encoding not in (None, "", "identity") else None
@@ -254,9 +259,12 @@ class ReplyCapture:
         reply = CapturedReply(body_text=text)
         try:
             body = json.loads(text)
-        except json.JSONDecodeError:
-            return reply  # e.g. an HTML error page from a gateway; keep the text only
+        except (ValueError, RecursionError):
+            # e.g. an HTML error page from a gateway: keep the text, and say why usage is missing.
+            reply.problem = "response body is not JSON"
+            return reply
         if not isinstance(body, dict):
+            reply.problem = "response body is not a JSON object"
             return reply
         if body.get("type") == "error":
             reply.problem = f"upstream error: {json.dumps(body.get('error'))}"

@@ -4,8 +4,13 @@ ARCHITECTURE.md §3 steps 1 and 6, D12 (credentials pass through untouched).
 
 The proxy must be invisible: the upstream sees the client's method, path, query, body and
 headers, and the client sees the upstream's status, headers and body bytes exactly as sent,
-chunk by chunk as they arrive. The only headers changed are hop-by-hop headers (they describe a
-single network connection, not the request) and `accept-encoding` (see docs/decisions/0001).
+chunk by chunk as they arrive. The only headers that change:
+- hop-by-hop headers are dropped (they describe one network connection, not the request);
+- `host` and `content-length` are recomputed by httpx for the upstream connection;
+- `accept-encoding` becomes `identity` (see docs/decisions/0001).
+
+Headers are handled as raw bytes throughout. Decoding them to text and back can fail or change
+bytes for non-ASCII values, and the proxy has no reason to interpret them.
 """
 
 from collections.abc import AsyncIterator, Callable, Iterable
@@ -20,50 +25,59 @@ from liber.config import Settings
 
 log = structlog.get_logger(__name__)
 
+Headers = list[tuple[bytes, bytes]]
+
 # RFC 9110 §7.6.1: these apply to one connection (client->Liber or Liber->upstream) and must
 # not be forwarded to the next hop.
 HOP_BY_HOP_HEADERS = frozenset(
     {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
+        b"connection",
+        b"keep-alive",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"te",
+        b"trailer",
+        b"trailers",
+        b"transfer-encoding",
+        b"upgrade",
     }
 )
 
 # httpx sets these itself from the upstream URL and the body it sends.
-RECOMPUTED_REQUEST_HEADERS = frozenset({"host", "content-length"})
+RECOMPUTED_REQUEST_HEADERS = frozenset({b"host", b"content-length"})
 
 CLIENT_DISCONNECTED = "client disconnected before the response finished"
 
 
-def _without(headers: Iterable[tuple[str, str]], drop: frozenset[str]) -> list[tuple[str, str]]:
+def _without(headers: Iterable[tuple[bytes, bytes]], drop: frozenset[bytes]) -> Headers:
     """Copy headers (keeping duplicates and order) minus `drop` and anything `Connection` names."""
     pairs = list(headers)
+
     # A sender can mark extra headers as hop-by-hop by listing them in `Connection`.
-    named_by_connection = {
-        token.strip().lower() for name, value in pairs if name.lower() == "connection" for token in value.split(",")
-    }
-    return [
-        (name, value) for name, value in pairs if name.lower() not in drop and name.lower() not in named_by_connection
-    ]
+    named_by_connection = set()
+    for name, value in pairs:
+        if name.lower() == b"connection":
+            for token in value.split(b","):
+                named_by_connection.add(token.strip().lower())
+
+    kept = []
+    for name, value in pairs:
+        lowered = name.lower()
+        if lowered not in drop and lowered not in named_by_connection:
+            kept.append((lowered, value))
+    return kept
 
 
-def upstream_request_headers(client_headers: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+def upstream_request_headers(client_headers: Iterable[tuple[bytes, bytes]]) -> Headers:
     """Headers to send upstream: the client's own, including x-api-key/authorization (D12)."""
-    headers = _without(client_headers, HOP_BY_HOP_HEADERS | RECOMPUTED_REQUEST_HEADERS | {"accept-encoding"})
+    headers = _without(client_headers, HOP_BY_HOP_HEADERS | RECOMPUTED_REQUEST_HEADERS | {b"accept-encoding"})
     # Ask for an uncompressed body: then the bytes we relay are also bytes we can read for
     # recording. The client still gets a valid response (docs/decisions/0001).
-    headers.append(("accept-encoding", "identity"))
+    headers.append((b"accept-encoding", b"identity"))
     return headers
 
 
-def client_response_headers(upstream_headers: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+def client_response_headers(upstream_headers: Iterable[tuple[bytes, bytes]]) -> Headers:
     """Headers to return to the client: the upstream's own, minus hop-by-hop ones.
 
     `content-length` and `content-encoding` are kept: the body bytes are relayed unmodified,
@@ -98,7 +112,7 @@ async def open_upstream(client: httpx.AsyncClient, request: Request, body: bytes
     upstream_request = client.build_request(
         request.method,
         target,
-        headers=upstream_request_headers(request.headers.items()),
+        headers=upstream_request_headers(request.headers.raw),
         content=body,
     )
     return await client.send(upstream_request, stream=True)
@@ -114,19 +128,30 @@ async def relay(
     `on_chunk` sees a copy of every chunk (for recording). `on_end` is called exactly once
     with None if the body was fully relayed, or a short description of what went wrong.
     """
-    error: str | None = CLIENT_DISCONNECTED  # if we never reach the end, the client left
+    # Stays like this only if the loop is abandoned without an exception of its own: the
+    # generator was closed or cancelled, which happens when the client goes away.
+    error: str | None = CLIENT_DISCONNECTED
     try:
         # aiter_raw: the bytes exactly as received, with no decompression or re-encoding.
         async for chunk in upstream.aiter_raw():
             if on_chunk is not None:
-                on_chunk(chunk)
+                try:
+                    on_chunk(chunk)
+                except Exception:
+                    # A bug in whatever watches the stream must never cost the client its reply.
+                    log.exception("chunk_observer_failed")
+                    on_chunk = None
             yield chunk
         error = None
     except httpx.HTTPError as exc:
-        error = f"upstream stream failed: {type(exc).__name__}: {exc}"
-        log.warning("upstream_stream_failed", error=type(exc).__name__)
+        error = f"upstream stream failed: {describe(exc)}"
+        log.warning("upstream_stream_failed", error=describe(exc))
         # Re-raise so the server aborts the connection: the client must see a broken
         # response, not a clean-looking truncated one.
+        raise
+    except Exception as exc:
+        error = f"relay failed: {describe(exc)}"
+        log.exception("relay_failed")
         raise
     finally:
         if on_end is not None:
@@ -140,20 +165,32 @@ async def relay(
 def streaming_response(upstream: httpx.Response, body: AsyncIterator[bytes]) -> StreamingResponse:
     """A response with the upstream's status and headers whose body is `body` (from `relay`)."""
     response = StreamingResponse(body, status_code=upstream.status_code)
-    # headers.append (not a dict) so repeated headers such as set-cookie survive.
-    for name, value in client_response_headers(upstream.headers.multi_items()):
-        response.headers.append(name, value)
+    # Set the raw (name, value) byte pairs directly: keeps repeated headers such as set-cookie
+    # and never re-encodes a value.
+    response.raw_headers = client_response_headers(upstream.headers.raw)
     return response
 
 
-def gateway_error(exc: httpx.HTTPError) -> JSONResponse:
-    """The response when the upstream can't be reached at all.
+def describe(exc: BaseException) -> str:
+    """A short description of an error that is safe to log and store.
+
+    Network and timeout errors keep their message ("[Errno 111] Connection refused" is useful).
+    Anything else gets only its type name: protocol errors can quote the offending header value,
+    and a header value may be a credential (hard rule 2).
+    """
+    if isinstance(exc, httpx.NetworkError | httpx.TimeoutException):
+        return f"{type(exc).__name__}: {exc}"
+    return type(exc).__name__
+
+
+def gateway_error(exc: Exception) -> JSONResponse:
+    """The response when Liber could not forward the request at all.
 
     Shaped like an Anthropic API error so clients handle it normally; 502/504 are retried by
     the Anthropic SDKs and Claude Code.
     """
     status = 504 if isinstance(exc, httpx.TimeoutException) else 502
-    message = f"Liber could not reach the upstream API ({type(exc).__name__}: {exc})"
+    message = f"Liber could not forward the request to the upstream API ({describe(exc)})"
     return JSONResponse(
         status_code=status,
         content={"type": "error", "error": {"type": "api_error", "message": message}},

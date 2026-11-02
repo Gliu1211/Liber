@@ -79,7 +79,9 @@ class Store:
     """Async access to the SQLite database at `db_path`."""
 
     def __init__(self, db_path: Path) -> None:
-        self.engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        # hide_parameters: if an insert fails, SQLAlchemy's error message would otherwise quote
+        # the row's values (conversation text) into the logs.
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", hide_parameters=True)
         # expire_on_commit=False: records stay readable after their session closes.
         self._sessions = async_sessionmaker(self.engine, expire_on_commit=False)
 

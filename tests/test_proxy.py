@@ -12,6 +12,7 @@ import pytest
 
 from liber.app import create_app
 from liber.config import Settings
+from liber.proxy.forward import relay
 from liber.session.store import RequestRecord
 from tests.helpers import (
     MESSAGES_BODY,
@@ -393,3 +394,94 @@ async def test_recording_bodies_can_be_disabled(settings: Settings, upstream: Fa
     assert row.response_body is None
     # Usage is metadata, not content, so it is still recorded.
     assert row.output_tokens == 87
+
+
+# --- Robustness (review findings) -------------------------------------------------------------
+
+
+async def test_non_ascii_header_values_pass_through_byte_for_byte(
+    client: httpx.AsyncClient, upstream: FakeUpstream
+) -> None:
+    # Header values are bytes on the wire; Liber must not decode/re-encode them (that used to
+    # turn valid traffic into a 500).
+    request_value = "héllo → wörld".encode()
+    response_value = "café ✓".encode()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers=[(b"x-note", response_value)], content=b"{}")
+
+    upstream.handler = handler
+    response = await client.post(
+        "/v1/messages", json=MESSAGES_BODY, headers=[(b"x-title", request_value), (b"x-api-key", b"k")]
+    )
+
+    assert response.status_code == 200
+    assert (b"x-title", request_value) in upstream.last_request.headers.raw
+    assert (b"x-note", response_value) in response.headers.raw
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        b"[" * 200_000,  # so deeply nested that json.loads raises RecursionError
+        b"\xff\xfe not json",
+        b"",
+    ],
+)
+async def test_unusual_request_bodies_are_still_forwarded(
+    client: httpx.AsyncClient, upstream: FakeUpstream, records: Records, raw_body: bytes
+) -> None:
+    # Recording is optional, forwarding is not (hard rule 1): if Liber can't make sense of a
+    # body, the upstream still gets it and decides.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"type": "error", "error": {"type": "invalid_request_error"}})
+
+    upstream.handler = handler
+    response = await client.post("/v1/messages", content=raw_body, headers=CLIENT_HEADERS)
+
+    assert response.status_code == 400
+    assert upstream.last_request.content == raw_body
+    [row] = await records()
+    assert row.status_code == 400
+
+
+async def test_non_network_failure_mid_stream_is_labelled_as_such(
+    client: httpx.AsyncClient, upstream: FakeUpstream, records: Records
+) -> None:
+    async def broken_body() -> AsyncIterator[bytes]:
+        yield b"event: ping\ndata: {}\n\n"
+        raise RuntimeError("something unexpected")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=broken_body())
+
+    upstream.handler = handler
+    with pytest.raises(RuntimeError):
+        await client.post("/v1/messages", json=MESSAGES_BODY, headers=CLIENT_HEADERS)
+
+    [row] = await records()
+    assert row.error is not None
+    assert "RuntimeError" in row.error
+    assert "disconnect" not in row.error
+
+
+async def test_a_failing_chunk_observer_never_breaks_the_stream() -> None:
+    # relay() must deliver every byte even if whatever watches the chunks blows up.
+    body = STREAM_FIXTURE.read_bytes()
+    upstream_response = httpx.Response(200, content=stream_of(chunked(body, [10])))
+    endings: list[str | None] = []
+
+    def explode(chunk: bytes) -> None:
+        raise ValueError("observer bug")
+
+    received = b""
+    async for chunk in relay(upstream_response, on_chunk=explode, on_end=endings.append):
+        received += chunk
+
+    assert received == body
+    assert endings == [None]
+
+
+async def test_data_directory_is_private(app: object, settings: Settings) -> None:
+    # It holds conversation bodies (§11): only the owner may read it.
+    assert settings.data_dir.stat().st_mode & 0o777 == 0o700

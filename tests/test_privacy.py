@@ -1,6 +1,7 @@
 """Credentials pass through but are never stored or logged (CLAUDE.md hard rule 2, D12, §11)."""
 
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -36,16 +37,31 @@ async def test_credentials_are_forwarded_but_never_stored_or_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.DEBUG)  # the most verbose level any logger could use
-    responses = iter(
+
+    async def broken_stream() -> AsyncIterator[bytes]:
+        yield b"event: ping\ndata: {}\n\n"
+        raise httpx.ReadError("connection reset")
+
+    async def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    # Every path that writes to the database or the logs: success, upstream error, network
+    # failure before and during the response, and a passthrough request.
+    outcomes = iter(
         [
             sse_response(STREAM_FIXTURE.read_bytes()),
             httpx.Response(401, json={"type": "error", "error": {"type": "authentication_error"}}),
+            unreachable,
+            httpx.Response(200, headers={"content-type": "text/event-stream"}, content=broken_stream()),
             httpx.Response(200, json={"data": []}),
         ]
     )
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        return next(responses)
+        outcome = next(outcomes)
+        if callable(outcome):
+            return await outcome(request)
+        return outcome
 
     upstream.handler = handler
     secret_headers = {
@@ -55,6 +71,9 @@ async def test_credentials_are_forwarded_but_never_stored_or_logged(
     }
     await client.post("/v1/messages", json=MESSAGES_BODY, headers=secret_headers)
     await client.post("/v1/messages", json=MESSAGES_BODY, headers=secret_headers)
+    await client.post("/v1/messages", json=MESSAGES_BODY, headers=secret_headers)
+    with pytest.raises(httpx.ReadError):
+        await client.post("/v1/messages", json=MESSAGES_BODY, headers=secret_headers)
     await client.get("/v1/models", headers=secret_headers)
     rows = await recorded(app)
 
@@ -64,7 +83,7 @@ async def test_credentials_are_forwarded_but_never_stored_or_logged(
         assert sent.headers["authorization"] == SECRET_BEARER
 
     # ... but never written to the database ...
-    assert len(rows) == 2
+    assert len(rows) == 4  # the four /v1/messages calls; passthrough isn't recorded
     for row in rows:
         for column in RequestRecord.__table__.columns:
             value = str(getattr(row, column.key))

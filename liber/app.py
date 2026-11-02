@@ -13,12 +13,15 @@ Request path in Session 1 (a transparent proxy, no context editing yet):
 
 Steps 2-5 of §3 (identify session, parse, render with the edit plan, validate) arrive in
 Session 2 and slot in between 1 and 2 above.
+
+Hard rule 1: recording is optional, forwarding is not. Every recording step is guarded so a
+failure in it is logged and the request still goes through.
 """
 
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
@@ -30,6 +33,7 @@ from liber.config import Settings
 from liber.log import configure_logging
 from liber.proxy.forward import (
     create_upstream_client,
+    describe,
     gateway_error,
     open_upstream,
     relay,
@@ -52,7 +56,8 @@ def create_app(settings: Settings | None = None, upstream_transport: httpx.Async
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Startup: open the database and the shared upstream client. (The background worker
         # from §9 will also start here.)
-        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        # mode=0o700: the database holds conversation bodies, so only the owner may read it (§11).
+        settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         store = Store(settings.db_path)
         await store.create_tables()
         app.state.store = store
@@ -82,37 +87,24 @@ async def proxy_messages(request: Request) -> Response:
     settings: Settings = app.state.settings
     started = time.perf_counter()
     body = await request.body()
-    record = new_record(request, body, settings.record_bodies)
+    record = start_record(request, body, settings.record_bodies)
 
     try:
         upstream = await open_upstream(app.state.client, request, body)
-    except httpx.HTTPError as exc:
-        log.warning("upstream_unreachable", path=request.url.path, error=type(exc).__name__)
-        response = gateway_error(exc)
-        record.status_code = response.status_code
-        record.error = f"upstream unreachable: {type(exc).__name__}: {exc}"
-        record.duration_ms = elapsed_ms(started)
-        spawn_write(app, record)
-        return response
+    except Exception as exc:
+        return forwarding_failed(app, record, exc, started)
 
-    record.status_code = upstream.status_code
-    record.upstream_request_id = upstream.headers.get("request-id")
-    record.latency_ms = elapsed_ms(started)
-    capture = ReplyCapture(upstream.headers.get("content-type", ""), upstream.headers.get("content-encoding"))
-
-    def finish(relay_error: str | None) -> None:
-        # Called by relay() once the body has ended (or stopped early). Recording is best
-        # effort: a failure here is logged and must never affect the client's response.
-        try:
-            record.duration_ms = elapsed_ms(started)
-            fill_from_reply(record, capture.result(), settings.record_bodies)
-            problems = [p for p in (relay_error, record.error) if p]
-            record.error = "; ".join(problems) or None
-            spawn_write(app, record)
-        except Exception:
-            log.exception("recording_failed", path=request.url.path)
-
-    return streaming_response(upstream, relay(upstream, on_chunk=capture.feed, on_end=finish))
+    try:
+        record.status_code = upstream.status_code
+        record.upstream_request_id = upstream.headers.get("request-id")
+        record.latency_ms = elapsed_ms(started)
+        capture = ReplyCapture(upstream.headers.get("content-type", ""), upstream.headers.get("content-encoding"))
+        finish = recording_finisher(app, record, capture, started)
+        return streaming_response(upstream, relay(upstream, on_chunk=capture.feed, on_end=finish))
+    except Exception as exc:
+        # Nothing has been sent to the client yet, so it can still get a clean error.
+        await upstream.aclose()
+        return forwarding_failed(app, record, exc, started)
 
 
 async def proxy_other(request: Request) -> Response:
@@ -120,35 +112,57 @@ async def proxy_other(request: Request) -> Response:
     body = await request.body()
     try:
         upstream = await open_upstream(request.app.state.client, request, body)
-    except httpx.HTTPError as exc:
-        log.warning("upstream_unreachable", path=request.url.path, error=type(exc).__name__)
+    except Exception as exc:
+        log_forwarding_failure(request.url.path, exc)
         return gateway_error(exc)
     return streaming_response(upstream, relay(upstream))
+
+
+def forwarding_failed(app: FastAPI, record: RequestRecord, exc: Exception, started: float) -> Response:
+    """The request could not be forwarded: answer with an API-style error and record why."""
+    log_forwarding_failure(record.path, exc)
+    response = gateway_error(exc)
+    record.status_code = response.status_code
+    record.error = f"could not forward: {describe(exc)}"
+    record.duration_ms = elapsed_ms(started)
+    spawn_write(app, record)
+    return response
+
+
+def log_forwarding_failure(path: str, exc: Exception) -> None:
+    if isinstance(exc, httpx.HTTPError):
+        log.warning("upstream_unreachable", path=path, error=describe(exc))
+    else:
+        log.exception("forwarding_failed", path=path)  # a Liber bug: keep the traceback
 
 
 # --- Recording helpers ------------------------------------------------------------------------
 
 
-def new_record(request: Request, body: bytes, keep_body: bool) -> RequestRecord:
-    """Start a `requests` row with what is known before forwarding."""
-    model, stream = request_summary(body)
+def start_record(request: Request, body: bytes, keep_body: bool) -> RequestRecord:
+    """Start a `requests` row with what is known before forwarding. Never raises."""
     path = request.url.path + (f"?{request.url.query}" if request.url.query else "")
-    return RequestRecord(
-        created_at=datetime.now(UTC),
-        method=request.method,
-        path=path,
-        model=model,
-        stream=stream,
-        request_headers=recordable_headers(request.headers.items()),
-        request_body=body.decode("utf-8", errors="replace") if keep_body else None,
-    )
+    try:
+        model, stream = request_summary(body)
+        return RequestRecord(
+            created_at=datetime.now(UTC),
+            method=request.method,
+            path=path,
+            model=model,
+            stream=stream,
+            request_headers=recordable_headers(request.headers.items()),
+            request_body=body.decode("utf-8", errors="replace") if keep_body else None,
+        )
+    except Exception:
+        log.exception("recording_failed", path=path)
+        return RequestRecord(created_at=datetime.now(UTC), method=request.method, path=path)
 
 
 def request_summary(body: bytes) -> tuple[str | None, bool | None]:
     """The model name and stream flag from a request body; Nones if it isn't usable JSON."""
     try:
         parsed = json.loads(body)
-    except ValueError:  # includes invalid UTF-8
+    except (ValueError, RecursionError):  # not JSON, invalid UTF-8, or absurdly deep nesting
         return None, None
     if not isinstance(parsed, dict):
         return None, None
@@ -158,6 +172,26 @@ def request_summary(body: bytes) -> tuple[str | None, bool | None]:
         model if isinstance(model, str) else None,
         stream if isinstance(stream, bool) else None,
     )
+
+
+def recording_finisher(
+    app: FastAPI, record: RequestRecord, capture: ReplyCapture, started: float
+) -> Callable[[str | None], None]:
+    """The `on_end` callback for relay(): completes the record once the body has ended."""
+    keep_body: bool = app.state.settings.record_bodies
+
+    def finish(relay_error: str | None) -> None:
+        # Recording is best effort: a failure here is logged and must never affect the client.
+        try:
+            record.duration_ms = elapsed_ms(started)
+            fill_from_reply(record, capture.result(), keep_body)
+            problems = [p for p in (relay_error, record.error) if p]
+            record.error = "; ".join(problems) or None
+            spawn_write(app, record)
+        except Exception:
+            log.exception("recording_failed", path=record.path)
+
+    return finish
 
 
 def fill_from_reply(record: RequestRecord, reply: CapturedReply, keep_body: bool) -> None:

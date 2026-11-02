@@ -82,5 +82,6 @@ are recorded in [docs/decisions/](docs/decisions/).
   client already uses.
 - Credential headers are forwarded but never written to the database or logs (tested).
 - Request and response bodies (your conversations, which may include code and secrets) are
-  stored locally in `~/.liber/liber.db` unless `LIBER_RECORD_BODIES=false`. Delete that file to
-  remove them (a `liber purge` command is planned).
+  stored locally in `~/.liber/liber.db` unless `LIBER_RECORD_BODIES=false`. Liber creates
+  `~/.liber` readable by you only (mode 700). Delete the database to remove everything (a
+  `liber purge` command is planned).

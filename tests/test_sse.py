@@ -248,3 +248,20 @@ def test_capture_skips_compressed_bodies() -> None:
     assert reply.message is None
     assert reply.body_text is None
     assert reply.problem is not None and "gzip" in reply.problem
+
+
+def test_capture_treats_media_types_case_insensitively() -> None:
+    capture = ReplyCapture("Text/Event-Stream; charset=UTF-8", content_encoding=None)
+    capture.feed(STREAM_FIXTURE.read_bytes())
+
+    assert capture.result().usage.output_tokens == 87
+
+
+def test_capture_reports_a_body_that_is_not_json() -> None:
+    capture = ReplyCapture("text/html", content_encoding=None)
+    capture.feed(b"<html>502 Bad Gateway</html>")
+
+    reply = capture.result()
+
+    assert reply.body_text == "<html>502 Bad Gateway</html>"
+    assert reply.problem is not None and "not JSON" in reply.problem
