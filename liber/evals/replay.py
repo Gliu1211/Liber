@@ -4,7 +4,8 @@ ARCHITECTURE.md §12 (Tier 1 runs against recorded fixture sessions) and §13 (e
 
 A client like Claude Code resends the whole conversation on every turn. So a session is stored
 once, as its final request, and replayed as the sequence of requests that led up to it: one per
-turn that ends with the user speaking (or with a system message right after the user).
+turn that ends with the user speaking (or with a system message right after the user). Bodies
+are compact JSON, as the TypeScript SDK behind Claude Code sends them.
 
 Session fixture format (one JSON file per session in tests/fixtures/sessions/):
 
@@ -19,7 +20,9 @@ Session fixture format (one JSON file per session in tests/fixtures/sessions/):
     }
 
 Branches cover a retry (keep N messages, add none), an edited prompt (keep the messages before
-the edit, then the new ones) and the client's own compaction (keep none).
+the edit, then the new ones) and the client's own compaction (keep none). A branch is replayed
+turn by turn like the main conversation, from its first new request on, so continuing a fork is
+exercised too.
 """
 
 import copy
@@ -51,7 +54,7 @@ class SessionFixture:
 class ReplayedRequest:
     session: str
     index: int  # position in the session's replay, from 0
-    label: str  # "turn 5" (the request carries the first 5 messages) or "branch 2"
+    label: str  # "turn 5" (the request carries the first 5 messages) or "branch 2 turn 5"
     body: bytes  # exactly what the client would send
 
 
@@ -78,15 +81,17 @@ def load_sessions(directory: Path) -> list[SessionFixture]:
 
 
 def ends_a_turn(messages: list[dict[str, Any]], index: int) -> bool:
-    """Would a client send a request whose last message is messages[index]?
+    """Did a client send a request whose last message is messages[index]?
 
-    Yes after a user message, and after a system message that directly follows one (the API
-    allows a system message as the last entry). Not after an assistant message: that is the
-    model's own reply.
+    After a user message, yes, unless a system message follows it directly: then the two went
+    out together. After a system message that follows a user message, yes (the API allows a
+    system message as the last entry). Never after an assistant message: that's the model's
+    reply.
     """
     role = messages[index]["role"]
+    followed_by_system = index + 1 < len(messages) and messages[index + 1]["role"] == "system"
     if role == "user":
-        return True
+        return not followed_by_system
     return role == "system" and index > 0 and messages[index - 1]["role"] == "user"
 
 
@@ -97,7 +102,13 @@ def replay(session: SessionFixture) -> list[ReplayedRequest]:
         (f"turn {index + 1}", full[: index + 1]) for index in range(len(full)) if ends_a_turn(full, index)
     ]
     for number, branch in enumerate(session.branches, start=1):
-        histories.append((f"branch {number}", full[: branch.keep_messages] + branch.messages))
+        history = full[: branch.keep_messages] + branch.messages
+        # From the last kept message on: that's a retry when nothing new follows, otherwise the
+        # requests the branch adds. Earlier turns were already sent by the main conversation.
+        first = max(branch.keep_messages - 1, 0)
+        for index in range(first, len(history)):
+            if ends_a_turn(history, index):
+                histories.append((f"branch {number} turn {index + 1}", history[: index + 1]))
 
     requests = []
     for index, (label, messages) in enumerate(histories):
@@ -127,5 +138,5 @@ def with_marker_on_last_block(messages: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def encode_like_a_client(body: dict[str, Any]) -> bytes:
-    """JSON as the Anthropic SDKs send it (Python's default separators, UTF-8)."""
-    return json.dumps(body, ensure_ascii=False).encode("utf-8")
+    """Compact JSON, UTF-8: what Claude Code's TypeScript SDK sends (JSON.stringify)."""
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

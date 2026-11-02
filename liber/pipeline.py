@@ -42,6 +42,7 @@ class Prepared:
     body: bytes
     outcome: str = "fallback"  # "passthrough", "rendered" or "fallback"
     request: Any = None  # the decoded client request (None if it wasn't JSON), for recording
+    rendered: dict[str, Any] | None = None  # what render() produced, whether or not it was sent
     session_id: str | None = None
     branch_id: str | None = None
     known_messages: int | None = None
@@ -69,6 +70,7 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
 
         plan = Plan()  # the session's applied plan; plans are stored from Session 4
         rendered = render(parsed, plan)
+        prepared.rendered = rendered
         prepared.violations = validate(rendered, original=reference)
 
         if prepared.violations:

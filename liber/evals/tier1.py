@@ -27,9 +27,11 @@ Metrics (definitions in docs/decisions/0006-tier1-metric-definitions.md):
 
 import argparse
 import asyncio
+import hashlib
 import json
+import statistics
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +40,6 @@ from liber.evals.metrics import Metric, p95, ratio, write_results, write_trace
 from liber.evals.replay import ReplayedRequest, load_sessions, replay
 from liber.model.anthropic import parse, render
 from liber.model.items import Plan
-from liber.model.validate import validate
 from liber.session.store import Store
 
 OVERHEAD_BUDGET_MS = 10.0  # §3: steps 2-5 must add only a few milliseconds
@@ -49,16 +50,23 @@ DEFAULT_OUT = Path("evals/results/latest.json")
 WARMUP_BODY = b'{"model": "warm-up", "system": "warm-up", "messages": [{"role": "user", "content": "warm-up"}]}'
 
 
+# The request path is timed this many times, each on a fresh database; the reported p95 is the
+# median of the runs' p95s, so one unlucky run (a scheduler hiccup) doesn't move the gate.
+TIMING_RUNS = 3
+
+
+class EvalError(Exception):
+    """The run measured nothing (no fixtures, or a session with no requests): not a pass."""
+
+
 @dataclass
 class RenderCheck:
-    """What the model functions did with one request."""
+    """What the model functions did with one request, outside the request path."""
 
-    valid: bool = False
-    violations: list[str] = field(default_factory=list)
     round_trip: bool = False
     deterministic: bool = False
+    rendered_sha256: str | None = None  # fingerprint of the bytes Liber would send if it edited
     tokens_before: int = 0
-    tokens_after: int = 0
     error: str | None = None
 
 
@@ -70,26 +78,24 @@ class Tier1Result:
 
 
 def check_render(body: bytes, plan: Plan) -> RenderCheck:
-    """Parse, render and validate one request directly, the way the request path does."""
+    """Round trip, determinism and token estimate for one request, from scratch each time."""
     check = RenderCheck()
     try:
-        request = json.loads(body)
         reference = json.loads(body)  # an independent copy to compare against
-        parsed = parse(request)
-        rendered = render(parsed, plan)
-        check.violations = [str(v) for v in validate(rendered, original=reference)]
-        check.valid = not check.violations
+        parsed = parse(json.loads(body))
+        check.tokens_before = sum(item.tokens for item in parsed.items)
         # Round trip is always about the empty plan, even once real plans exist: "no edits" must
         # give back the client's request, equal as data *and* in key order.
-        unedited = rendered if plan.is_empty else render(parse(json.loads(body)), Plan())
+        unedited = render(parsed, Plan())
         check.round_trip = unedited == reference and json.dumps(unedited) == json.dumps(reference)
-        # Render the same bytes again from scratch: the output must not vary (ADR 0004 A2).
-        second = render(parse(json.loads(body)), plan)
-        check.deterministic = pipeline.encode_request(rendered) == pipeline.encode_request(second)
-        check.tokens_before = sum(item.tokens for item in parsed.items)
-        check.tokens_after = sum(item.tokens for item in parse(rendered).items)
+        # Render twice from scratch: the bytes must not vary (ADR 0004 A2). The fingerprint goes in
+        # the trace, so two runs in separate processes can be compared too (a restart of Liber).
+        first = pipeline.encode_request(render(parse(json.loads(body)), plan))
+        second = pipeline.encode_request(render(parse(json.loads(body)), plan))
+        check.deterministic = first == second
+        check.rendered_sha256 = hashlib.sha256(first).hexdigest()
     except Exception as exc:
-        check.error = f"{type(exc).__name__}: {exc}"  # fixtures are synthetic: safe to show
+        check.error = pipeline.describe_failure(exc)
     return check
 
 
@@ -105,46 +111,67 @@ async def run_request_path(requests: list[ReplayedRequest]) -> list[pipeline.Pre
             await store.close()
 
 
+def tokens_sent(result: pipeline.Prepared, tokens_before: int) -> int:
+    """Estimated tokens in what actually went upstream: the client's own request unless Liber
+    sent a rendered one. A render that failed validation was never sent, so it saves nothing."""
+    if result.outcome != "rendered":
+        return tokens_before
+    return sum(item.tokens for item in parse(json.loads(result.body)).items)
+
+
 async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) -> Tier1Result:
     sessions = load_sessions(sessions_dir)
-    requests = [request for session in sessions for request in replay(session)]
+    if not sessions:
+        raise EvalError(f"no session fixtures in {sessions_dir}")
+    requests: list[ReplayedRequest] = []
+    for session in sessions:
+        replayed = replay(session)
+        if not replayed:
+            raise EvalError(f"session {session.name} replays to no requests")
+        requests += replayed
+
     plan = Plan()  # the plan the request path applies: always empty until Session 4
     checks = [check_render(request.body, plan) for request in requests]
-    prepared = await run_request_path(requests)
+    runs = [await run_request_path(requests) for _ in range(TIMING_RUNS)]
+    prepared = runs[0]  # outcomes don't depend on timing; the first run is the one traced
 
-    trace = [
-        {
-            "session": request.session,
-            "label": request.label,
-            "index": request.index,
-            "messages": len(json.loads(request.body)["messages"]),
-            "plan_version": None,  # no plans until Session 4
-            "outcome": result.outcome,
-            "liber_error": result.error,
-            "known_messages": result.known_messages,
-            "new_messages": result.new_messages,
-            "valid": check.valid,
-            "violations": check.violations,
-            "round_trip": check.round_trip,
-            "deterministic": check.deterministic,
-            "tokens_before": check.tokens_before,
-            "tokens_after": check.tokens_after,
-            "check_error": check.error,
-            "overhead_ms": result.overhead_ms,
-        }
-        for request, check, result in zip(requests, checks, prepared, strict=True)
-    ]
+    trace: list[dict[str, Any]] = []
+    for request, check, result in zip(requests, checks, prepared, strict=True):
+        trace.append(
+            {
+                "session": request.session,
+                "label": request.label,
+                "index": request.index,
+                "messages": len(json.loads(request.body)["messages"]),
+                "plan_version": None,  # no plans until Session 4
+                "outcome": result.outcome,
+                "liber_error": result.error,
+                "known_messages": result.known_messages,
+                "new_messages": result.new_messages,
+                # Validity is judged on what the request path itself rendered.
+                "valid": result.rendered is not None and not result.violations,
+                "violations": [str(v) for v in result.violations],
+                "round_trip": check.round_trip,
+                "deterministic": check.deterministic,
+                "rendered_sha256": check.rendered_sha256,
+                "tokens_before": check.tokens_before,
+                "tokens_after": tokens_sent(result, check.tokens_before),
+                "check_error": check.error,
+                "overhead_ms": result.overhead_ms,
+            }
+        )
 
     total = len(requests)
-    tokens_before = sum(check.tokens_before for check in checks)
-    tokens_after = sum(check.tokens_after for check in checks)
-    overhead = p95([result.overhead_ms or 0.0 for result in prepared])
+    tokens_before = sum(record["tokens_before"] for record in trace)
+    tokens_after = sum(record["tokens_after"] for record in trace)
+    run_p95s = [p95([result.overhead_ms or 0.0 for result in run]) for run in runs]
+    overhead = statistics.median(run_p95s)
     metrics = {
         "validity_rate": Metric(
-            ratio(sum(check.valid for check in checks), total),
+            ratio(sum(record["valid"] for record in trace), total),
             "higher",
             0.0,
-            "Share of rendered requests that pass the validator (§5).",
+            "Share of requests whose rendering on the request path passes the validator (§5).",
         ),
         "round_trip_identity": Metric(
             ratio(sum(check.round_trip for check in checks), total),
@@ -153,7 +180,7 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
             "Share of requests an empty plan reproduces exactly, key order included.",
         ),
         "fallback_rate": Metric(
-            round(sum(result.outcome == "fallback" for result in prepared) / total, 6) if total else 0.0,
+            round(sum(result.outcome == "fallback" for result in prepared) / total, 6),
             "lower",
             0.0,
             "Share of requests the pipeline forwarded untouched because something failed.",
@@ -162,7 +189,7 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
             round(1 - tokens_after / tokens_before, 6) if tokens_before else 0.0,
             "higher",
             0.02,
-            "1 - estimated input tokens Liber sends / tokens the client sent, over all requests.",
+            "1 - estimated input tokens actually sent / tokens the client sent, over all requests.",
         ),
         "prefix_stability": Metric(
             1.0,
@@ -180,16 +207,19 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
         "p95_overhead_ms": Metric(
             round(overhead, 3),
             "lower",
-            # The gate allows a rise up to the tolerance, so "budget left" makes it fail exactly
-            # when p95 passes the budget, on any machine the baseline was recorded on.
-            round(max(0.0, budget_ms - overhead), 3),
-            f"p95 of §3 steps 2-5 on the request path, in ms (budget {budget_ms:g} ms).",
+            # "Budget left": the gate fails once p95 rises by more than the tolerance, i.e. exactly
+            # when it passes the budget. Negative if the baseline itself was over budget, so the
+            # gate still demands getting back under it.
+            round(budget_ms - overhead, 3),
+            f"p95 of §3 steps 2-5 on the request path, in ms; median of {TIMING_RUNS} runs (budget {budget_ms:g} ms).",
         ),
     }
     summary = {
         "sessions": [session.name for session in sessions],
         "requests": total,
         "overhead_budget_ms": budget_ms,
+        # Not gated, but worth a look: p95 hides single slow requests.
+        "max_overhead_ms": max(result.overhead_ms or 0.0 for run in runs for result in run),
         "plan": "empty (plans arrive in Session 4)",
     }
     return Tier1Result(metrics=metrics, trace=trace, summary=summary)
@@ -206,7 +236,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget-ms", type=float, default=OVERHEAD_BUDGET_MS, help="request-path p95 budget")
     args = parser.parse_args(argv)
 
-    result = asyncio.run(evaluate(args.sessions, args.budget_ms))
+    try:
+        result = asyncio.run(evaluate(args.sessions, args.budget_ms))
+    except EvalError as exc:
+        print(f"tier1: FAILED: {exc}")
+        return 2  # an empty run must never look like a perfect one
     write_results(args.out, result.metrics, result.summary)
     write_trace(trace_path(args.out), result.trace)
 
@@ -214,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     for name, metric in result.metrics.items():
         print(f"  {name:20s} {metric.value:g}")
     print(f"  results: {args.out}  trace: {trace_path(args.out)}")
-    return 0  # pass/fail is the gate's job (scripts/eval_gate.py)
+    return 0  # pass/fail on the numbers is the gate's job (scripts/eval_gate.py)
 
 
 if __name__ == "__main__":

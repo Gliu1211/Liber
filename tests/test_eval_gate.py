@@ -109,3 +109,16 @@ def test_the_gate_reads_real_tier1_output(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "render_determinism" in result.stdout
+
+
+def test_a_baseline_recorded_over_budget_still_enforces_the_budget(tmp_path: Path) -> None:
+    # tier1 sets the p95 tolerance to "budget - value": negative when the baseline itself was
+    # over budget. The gate must then fail anything over budget, not accept the slow baseline.
+    over = {"p95_overhead_ms": {"value": 11.0, "direction": "lower", "tolerance": 10.0 - 11.0}}
+    baseline = write(tmp_path / "baseline.json", over)
+
+    still_slow = write(tmp_path / "a.json", {"p95_overhead_ms": {**over["p95_overhead_ms"], "value": 10.9}})
+    back_in_budget = write(tmp_path / "b.json", {"p95_overhead_ms": {**over["p95_overhead_ms"], "value": 9.9}})
+
+    assert run_gate(still_slow, baseline).returncode == 1
+    assert run_gate(back_in_budget, baseline).returncode == 0

@@ -7,7 +7,10 @@ that can't fail is no gate.
 """
 
 import json
+import os
 import random
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,7 @@ from liber.evals.replay import load_sessions, replay
 from tests.helpers import FIXTURES
 
 SESSIONS = FIXTURES / "sessions"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 METRICS = {
     "validity_rate",
     "round_trip_identity",
@@ -69,18 +73,35 @@ def test_replay_includes_retries_forks_and_rewrites() -> None:
     labels = [r.label for r in requests]
 
     assert labels[:4] == ["turn 1", "turn 3", "turn 5", "turn 7"]
-    assert labels[4:] == ["branch 1", "branch 2", "branch 3"]
-    retry, fork, rewrite = (json.loads(r.body)["messages"] for r in requests[4:])
+    # Branches are replayed turn by turn too, so continuing a fork is exercised, not just its end.
+    assert labels[4:] == [
+        "branch 1 turn 3",  # retry of turn 3
+        "branch 2 turn 3",  # the edited prompt...
+        "branch 2 turn 5",  # ...and the conversation continuing on the fork
+        "branch 3 turn 1",  # the client's compaction summary...
+        "branch 3 turn 3",  # ...and the next turn after it
+    ]
+    retry, fork, fork_continued, rewrite, _ = (json.loads(r.body)["messages"] for r in requests[4:])
     assert len(retry) == 3
-    assert fork[2]["content"] == "Now one about wind."
+    assert fork[2]["content"] == "Now one about wind." and len(fork) == 3
+    assert len(fork_continued) == 5
     assert rewrite[0]["content"].startswith("Summary so far")
 
 
 def test_system_messages_end_a_request_only_after_a_user_turn() -> None:
     requests = bodies("system_messages")
 
-    # Not the effort-only system message on its own, but the one that follows a user turn.
-    assert [len(r["messages"]) for r in requests] == [2, 4, 5, 7]
+    # Not the effort-only system message on its own. And the user turn at 4 went out together
+    # with the system message after it (5): the client never sent it alone.
+    assert [len(r["messages"]) for r in requests] == [2, 5, 7]
+
+
+def test_requests_are_compact_json_like_the_typescript_sdk() -> None:
+    [session] = [s for s in load_sessions(SESSIONS) if s.name == "chat_short"]
+    body = replay(session)[0].body
+
+    assert b'", "' not in body and b'": ' not in body
+    assert json.loads(body)["messages"][0]["content"] == "Hi! Can you help me plan a short trip?"
 
 
 def test_replay_moves_the_cache_marker_like_claude_code() -> None:
@@ -117,11 +138,34 @@ async def test_metrics_on_the_fixtures() -> None:
     # asserting a timing in two places would only double the chance of a flaky failure.)
     p95 = metrics["p95_overhead_ms"]
     assert p95.value > 0
-    assert p95.tolerance == pytest.approx(max(0.0, tier1.OVERHEAD_BUDGET_MS - p95.value))
+    # No max(0, ...): a baseline recorded over budget gets a negative tolerance, so the gate
+    # still fails on anything over budget instead of accepting the over-budget value.
+    assert p95.tolerance == pytest.approx(tier1.OVERHEAD_BUDGET_MS - p95.value)
 
     assert len(result.trace) == result.summary["requests"] >= 60
     first = result.trace[0]
-    assert {"session", "label", "plan_version", "valid", "violations", "tokens_before", "tokens_after"} <= first.keys()
+    assert {
+        "session",
+        "label",
+        "plan_version",
+        "valid",
+        "violations",
+        "tokens_before",
+        "tokens_after",
+        "rendered_sha256",
+    } <= first.keys()
+
+
+def test_an_empty_run_is_an_error_not_a_perfect_score(tmp_path: Path) -> None:
+    # No requests would make every metric look perfect; the run must fail instead.
+    assert tier1.main(["--out", str(tmp_path / "latest.json"), "--sessions", str(tmp_path / "missing")]) != 0
+
+    empty = tmp_path / "sessions"
+    empty.mkdir()
+    (empty / "only_assistant.json").write_text(
+        json.dumps({"request": {"model": "m", "messages": [{"role": "assistant", "content": "hi"}]}})
+    )
+    assert tier1.main(["--out", str(tmp_path / "latest.json"), "--sessions", str(empty)]) != 0
 
 
 def test_cli_writes_the_gate_format_and_a_trace(tmp_path: Path) -> None:
@@ -139,16 +183,21 @@ def test_cli_writes_the_gate_format_and_a_trace(tmp_path: Path) -> None:
 
 def without_timings(results: dict[str, Any], trace: list[dict[str, Any]]) -> tuple[Any, Any]:
     results["metrics"].pop("p95_overhead_ms")
+    results["summary"].pop("max_overhead_ms")
     for record in trace:
         record.pop("overhead_ms")
     return results, trace
 
 
-def test_output_is_deterministic_apart_from_timings(tmp_path: Path) -> None:
+def test_output_is_deterministic_across_processes(tmp_path: Path) -> None:
+    # Two separate `python -m` runs with different hash seeds: what a restart of Liber looks like.
+    # Anything that depends on set or dict-of-hash ordering would show up in rendered_sha256.
     runs = []
-    for name in ("a", "b"):
-        out = tmp_path / name / "latest.json"
-        tier1.main(["--out", str(out), "--sessions", str(SESSIONS)])
+    for seed in ("1", "2"):
+        out = tmp_path / seed / "latest.json"
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        command = [sys.executable, "-m", "liber.evals.tier1", "--out", str(out), "--sessions", str(SESSIONS)]
+        subprocess.run(command, check=True, capture_output=True, env=env, cwd=REPO_ROOT)
         trace = [json.loads(line) for line in out.with_name("latest.trace.jsonl").read_text().splitlines()]
         runs.append(without_timings(json.loads(out.read_text()), trace))
 
@@ -174,19 +223,22 @@ async def test_render_determinism_catches_a_render_that_varies(monkeypatch: pyte
 
 
 async def test_validity_rate_catches_a_render_that_breaks_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_render = tier1.render
+    # Validity is measured on what the request path itself rendered, so that's what is broken here.
+    real_render = pipeline.render
 
     def breaking_render(parsed: Any, plan: Any) -> dict[str, Any]:
         rendered = real_render(parsed, plan)
         rendered["messages"] = [{"role": "assistant", "content": "oops"}, *rendered["messages"]]
         return rendered
 
-    monkeypatch.setattr(tier1, "render", breaking_render)
+    monkeypatch.setattr(pipeline, "render", breaking_render)
 
     result = await tier1.evaluate(SESSIONS)
 
     assert result.metrics["validity_rate"].value == 0.0
-    assert any(record["violations"] for record in result.trace)
+    assert all(record["violations"] for record in result.trace)
+    # Nothing invalid was sent, so nothing counts as saved.
+    assert result.metrics["token_reduction"].value == 0.0
 
 
 async def test_round_trip_identity_is_strict_about_key_order(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -213,3 +265,20 @@ async def test_fallback_rate_counts_requests_liber_stepped_aside_from(monkeypatc
 
     assert result.metrics["fallback_rate"].value == 1.0
     assert all(record["outcome"] == "fallback" for record in result.trace)
+
+
+async def test_token_reduction_counts_only_what_is_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A render that drops content but fails validation is never sent: no saving may be claimed.
+    real_render = pipeline.render
+
+    def lossy_invalid_render(parsed: Any, plan: Any) -> dict[str, Any]:
+        rendered = real_render(parsed, plan)
+        rendered["messages"] = [*rendered["messages"][-1:], {"role": "user", "content": "again"}]
+        return rendered
+
+    monkeypatch.setattr(pipeline, "render", lossy_invalid_render)
+
+    result = await tier1.evaluate(SESSIONS)
+
+    assert result.metrics["token_reduction"].value == 0.0
+    assert all(record["tokens_after"] == record["tokens_before"] for record in result.trace)
