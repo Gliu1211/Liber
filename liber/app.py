@@ -1,18 +1,17 @@
 """The FastAPI application: routes and lifespan (ARCHITECTURE.md §3, §13).
 
-Request path in Session 1 (a transparent proxy, no context editing yet):
+Request path (Session 2: conversations are identified and checked; no edits yet):
 
     POST /v1/messages
       1. read the raw body                       (§3 step 1)
-      2. forward it upstream unchanged           (§3 step 6)
-      3. relay the response chunk by chunk, while ReplyCapture watches a copy
-      4. when the body ends, record the exchange (§3 step 7) in a background task
+      2. pipeline.prepare(): parse, identify the conversation, render with the applied plan,
+         validate, and choose the bytes to send  (§3 steps 2-5)
+      3. forward those bytes upstream            (§3 step 6)
+      4. relay the response chunk by chunk, while ReplyCapture watches a copy
+      5. when the body ends, record the exchange (§3 step 7) in a background task
 
     any other method/path
       forward and relay unchanged, no recording
-
-Steps 2-5 of §3 (identify session, parse, render with the edit plan, validate) arrive in
-Session 2 and slot in between 1 and 2 above.
 
 Hard rule 1: recording is optional, forwarding is not. Every recording step is guarded so a
 failure in it is logged and the request still goes through.
@@ -31,6 +30,7 @@ from fastapi import FastAPI, Request, Response
 
 from liber.config import Settings
 from liber.log import configure_logging
+from liber.pipeline import Prepared, prepare
 from liber.proxy.forward import (
     create_upstream_client,
     describe,
@@ -82,15 +82,19 @@ def create_app(settings: Settings | None = None, upstream_transport: httpx.Async
 
 
 async def proxy_messages(request: Request) -> Response:
-    """POST /v1/messages: forward, stream the reply back, and record the exchange."""
+    """POST /v1/messages: decide what to send, forward it, stream the reply back, record it all."""
     app = request.app
     settings: Settings = app.state.settings
     started = time.perf_counter()
     body = await request.body()
     record = start_record(request, body, settings.record_bodies)
 
+    # §3 steps 2-5. prepare() never raises; on any problem it hands back the client's own bytes.
+    prepared = await prepare(app.state.store, body)
+    note_preparation(record, prepared)
+
     try:
-        upstream = await open_upstream(app.state.client, request, body)
+        upstream = await open_upstream(app.state.client, request, prepared.body)
     except Exception as exc:
         return forwarding_failed(app, record, exc, started)
 
@@ -156,6 +160,18 @@ def start_record(request: Request, body: bytes, keep_body: bool) -> RequestRecor
     except Exception:
         log.exception("recording_failed", path=path)
         return RequestRecord(created_at=datetime.now(UTC), method=request.method, path=path)
+
+
+def note_preparation(record: RequestRecord, prepared: Prepared) -> None:
+    """Copy what the pipeline decided onto the request's row."""
+    record.session_id = prepared.session_id
+    record.branch_id = prepared.branch_id
+    record.known_messages = prepared.known_messages
+    record.new_messages = prepared.new_messages
+    record.liber_outcome = prepared.outcome
+    record.liber_error = prepared.error
+    record.violations = json.dumps([str(v) for v in prepared.violations]) if prepared.violations else None
+    record.overhead_ms = prepared.overhead_ms
 
 
 def request_summary(body: bytes) -> tuple[str | None, bool | None]:

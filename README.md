@@ -5,10 +5,12 @@ summarize, offload, or delete individual items) instead of relying on the client
 auto-compaction. The design lives in [ARCHITECTURE.md](ARCHITECTURE.md); progress is logged in
 [docs/PROGRESS.md](docs/PROGRESS.md).
 
-**Status:** Session 1, a transparent passthrough proxy. Liber forwards every request to the
-Anthropic API unchanged, streams the answer back as it arrives, and records each
-`POST /v1/messages` exchange (token usage, cache reads and writes, latency) in a local SQLite
-database. Context editing arrives in later sessions.
+**Status:** Session 2. Liber forwards every request to the Anthropic API, streams the answer
+back as it arrives, and records each `POST /v1/messages` exchange (token usage, cache reads and
+writes, latency) in a local SQLite database. It also recognises which conversation each
+request belongs to (a tree of sessions and branches), splits it into items (one per content
+block), and checks it against the API's rules. It doesn't edit anything yet: every request
+still goes upstream byte for byte. Edit plans arrive in Session 4.
 
 ## Setup
 
@@ -44,6 +46,23 @@ sqlite3 ~/.liber/liber.db \
 
 Any client that speaks the Anthropic Messages API and lets you set a base URL works the same way
 (for the Anthropic SDKs, `ANTHROPIC_BASE_URL` or `base_url=`).
+
+### What Liber records
+
+| Table | One row per |
+|---|---|
+| `requests` | `POST /v1/messages`: usage, latency, and what Liber did (`liber_outcome`, `session_id`, `known_messages`/`new_messages`, `violations`, `overhead_ms`) |
+| `sessions`, `branches`, `chain_nodes` | conversation, path through it, message (by hash: [D7](ARCHITECTURE.md), [ADR 0005](docs/decisions/0005-conversation-identity-details.md)) |
+| `items` | content block: role, kind, position, content hash, estimated tokens. Never the content itself. |
+
+`liber_outcome` is `passthrough` when nothing needed changing (the normal case for now) or
+`fallback` when Liber stepped aside. Either way the client's original request was sent. To see
+any fallbacks and why:
+
+```bash
+sqlite3 ~/.liber/liber.db \
+  "select created_at, liber_error, violations from requests where liber_outcome = 'fallback' order by id desc limit 10"
+```
 
 ## Configuration
 
