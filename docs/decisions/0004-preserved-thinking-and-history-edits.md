@@ -1,6 +1,6 @@
 # 0004: Preserved thinking vs. Liber's history edits
 
-- Status: **Proposed. The owner needs to decide before Session 4 (plans) starts.**
+- Status: **Accepted** (owner, 2026-11-02): Option 1 with amendments A1–A5 below.
 - Date: 2026-11-02
 
 ## Context
@@ -43,24 +43,51 @@ bytes unchanged.
 3. **Only edit when no thinking block follows the edit point.**
    - Problem: Claude Code turns almost always contain thinking, so plans would almost never
      apply.
-4. **Use the API's server-side compaction** (`compact-2026-01-12`) instead of Liber-authored
+4. **Use the API's server-side compaction** (`compact-2026-09-04`, on-demand) instead of Liber-authored
    frozen blocks.
    - Upside: the docs say the checked prefix starts at the most recent compaction block.
    - Cost: Liber no longer chooses what is kept, which is its whole point. It would need a
      separate investigation.
 
-## Recommendation
-Option 1, applied only to requests Liber actually changes ("rendered" outcome), plus:
-- record `input_transformations` from responses (a Session 4 recording change), so drops are
-  measured, not guessed;
-- extend the validator: when the rendered prefix before a kept thinking block differs from the
-  client's, the request must carry `drop_block` (otherwise it falls back to the original);
-- treat the reasoning loss as part of a compaction's cost in `plan/cost.py` and the dashboard.
+## Decision
+Option 1, applied only to requests Liber actually changes ("rendered" outcome): send the
+`thinking-binding-controls-2026-08-01` beta and `thinking.block_binding.prefix_mismatch_behavior:
+"drop_block"`. Requests with no plan stay byte-identical. Plus:
 
-## Consequences (if accepted)
-- Session 4's `render()` adds the beta header and `block_binding` field on edited requests.
-  That's a deliberate, validated modification, logged per request.
-- Requests through Liber with no plan stay byte-identical, so there's no effect on users who
-  never edit.
-- Revisit when the beta goes GA or its name changes; `liber/model/validate.py` documents the
-  rule.
+- **A1. Edit only at clean turn boundaries.** A plan is applied only when the request's latest
+  message is a user turn that starts a new exchange (no `tool_result` blocks), so no tool loop is
+  in flight and no mid-task reasoning is dropped. Otherwise the pending plan waits for the next
+  clean boundary (§6). The docs say not to compact between a `tool_use` and its `tool_result`.
+- **A2. Byte-identical rendering.** Rendering the same client history with the same plan
+  version must produce identical bytes every time. Otherwise every request after a compaction
+  would fail the check again and drop fresh reasoning. New Tier 1 metric: `render_determinism`
+  (must be 1.0).
+- **A3. Edge cases:**
+  - Merge into the client's `anthropic-beta` header; never replace it. Keep any other
+    `thinking` fields the client sent.
+  - If the client already set `prefix_mismatch_behavior`, respect it. If it is `"error"`, forward
+    the original request unedited and record why.
+  - On Sonnet 5.5 and Haiku 5.5, `block_binding` requires `thinking.type: "adaptive"`. With any
+    other thinking setting, strip every `thinking`/`redacted_thinking` block after the edit point
+    instead (safe under A1, because no loop is in flight), or skip the edit if that isn't valid.
+  - Unknown model: forward unedited until the rule is confirmed for it.
+- **A4. Measure drops.** Record `input_transformations` from responses (streaming: the
+  `message_start` event) per request. Tier 2 runs use `"error"` mode so any unintended
+  binding break surfaces as a 400 with the failing path. `plan/cost.py` and the dashboard count
+  the reasoning dropped by a compaction as part of its cost.
+- **A5. Reasoning carry-forward experiment.** The summarizer gets an optional flag,
+  `carry_forward_reasoning` (default off): when on, it reads the thinking text of the turns it
+  summarizes (whatever the API returned, which may itself be a summary) and adds a short
+  "earlier decisions and why" section to the frozen block, as plain text. Thinking blocks can't
+  be re-inserted as thinking (signatures). Tier 2 compares four conditions (§12): full context,
+  Liber with thinking dropped, Liber with carry-forward, and client auto-compaction. The flag
+  stays off unless the data shows it helps more than it costs.
+
+## Consequences
+- Session 4's `render()` adds the beta header and `block_binding` field on edited requests,
+  validated and logged per request; the break-point policy enforces A1.
+- Each compaction drops the reasoning after the edit point once. After that, new reasoning is
+  produced against Liber's rendered history and stays valid as long as A2 holds.
+- Revisit when the beta goes GA or its name changes, and after the first Tier 2 results.
+- v2 investigation: the API's own context editing (`clear_tool_uses_20250919`) and on-demand
+  compaction keep thinking valid; a "compatible mode" for offload could use them.

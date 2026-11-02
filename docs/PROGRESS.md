@@ -35,3 +35,8 @@ Template:
 - Open issues: if the database is busy (another writer holds SQLite's lock), identification gives up after ≤ ~0.35 s and the request goes through untouched (`liber_error` "StoreBusy"); request-path p95 is ~5.5–6.8 ms locally vs the 10 ms gate — watch CI timing. `add_missing_columns` refuses to add a NOT NULL column (needs a real migration).
 - make check: pass (153 tests)
 - Next step: Session 3 — Tier 1 eval harness. The pipeline's `Prepared` (outcome, violations, overhead_ms) and the request fixtures in `tests/fixtures/requests/` are ready to feed validity_rate, round_trip_identity, fallback_rate and p95_overhead_ms. Before Session 4: decide ADR 0004.
+
+## 2026-11-02 — Owner decision: preserved thinking (ADR 0004)
+- Done: ADR 0004 accepted with amendments A1–A5; ARCHITECTURE.md §5, D8, §6, §12 and SESSION_PROMPTS.md (Sessions 3, 4, 5, 7) updated to match.
+- Decisions: edited requests send `drop_block`; plans apply only at clean turn boundaries; rendering must be byte-identical (new Tier 1 metric `render_determinism`); `input_transformations` recorded; `carry_forward_reasoning` summarizer flag (default off) tested in a four-condition Tier 2 ablation.
+- Next step: merge PR #2, then Session 3 (Tier 1 evals, now including render_determinism).
