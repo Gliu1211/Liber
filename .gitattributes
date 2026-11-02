@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Keep recorded fixtures byte-exact: proxy tests compare them byte for byte.
+tests/fixtures/** -text
