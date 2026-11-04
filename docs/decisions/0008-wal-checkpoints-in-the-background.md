@@ -1,6 +1,6 @@
 # 0008: SQLite WAL checkpoints run in a background task, never in a request's commit
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-04)
 - Date: 2026-11-02
 
 ## Context

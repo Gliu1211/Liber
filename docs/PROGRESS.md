@@ -57,3 +57,9 @@ Template:
 - Open issues: `summary.max_overhead_ms` (~25 ms) is now Python's full garbage collections (every request over ~13 ms in 20 runs coincided with one; `gc.freeze()` after startup removed them in an experiment), made worse by the harness keeping every run's results. `identify()` (~2.3 ms, ~1 ms of it SQLAlchemy rebuilding its SELECT) is now the largest step at fixture size. At ~1 MB the request path is still ~19 ms (two `json.loads`, identify, validate). Both follow-ups were suggested as separate tasks.
 - make check: pass (199 tests)
 - Next step: owner reviews/accepts ADRs 0007-0008 and merges after PR #3. Then the GC and identify follow-ups if wanted, or Session 4 (which must build new blocks rather than edit the client's in place, ADR 0007).
+
+## 2026-11-04 — Owner decision: request-path ADRs 0007 and 0008
+- Done: [ADR 0007](decisions/0007-reuse-previous-request-in-parse.md) and [ADR 0008](decisions/0008-wal-checkpoints-in-the-background.md) accepted as written. PR #4 had been merged into `feat/session-3-tier1-evals` after PR #3 was merged into `main`, so its commits never reached `main`; this branch merges `main` back in and carries them there.
+- Decisions: Session 4's `plan/apply.py` must build new blocks and never edit the client's blocks in place (ADR 0007 requirement).
+- make check: pass
+- Next step: merge this PR into `main`. Then the follow-ups (full-GC pauses on the request path; identify()'s fixed cost) or Session 4.
