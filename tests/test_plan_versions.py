@@ -16,11 +16,11 @@ from fastapi import FastAPI
 
 from liber import pipeline
 from liber.model.anthropic import RecentRequests, parse
-from liber.model.items import Kind, Operation, OperationKind
+from liber.model.items import Operation, OperationKind
 from liber.plan import versions
 from liber.plan.apply import summarize_operation
 from liber.session.store import Store, StoreBusy
-from tests.helpers import FIXTURES, FakeUpstream, recorded
+from tests.helpers import FakeUpstream, recorded
 
 
 @pytest.fixture
@@ -151,26 +151,6 @@ async def test_undo_restores_the_previous_render_exactly(store: Store) -> None:
     assert after_undo.body == with_v1.body
 
 
-async def test_edits_are_held_back_when_the_request_has_thinking(store: Store) -> None:
-    # Until Session 4b sends the preserved-thinking opt-in, an edited request with thinking blocks
-    # could be rejected by the API, so the client's request goes through and the reason is kept.
-    request = json.loads((FIXTURES / "requests" / "long_session_101.json").read_text(encoding="utf-8"))
-    recent = RecentRequests()
-    first = await pipeline.prepare(store, body(request), recent)
-    assert first.session_id is not None
-    tool_result = next(i for i in parse(request).items if i.kind is Kind.TOOL_RESULT)
-    await versions.create(store, first.session_id, (Operation(kind=OperationKind.OFFLOAD, item_ids=(tool_result.id,)),))
-    await versions.apply(store, first.session_id)
-    raw = body(request)
-
-    held = await pipeline.prepare(store, raw, recent)
-
-    assert held.outcome == "passthrough" and held.body is raw
-    assert held.edit_skipped == pipeline.HELD_FOR_THINKING
-    assert held.plan_version == 1 and held.violations == []
-    assert [item.id for item in held.offloaded] == [tool_result.id]  # its original is still stored
-
-
 async def test_a_plan_that_does_not_fit_the_request_is_skipped(store: Store) -> None:
     # The user went back and edited message 2: this branch doesn't have the items the plan is about.
     recent = RecentRequests()
@@ -235,8 +215,8 @@ async def test_a_pending_version_that_breaks_the_request_gives_way_to_the_applie
     await versions.apply(store, session)
     real_render = pipeline.render
 
-    def render_breaking_version_2(parsed: Any, plan: Any) -> dict[str, Any]:
-        rendered = real_render(parsed, plan)
+    def render_breaking_version_2(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
+        rendered = real_render(parsed, plan, stale)
         if len(plan.operations) == 2:  # version 2 renders a request the API would reject
             rendered["messages"] = [{"role": "assistant", "content": "oops"}, *rendered["messages"]]
         return rendered
@@ -249,22 +229,6 @@ async def test_a_pending_version_that_breaks_the_request_gives_way_to_the_applie
     assert (prepared.outcome, prepared.plan_version) == ("rendered", 1)
     assert prepared.edit_skipped is not None and "version 2 not used" in prepared.edit_skipped
     assert state.applied.number == 1 and state.pending is not None and state.pending.number == 2
-
-
-async def test_a_held_back_edit_is_not_marked_applied(store: Store) -> None:
-    request = json.loads((FIXTURES / "requests" / "long_session_101.json").read_text(encoding="utf-8"))
-    recent = RecentRequests()
-    first = await pipeline.prepare(store, body(request), recent)
-    assert first.session_id is not None
-    tool_result = next(i for i in parse(request).items if i.kind is Kind.TOOL_RESULT)
-    await versions.create(store, first.session_id, (Operation(kind=OperationKind.OFFLOAD, item_ids=(tool_result.id,)),))
-    await versions.apply(store, first.session_id)
-
-    await pipeline.prepare(store, body(request), recent)
-    state = await versions.load_state(store, first.session_id)
-
-    assert state.applied.number == 0  # never sent, so never in effect
-    assert state.pending is not None and state.pending.number == 1 and state.apply_requested
 
 
 async def test_if_applying_a_version_cannot_be_recorded_the_original_is_sent(
@@ -294,10 +258,10 @@ async def test_a_plan_that_crashes_gives_way_to_the_next_version(store: Store, m
     await versions.apply(store, session)
     real_render = pipeline.render
 
-    def crashing_with_plans(parsed: Any, plan: Any) -> dict[str, Any]:
+    def crashing_with_plans(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
         if not plan.is_empty:
             raise RuntimeError("a bug in applying plans")
-        return real_render(parsed, plan)
+        return real_render(parsed, plan, stale)
 
     monkeypatch.setattr(pipeline, "render", crashing_with_plans)
 

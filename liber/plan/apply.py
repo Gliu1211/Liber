@@ -88,8 +88,14 @@ def pointer_note(item: Item, label: str) -> str:
     )
 
 
-def apply_plan(parsed: "ParsedRequest", plan: Plan) -> list[dict[str, Any]]:
-    """The request's messages with `plan` applied. Raises PlanNotApplicable if it doesn't fit."""
+def apply_plan(parsed: "ParsedRequest", plan: Plan, stale_thinking_before: int = 0) -> list[dict[str, Any]]:
+    """The request's messages with `plan` applied. Raises PlanNotApplicable if it doesn't fit.
+
+    `stale_thinking_before`: thinking blocks in messages before this index were produced against
+    a different history than this plan renders, so they are left out (docs/decisions/0012). They
+    are always the oldest thinking blocks still in the request, a leading run, which keeps every
+    later block valid. Text and tool calls in those messages stay.
+    """
     items = {item.id: item for item in parsed.items}
     for operation in plan.operations:
         if not operation.item_ids:
@@ -98,9 +104,13 @@ def apply_plan(parsed: "ParsedRequest", plan: Plan) -> list[dict[str, Any]]:
             raise PlanNotApplicable("the plan refers to messages this request doesn't have")
 
     originals = [frame.message for frame in parsed.messages]
+    removed_thinking: set[tuple[int, int]] = set()  # stale thinking blocks (ADR 0012)
     blocks: list[list[dict[str, Any]]] = [[] for _ in originals]  # each message's blocks, as parsed
     for item in parsed.items:
         blocks[item.msg_index].append(item.block)
+        if item.msg_index < stale_thinking_before and item.kind is Kind.THINKING:
+            stale = (item.msg_index, item.block_index)
+            removed_thinking.add(stale)
     starts = exchange_starts(originals)
     current_turn = starts[-1] if starts else 0
 
@@ -136,8 +146,10 @@ def apply_plan(parsed: "ParsedRequest", plan: Plan) -> list[dict[str, Any]]:
         kept = [
             replaced.get((index, block_index), block)
             for block_index, block in enumerate(blocks[index])
-            if (index, block_index) not in removed
+            if (index, block_index) not in removed and (index, block_index) not in removed_thinking
         ]
+        if not kept and blocks[index]:
+            raise PlanNotApplicable(f"leaving out stale thinking would empty messages[{index}]")
         if not messages and frozen:
             kept = [{"type": "text", "text": text} for text in frozen] + kept  # D8: new dicts each time
         if len(kept) == len(blocks[index]) and all(new is old for new, old in zip(kept, blocks[index], strict=True)):
