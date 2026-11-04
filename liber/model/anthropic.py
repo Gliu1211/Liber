@@ -2,9 +2,9 @@
 
 These two functions are the only code that knows the Messages API's shape:
 
-    parse(request)        -> ParsedRequest   items (one per content block) + what's needed to
-                                             rebuild the request around them
-    render(parsed, plan)  -> request         the request with the plan applied
+    parse(request, previous)  -> ParsedRequest   items (one per content block) + what's needed to
+                                                 rebuild the request around them
+    render(parsed, plan)      -> request         the request with the plan applied
 
 The rule that makes Liber safe: with an empty plan, render(parse(r)) == r, exactly, with the
 same key order (tested on every fixture and on generated requests). Everything Liber doesn't
@@ -13,6 +13,12 @@ message-level fields, and each content block.
 
 Applying plan operations (offload, delete, summarize -> frozen blocks) is Session 4's work, in
 plan/apply.py; until then render() accepts only the empty plan.
+
+Speed (ARCHITECTURE.md §3 latency budget): a client resends the whole conversation on every
+turn, and canonicalizing and hashing every block is most of parse()'s time. So parse() can be
+given the previous request of the same conversation (`RecentRequests` keeps them) and copies
+its results for the messages that haven't changed. Only new or changed messages are hashed.
+The result is exactly what parsing from scratch gives (docs/decisions/0007).
 """
 
 import math
@@ -33,6 +39,13 @@ KIND_BY_BLOCK_TYPE = {
 }
 
 ROLE_VALUES = {role.value for role in Role}
+
+# The field holding the id that pairs a tool_use with its tool_result (§5).
+PAIRING_KEYS = {Kind.TOOL_USE: "id", Kind.TOOL_RESULT: "tool_use_id"}
+
+# Conversations whose latest request RecentRequests keeps. Claude Code runs its main conversation
+# alongside subagents and short side requests; a handful of slots keeps the busy ones.
+RECENT_CONVERSATIONS = 8
 
 # Rough token estimates for blocks whose JSON length says little about their token count.
 IMAGE_TOKENS_ESTIMATE = 1600  # a typical ~1 megapixel image
@@ -56,6 +69,11 @@ class MessageFrame:
     message: dict[str, Any]  # the original message dict; render keeps its other fields and key order
     content_is_string: bool  # the client wrote "content": "..." rather than a list of blocks
     chain_hash: str  # h_i: identifies this message and everything before it (D7)
+    # What parse() computed for the message's blocks, kept so the next request can reuse it
+    # (the same values are in the items, one per block).
+    block_hashes: tuple[str, ...]
+    block_tokens: tuple[int, ...]
+    has_numbers: bool  # holds a number or true/false: == isn't enough to spot it unchanged
 
 
 @dataclass(frozen=True)
@@ -70,8 +88,58 @@ class ParsedRequest:
         return [frame.chain_hash for frame in self.messages]
 
 
-def parse(request: Any) -> ParsedRequest:
-    """Split a Messages API request into items. Raises RequestShapeError if it isn't request-shaped."""
+class RecentRequests:
+    """The latest parsed request of each of the last few conversations, for parse(previous=...).
+
+    One per process (the app keeps it in app.state), in memory only. Picking an unrelated entry
+    can't give a wrong result, only less reuse, because parse() checks everything it reuses.
+    Memory: one decoded request per conversation kept (a ~1 MB request is a few MB of Python
+    objects), at most RECENT_CONVERSATIONS of them.
+    """
+
+    def __init__(self, size: int = RECENT_CONVERSATIONS) -> None:
+        self.size = size
+        self.entries: list[ParsedRequest] = []  # most recently used first
+
+    def find(self, request: Any) -> ParsedRequest | None:
+        """The latest request that starts like this one: same first message, system and tools.
+
+        Those don't change while a conversation goes on, and each comparison is a cheap == that
+        usually stops at the first difference.
+        """
+        messages = request.get("messages") if isinstance(request, dict) else None
+        if not isinstance(messages, list) or not messages:
+            return None
+        for entry in self.entries:
+            earlier = entry.original
+            if (
+                earlier["messages"][0] == messages[0]
+                and earlier.get("system") == request.get("system")
+                and earlier.get("tools") == request.get("tools")
+            ):
+                return entry
+        return None
+
+    def remember(self, parsed: ParsedRequest, replacing: ParsedRequest | None = None) -> None:
+        """Keep `parsed` as the newest entry, in place of `replacing` (its conversation's older request).
+
+        The least recently used entry is dropped once there are more than `size`.
+        """
+        if not parsed.messages:
+            return  # nothing a later request could reuse
+        # `is not`, not !=: comparing two parsed requests with != would compare all their contents.
+        others = [entry for entry in self.entries if entry is not replacing]
+        self.entries = [parsed, *others][: self.size]
+
+
+def parse(request: Any, previous: ParsedRequest | None = None) -> ParsedRequest:
+    """Split a Messages API request into items. Raises RequestShapeError if it isn't request-shaped.
+
+    `previous`: an earlier parse to reuse work from, normally the latest request of the same
+    conversation (see RecentRequests). A message gets previous's results when it is the same
+    message after the same history (reusable_frame checks both). Any other `previous`, or
+    None, just means more hashing: the result is the same either way.
+    """
     if not isinstance(request, dict):
         raise RequestShapeError("the request is not a JSON object")
     messages = request.get("messages")
@@ -86,13 +154,28 @@ def parse(request: Any) -> ParsedRequest:
 
     for index, message in enumerate(messages):
         role, blocks, content_is_string = read_message(index, message)
-        canonical = [chain.canonical_block(block) for block in blocks]
-        block_hashes = [chain.sha256_hex(text) for text in canonical]
-        previous_hash = chain.message_hash(previous_hash, message, block_hashes)
-        frames.append(MessageFrame(index, role, message, content_is_string, previous_hash))
+        known = reusable_frame(previous, index, previous_hash, message)
+        if known is not None:
+            # Unchanged since the previous request: copy its results instead of rehashing.
+            block_hashes, block_tokens, has_numbers = known.block_hashes, known.block_tokens, known.has_numbers
+            previous_hash = known.chain_hash
+        else:
+            canonical = [chain.canonical_block(block) for block in blocks]
+            block_hashes = tuple(chain.sha256_hex(text) for text in canonical)
+            block_tokens = tuple(
+                estimate_tokens(block_kind(block), block, text) for block, text in zip(blocks, canonical, strict=True)
+            )
+            has_numbers = chain.has_numbers(message)
+            previous_hash = chain.message_hash(previous_hash, message, list(block_hashes))
+        frames.append(
+            MessageFrame(
+                index, role, message, content_is_string, previous_hash, block_hashes, block_tokens, has_numbers
+            )
+        )
 
+        # Items are rebuilt even for reused messages: each points at this request's block object.
         for block_index, block in enumerate(blocks):
-            kind = KIND_BY_BLOCK_TYPE.get(str(block.get("type")), Kind.OTHER)
+            kind = block_kind(block)
             item_id = f"{previous_hash[:16]}-{block_index}"
             tool_use_id = pairing_id(block, kind)
             if kind is Kind.TOOL_USE and tool_use_id is not None:
@@ -105,13 +188,38 @@ def parse(request: Any) -> ParsedRequest:
                     role=role,
                     kind=kind,
                     content_hash=block_hashes[block_index],
-                    tokens=estimate_tokens(kind, block, canonical[block_index]),
+                    tokens=block_tokens[block_index],
                     tool_use_id=tool_use_id,
                     depends_on=tool_use_items.get(tool_use_id) if kind is Kind.TOOL_RESULT and tool_use_id else None,
                     block=block,
                 )
             )
     return ParsedRequest(original=request, root_hash=root, messages=frames, items=items)
+
+
+def reusable_frame(
+    previous: ParsedRequest | None, index: int, hash_before: str, message: dict[str, Any]
+) -> MessageFrame | None:
+    """previous's frame for messages[index], if everything parse() computed for it still holds.
+
+    That needs the same history before the message (equal chain hashes: h_i covers everything
+    before message i) and the same message. Comparing the decoded messages with == runs in C and
+    is far cheaper than canonicalizing and hashing them (~0.2 ms against ~6 ms per MB). For JSON
+    without numbers, == means exactly "same canonical form"; with numbers it doesn't (Python
+    says 1 == 1.0 == True), so those messages are compared with chain.same_json instead.
+    """
+    if previous is None or index >= len(previous.messages):
+        return None
+    known = previous.messages[index]
+    known_hash_before = previous.messages[index - 1].chain_hash if index > 0 else previous.root_hash
+    if known_hash_before != hash_before:
+        return None
+    same = chain.same_json(known.message, message) if known.has_numbers else known.message == message
+    return known if same else None
+
+
+def block_kind(block: dict[str, Any]) -> Kind:
+    return KIND_BY_BLOCK_TYPE.get(str(block.get("type")), Kind.OTHER)
 
 
 def read_message(index: int, message: Any) -> tuple[Role, list[dict[str, Any]], bool]:
@@ -131,7 +239,7 @@ def read_message(index: int, message: Any) -> tuple[Role, list[dict[str, Any]], 
 
 def pairing_id(block: dict[str, Any], kind: Kind) -> str | None:
     """The id that pairs a tool_use with its tool_result (§5), if this block has one."""
-    key = {Kind.TOOL_USE: "id", Kind.TOOL_RESULT: "tool_use_id"}.get(kind)
+    key = PAIRING_KEYS.get(kind)
     value = block.get(key) if key else None
     return value if isinstance(value, str) else None
 

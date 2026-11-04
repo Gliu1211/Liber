@@ -2,7 +2,9 @@
 
 For every POST /v1/messages, `prepare()` decides which bytes go upstream:
 
-    1. parse the JSON into items                 (model/anthropic.py)
+    1. parse the JSON into items, reusing the    (model/anthropic.py)
+       work done for this conversation's previous
+       request (RecentRequests, ADR 0007)
     2. identify the conversation and register
        the new messages and items                (session/chain.py)
     3. render with the session's applied plan    (empty until Session 4 stores plans)
@@ -26,7 +28,7 @@ from typing import Any
 
 import structlog
 
-from liber.model.anthropic import RequestShapeError, parse, render
+from liber.model.anthropic import RecentRequests, RequestShapeError, parse, render
 from liber.model.items import Plan
 from liber.model.validate import Violation, validate
 from liber.session.chain import StoreBusy, identify
@@ -52,8 +54,12 @@ class Prepared:
     overhead_ms: float | None = None
 
 
-async def prepare(store: Store, raw_body: bytes) -> Prepared:
-    """Run §3 steps 2-5 on a request body. Never raises; falls back to `raw_body` on any problem."""
+async def prepare(store: Store, raw_body: bytes, recent: RecentRequests | None = None) -> Prepared:
+    """Run §3 steps 2-5 on a request body. Never raises; falls back to `raw_body` on any problem.
+
+    `recent`: the app's cache of recent conversations, so only new messages are hashed (ADR 0007).
+    Without it every message is hashed, with the same result.
+    """
     started = time.perf_counter()
     prepared = Prepared(body=raw_body)
     try:
@@ -63,7 +69,12 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
         # through, so comparing against those same objects could not catch a render bug that
         # edits one in place.
         reference = json.loads(raw_body)
-        parsed = parse(request)
+        # find, parse and remember run with no await in between, so concurrent requests can't
+        # interleave here.
+        previous = recent.find(request) if recent is not None else None
+        parsed = parse(request, previous)
+        if recent is not None:
+            recent.remember(parsed, replacing=previous)
         identity = await identify(store, parsed)
         prepared.session_id, prepared.branch_id = identity.session_id, identity.branch_id
         prepared.known_messages, prepared.new_messages = identity.known_messages, identity.new_messages

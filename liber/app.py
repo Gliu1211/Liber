@@ -31,6 +31,7 @@ from fastapi import FastAPI, Request, Response
 
 from liber.config import Settings
 from liber.log import configure_logging
+from liber.model.anthropic import RecentRequests
 from liber.pipeline import Prepared, prepare
 from liber.proxy.forward import (
     create_upstream_client,
@@ -41,7 +42,7 @@ from liber.proxy.forward import (
     streaming_response,
 )
 from liber.proxy.sse import CapturedReply, ReplyCapture
-from liber.session.store import RequestRecord, Store, recordable_headers
+from liber.session.store import RequestRecord, Store, checkpointing, recordable_headers
 
 log = structlog.get_logger(__name__)
 
@@ -55,8 +56,9 @@ def create_app(settings: Settings | None = None, upstream_transport: httpx.Async
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Startup: open the database and the shared upstream client. (The background worker
-        # from §9 will also start here.)
+        # Startup: open the database and the shared upstream client, and start checkpointing
+        # the database in the background (requests never do it, docs/decisions/0008). (The
+        # background worker from §9 will also start here.)
         # mode=0o700: the database holds conversation bodies, so only the owner may read it (§11).
         settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         store = Store(settings.db_path)
@@ -64,18 +66,23 @@ def create_app(settings: Settings | None = None, upstream_transport: httpx.Async
         app.state.store = store
         app.state.client = create_upstream_client(settings, upstream_transport)
         try:
-            yield
+            async with checkpointing(store, settings.wal_checkpoint_seconds):
+                try:
+                    yield
+                finally:
+                    # Shutdown: finish recording in-flight exchanges before closing the database.
+                    await wait_for_pending_writes(app)
+                    await app.state.client.aclose()
         finally:
-            # Shutdown: finish recording in-flight exchanges before closing the database.
-            await wait_for_pending_writes(app)
-            await app.state.client.aclose()
-            await store.close()
+            await store.close()  # the last connection to close checkpoints what's left
 
     # docs/redoc/openapi are switched off: those paths belong to the upstream API, and the proxy
     # must not answer anything itself.
     app = FastAPI(title="Liber", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.pending_writes = set()
+    # The latest request of each recent conversation, so the next one only hashes what's new (ADR 0007).
+    app.state.recent_requests = RecentRequests()
     # Order matters: the specific route first, then the catch-all for everything else.
     app.add_api_route("/v1/messages", proxy_messages, methods=["POST"])
     app.add_api_route("/{path:path}", proxy_other, methods=ALL_METHODS)
@@ -90,7 +97,7 @@ async def proxy_messages(request: Request) -> Response:
     body = await request.body()
 
     # §3 steps 2-5. prepare() never raises; on any problem it hands back the client's own bytes.
-    prepared = await prepare(app.state.store, body)
+    prepared = await prepare(app.state.store, body, app.state.recent_requests)
     record = start_record(request, body, prepared, settings.record_bodies)
 
     try:

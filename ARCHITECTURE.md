@@ -135,7 +135,7 @@ Every content unit becomes an `Item`:
 - **Pending plan** (edited in the dashboard) vs **applied plan** (used by the proxy). Pending becomes applied only at a break point (§6).
 
 ### Format adapters
-`parse(request) → items` and `render(items, plan) → request` are the only format-specific code. Anthropic first; an OpenAI adapter implements the same pair later.
+`parse(request) → items` and `render(items, plan) → request` are the only format-specific code. Anthropic first; an OpenAI adapter implements the same pair later. For speed, `parse` can take the conversation's previous request and reuse its hashes for unchanged messages, with an identical result (ADR 0007).
 
 ---
 
@@ -211,6 +211,7 @@ A background asyncio task (same process in v1) that processes new items:
 - Never store or log credential headers.
 - Context often contains code and secrets: everything stays local; nothing is sent anywhere except the upstream provider the client already uses (and the summarizer model the user configures).
 - Recording request bodies is on by default for undo/evals and can be disabled; a `liber purge` command deletes stored data.
+- Independently of recording, the running proxy keeps the latest decoded request of up to 8 recent conversations in memory (ADR 0007); nothing of it is written to disk.
 
 ---
 
