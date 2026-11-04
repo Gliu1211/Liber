@@ -128,8 +128,13 @@ async def test_metrics_on_the_fixtures() -> None:
     assert metrics["validity_rate"].value == 1.0
     assert metrics["round_trip_identity"].value == 1.0
     assert metrics["fallback_rate"].value == 0.0
-    assert metrics["token_reduction"].value == 0.0  # no plans until Session 4
-    assert metrics["prefix_stability"].value == 1.0  # placeholder until Session 4
+    # Standard plans (docs/decisions/0010): real savings, held back while thinking blocks remain
+    # (until Session 4b), and every minor compaction keeps the frozen prefix.
+    assert metrics["token_reduction"].value > 0
+    assert metrics["prefix_stability"].value == 1.0
+    assert result.summary["minor_compactions_checked"] > 0
+    outcomes = {(record["outcome"], record["plan_version"]) for record in result.trace}
+    assert {("rendered", 1), ("rendered", 2), ("passthrough", 1)} <= outcomes
     assert metrics["render_determinism"].value == 1.0
     lower_is_better = {"fallback_rate", "p95_overhead_ms"}
     assert all(m.direction == ("lower" if name in lower_is_better else "higher") for name, m in metrics.items())
@@ -265,6 +270,43 @@ async def test_fallback_rate_counts_requests_liber_stepped_aside_from(monkeypatc
 
     assert result.metrics["fallback_rate"].value == 1.0
     assert all(record["outcome"] == "fallback" for record in result.trace)
+
+
+async def test_prefix_stability_catches_a_compaction_that_rewrites_the_frozen_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_render = tier1.render
+
+    def reordering_render(parsed: Any, plan: Any) -> dict[str, Any]:
+        rendered = real_render(parsed, plan)
+        if sum(op.kind == "summarize" for op in plan.operations) == 2:
+            # Puts the new frozen block before the old one: not an append (D5).
+            first = rendered["messages"][0]
+            content = [first["content"][1], first["content"][0], *first["content"][2:]]
+            rendered["messages"] = [{**first, "content": content}, *rendered["messages"][1:]]
+        return rendered
+
+    monkeypatch.setattr(tier1, "render", reordering_render)
+
+    result = await tier1.evaluate(SESSIONS)
+
+    assert result.metrics["prefix_stability"].value == 0.0
+
+
+def test_every_fixture_with_three_exchanges_gets_a_standard_plan() -> None:
+    sessions = load_sessions(SESSIONS)
+    plans = {session.name: tier1.standard_plan(session) for session in sessions}
+
+    assert {name for name, plan in plans.items() if plan is not None} == {
+        "branches_and_rewrites",
+        "chat_short",
+        "coding_tool_loops",
+        "long_agentic_101",
+        "media_and_redacted",
+        "system_messages",
+    }
+    long_plan = plans["long_agentic_101"]
+    assert long_plan is not None and [op.kind for op in long_plan.first] == ["summarize", "offload"]
 
 
 async def test_token_reduction_counts_only_what_is_sent(monkeypatch: pytest.MonkeyPatch) -> None:

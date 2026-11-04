@@ -156,10 +156,14 @@ def frozen_region(
             continue
         covered = sorted({items[item_id].msg_index for item_id in operation.item_ids})
         first, last = covered[0], covered[-1]
+        # A message with no content blocks (an effort-only system message) has no item to name
+        # it; one at the start of the live region goes with the summary.
+        while first > live_from and not blocks[first - 1]:
+            first -= 1
         if first != live_from:
             raise PlanNotApplicable("a summary must start where the live region starts")
-        whole = sum(len(blocks[index]) for index in range(first, last + 1))
-        if covered != list(range(first, last + 1)) or len(set(operation.item_ids)) != whole:
+        # Whole messages: every block from `first` to `last` is in the summary.
+        if len(set(operation.item_ids)) != sum(len(blocks[index]) for index in range(first, last + 1)):
             raise PlanNotApplicable("a summary must cover whole messages")
         if last + 1 not in starts:
             raise PlanNotApplicable("a summary must end just before a user message that starts a new exchange")

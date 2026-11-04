@@ -55,15 +55,47 @@ Any client that speaks the Anthropic Messages API and lets you set a base URL wo
 | `requests` | `POST /v1/messages`: usage, latency, and what Liber did (`liber_outcome`, `session_id`, `known_messages`/`new_messages`, `violations`, `overhead_ms`) |
 | `sessions`, `branches`, `chain_nodes` | conversation, path through it, message (by hash: [D7](ARCHITECTURE.md), [ADR 0005](docs/decisions/0005-conversation-identity-details.md)) |
 | `items` | content block: role, kind, position, content hash, estimated tokens. Never the content itself. |
+| `plan_versions`, `plans` | a session's edit-plan versions, and which is applied or pending ([ADR 0009](docs/decisions/0009-edit-plans-session-4a.md)) |
+| `content_cache` | content hash → where an offloaded original is kept |
 
-`liber_outcome` is `passthrough` when nothing needed changing (the normal case for now) or
-`fallback` when Liber stepped aside. Either way the client's original request was sent. To see
-any fallbacks and why:
+`liber_outcome` is `rendered` when Liber sent your session's plan applied, `passthrough` when it
+sent your request unchanged (no plan, or an edit held back: `edit_skipped` says why), or
+`fallback` when Liber stepped aside because something failed. To see fallbacks and why:
 
 ```bash
 sqlite3 ~/.liber/liber.db \
   "select created_at, liber_error, violations from requests where liber_outcome = 'fallback' order by id desc limit 10"
 ```
+
+### Editing a session's context
+
+Until the dashboard exists, plans are made from the command line, against the same database
+the proxy uses ([ADR 0009](docs/decisions/0009-edit-plans-session-4a.md)):
+
+```bash
+liber plan show                       # sessions, newest first
+```
+
+```bash
+liber plan show --session SESSION     # its items (message, block, kind, tokens, id) and plan versions
+```
+
+```bash
+liber plan create --session SESSION --summarize-through 9 --offload ITEM_ID --note "build log"
+```
+
+```bash
+liber plan apply --session SESSION    # takes effect at the session's next new turn
+```
+
+```bash
+liber plan undo --session SESSION     # back to the previous version, also at the next new turn
+```
+
+A plan takes effect only when a request starts a new turn, never in the middle of a tool loop.
+**Current limit:** an edit is held back, and your request sent unchanged, while the request still
+contains thinking blocks. Editing history before them needs the preserved-thinking opt-in from
+the next session (4b). Offloaded originals are kept in `~/.liber/blobs/`.
 
 ## Configuration
 
@@ -127,3 +159,5 @@ are recorded in [docs/decisions/](docs/decisions/).
   stored locally in `~/.liber/liber.db` unless `LIBER_RECORD_BODIES=false`. Liber creates
   `~/.liber` readable by you only (mode 700). Delete the database to remove everything (a
   `liber purge` command is planned).
+- Content you choose to edit is kept locally even with body recording off: offloaded originals
+  in `~/.liber/blobs/` (files mode 600) and summary text in the plan versions.

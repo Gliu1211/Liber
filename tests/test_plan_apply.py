@@ -99,6 +99,19 @@ def test_appending_a_frozen_block_keeps_everything_before_it_byte_identical() ->
     assert json.loads(after)["messages"][0]["content"][1]["text"] == second.summary
 
 
+def test_an_empty_message_at_the_start_belongs_to_the_summary() -> None:
+    # An effort-only system message has no content blocks, so no item can name it; it still
+    # sits inside the range being summarized.
+    request = chat("u0", "a0", "u1", "a1", "u2")
+    request["messages"].insert(0, {"role": "system", "content": []})
+    parsed = parse(request)
+
+    result = rendered_with(request, summarize_operation(parsed.items, first=0, last=2, block_number=1))
+
+    assert [m["role"] for m in result["messages"]] == ["user", "assistant", "user"]
+    assert 'covers="msgs 0-2"' in result["messages"][0]["content"][0]["text"]
+
+
 def test_a_summary_must_start_where_the_live_region_starts() -> None:
     parsed = parse(SIX_TURNS)
 

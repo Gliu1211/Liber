@@ -279,8 +279,10 @@ liber/
     store.py          DB access
   plan/
     apply.py          render plan onto items, frozen blocks (D8)
+    versions.py       immutable plan versions, pending vs applied, undo (§4)
     policy.py         break points, minor/major compaction (§6)
     cost.py           reprocess/payback estimates
+    commands.py       `liber plan show|create|apply|undo` (until the dashboard)
   cache/
     content.py        content-addressed cache
     blobs.py          on-disk blob store
