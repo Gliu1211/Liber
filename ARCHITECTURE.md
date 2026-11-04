@@ -103,7 +103,7 @@ For `POST /v1/messages`:
 
 All other endpoints (e.g. token counting, model listing) are passed through unchanged.
 
-**Latency budget:** steps 2–5 must add only a few milliseconds. No LLM calls, no network calls other than the upstream forward.
+**Latency budget:** steps 2–5 must add at most **20 ms at p95**, measured by the Tier 1 replay and the in-suite request-path test (ADR 0011); typical requests take a few milliseconds. The model itself takes seconds, so 20 ms is under 1% of the wait, while still catching real regressions. No LLM calls, no network calls other than the upstream forward.
 
 ---
 
@@ -230,7 +230,7 @@ Runs against recorded fixture sessions with a fake model; no network, no API key
 | Token reduction on fixture sessions with standard plans | must not drop more than tolerance |
 | Prefix stability: requests whose bytes up to the frozen/live boundary are unchanged after a minor compaction | must be 100% |
 | Render determinism: the same history + plan version renders to identical bytes (ADR 0004 A2) | must be 100% |
-| Request-path overhead (p95, steps 2–5 of §3) | must stay under budget (default 10 ms) |
+| Request-path overhead (p95, steps 2–5 of §3) | must stay under budget (20 ms, ADR 0011) |
 
 Results are written to `evals/results/latest.json` and compared to the committed `evals/baseline.json` by `scripts/eval_gate.py`. Any metric outside tolerance fails the gate.
 

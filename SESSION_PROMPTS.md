@@ -54,7 +54,7 @@ Acceptance criteria (tests first; use Hypothesis for the property tests):
 - Validator catches: broken alternation, orphan tool_use and orphan tool_result, empty content, edited thinking blocks.
 - Two conversations sharing an opening are distinguished; a divergence creates a branch; a client rewriting its own history starts a new branch.
 - Any exception in parse/render/validate results in the original request being forwarded.
-- Request-path overhead p95 < 10 ms on a 100-message fixture (measured in a test).
+- Request-path overhead p95 within the §3 budget on a 100-message fixture (measured in a test; 20 ms since ADR 0011).
 - `make check` passes.
 ```
 

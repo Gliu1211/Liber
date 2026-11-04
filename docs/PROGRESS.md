@@ -71,3 +71,8 @@ Template:
 - Open issues: in practice 4a sends few edits (Claude Code requests nearly always contain thinking) until 4b. Stub summaries make tiny chats longer. The request-path latency test is at the edge on slow machines for main too (in-suite p95 8.6–10.9 ms on this container).
 - make check: pass (Tier 1 values move the baseline: `token_reduction`, `prefix_stability`; the owner records `evals/baseline.json`)
 - Next step: owner reviews 4a and accepts ADRs 0009/0010. Then Session 4b: the preserved-thinking opt-in (beta header + `drop_block`, A3 edge cases) replacing the hold-back, `input_transformations` recording (A4), idle/threshold break points, major/minor classification, `plan/cost.py` (which should refuse compactions that don't pay).
+
+## 2026-11-04 — Owner decisions: latency budget, ADR process
+- Done: ADRs 0009 and 0010 accepted and PR #6 (Session 4a) merged; ADR 0009's cache-breakpoint question resolved ("don't add one"). Request-path budget raised to 20 ms p95 (ADR 0011), defined once in `tier1.OVERHEAD_BUDGET_MS` and used by both the in-suite test and the eval gate. CLAUDE.md: new ADRs are always Proposed; no queued follow-up tasks.
+- Why: on a 2-vCPU container, 4a's p95 was 7.4-9.5 ms against the old 10 ms budget, and the latency test failed 1 in 3 `make check` runs.
+- Next step: owner records `evals/baseline.json` (`make eval-baseline`) in its own PR, then Session 4b.

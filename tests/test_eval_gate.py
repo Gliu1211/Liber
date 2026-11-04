@@ -114,6 +114,8 @@ def test_the_gate_reads_real_tier1_output(tmp_path: Path) -> None:
 def test_a_baseline_recorded_over_budget_still_enforces_the_budget(tmp_path: Path) -> None:
     # tier1 sets the p95 tolerance to "budget - value": negative when the baseline itself was
     # over budget. The gate must then fail anything over budget, not accept the slow baseline.
+    # The gate only sees the stored tolerance, never the budget, so 10 ms here is an arbitrary
+    # example budget, not the real one (tier1.OVERHEAD_BUDGET_MS, ADR 0011).
     over = {"p95_overhead_ms": {"value": 11.0, "direction": "lower", "tolerance": 10.0 - 11.0}}
     baseline = write(tmp_path / "baseline.json", over)
 

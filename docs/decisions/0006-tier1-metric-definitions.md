@@ -1,6 +1,6 @@
 # 0006: Tier 1 metric definitions
 
-- Status: Accepted
+- Status: Accepted. The budget *value* (10 ms below) is superseded by ADR 0011: 20 ms, defined in `tier1.OVERHEAD_BUDGET_MS`. The mechanism is unchanged.
 - Date: 2026-11-02
 
 ## Context
