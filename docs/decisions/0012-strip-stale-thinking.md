@@ -39,6 +39,17 @@ its own:
      client's thinking.
    - Text and tool calls in those messages stay. If removing the thinking would empty a
      message, that version doesn't fit the request.
+   - **Which requests continue that point:** it is stored with the chain hash of the activating
+     request's last message (`plans.activated_hash`). A request whose chain hash at that position
+     matches continues the same history, and leaves out the thinking before it.
+   - **Any other request** (another branch, an older request resent, or a version applied in 4a
+     before activation points were recorded) leaves out *all* thinking before the tool loop in
+     flight. Liber can't tell which rendering that thinking was produced against, and leaving
+     out a leading run is always valid. The loop's own thinking is kept: it was produced against
+     exactly this rendering, because the cut falls in the same place on every request of the
+     loop. This costs reasoning on forks, and is never invalid.
+   - **Sessions applied in 4a** get their activation point recorded at their next clean turn
+     that goes out edited.
 2. **The rule covers the empty plan too.** Once a version has taken effect in a session, the
    thinking produced under it was produced against Liber's rendering, not the client's history.
    So an undo back to no plan, a fork the plan doesn't fit, or a plan that fails all still leave
@@ -69,7 +80,18 @@ its own:
   `liber plan show` reports how much (`cost.py`: blocks and estimated tokens) before you apply.
 - **Tier 1 `token_reduction`** went from 0.0075 to 0.31, because the thinking-heavy fixtures'
   edits are now sent. `prefix_stability` stays at 1.0, now over 43 minor compactions.
-- **Remaining risk: fallbacks after an edit.** A request that falls back because something in
+- **Branches and idle time.** Forks of an edited session lose their completed-turn reasoning on
+  each new turn. The idle break point measures from the deepest matched branch's last request.
+- **Remaining risk: the client's own request after an edit.** In each case below Liber sends the
+  client's request unedited (hard rule 1, or the client's choice). In a session Liber has
+  already edited, that request can carry thinking produced against Liber's rendering, which an
+  enforced account rejects with a 400:
+  - something in Liber fails;
+  - the client switches to `prefix_mismatch_behavior: "error"`;
+  - the conversation moves to a model Liber hasn't confirmed;
+  - leaving out stale thinking would empty a message (a turn cut off while thinking), so no
+    version fits.
+- **Fallbacks after an edit, specifically.** A request that falls back because something in
   Liber failed is sent byte-for-byte, as hard rule 1 requires. In a session Liber has edited,
   that request can carry thinking produced against Liber's rendering, which an enforced account
   rejects with a 400. Avoiding it would mean editing a request after Liber itself failed.

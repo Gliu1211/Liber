@@ -116,10 +116,10 @@ Settings are environment variables prefixed with `LIBER_` (see `liber/config.py`
 | `LIBER_DATA_DIR` | `~/.liber` | Holds `liber.db` (and, later, offloaded content). |
 | `LIBER_RECORD_BODIES` | `true` | Store request/response bodies. Usage and latency are always stored. |
 | `LIBER_UPSTREAM_READ_TIMEOUT` | `600` | Longest silence (seconds) tolerated while streaming. |
-| `LIBER_IDLE_APPLY_SECONDS` | `300` | After this long idle, a pending plan version takes effect at the next new turn (§6). |
+| `LIBER_IDLE_APPLY_SECONDS` | `300` | After this long idle, a pending plan version takes effect at the next new turn (§6). Matches the 5-minute prompt cache; use `3600` if your client uses the 1-hour cache. |
 | `LIBER_CONTEXT_THRESHOLD` | `0.7` | Share of the model's context window at which a request is flagged (`requests.context_share`). |
 | `LIBER_THRESHOLD_AUTO_APPLY` | `false` | Also apply the pending plan version when the threshold is crossed. |
-| `LIBER_PRICING` | see `liber/config.py` | Prices per model for plan cost estimates (JSON: model prefix → `input`, `cache_write`, `cache_read` in $/MTok). |
+| `LIBER_PRICING` | see `liber/config.py` | Prices per model for plan cost estimates (JSON: model prefix → `input`, `cache_write`, `cache_read` in $/MTok). Replaces the whole default table. |
 | `LIBER_WAL_CHECKPOINT_SECONDS` | `1.0` | How often a background task copies SQLite's write-ahead log into `liber.db`. Requests never do it ([ADR 0008](docs/decisions/0008-wal-checkpoints-in-the-background.md)). |
 | `LIBER_LOG_LEVEL` | `INFO` | Log level. |
 

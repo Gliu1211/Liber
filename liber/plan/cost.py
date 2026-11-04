@@ -34,6 +34,9 @@ class ItemFacts(Protocol):
     def kind(self) -> str: ...
 
     @property
+    def msg_index(self) -> int: ...
+
+    @property
     def tokens(self) -> int: ...
 
 
@@ -56,20 +59,27 @@ def price_for(model: str | None, pricing: dict[str, ModelPrice]) -> ModelPrice |
     return pricing[max(matches, key=len)] if matches else None
 
 
-def estimate(items: Iterable[ItemFacts], applied: Plan, pending: Plan, price: ModelPrice | None) -> Estimate:
+def estimate(
+    items: Iterable[ItemFacts], applied: Plan, pending: Plan, price: ModelPrice | None, activated_at: int | None = None
+) -> Estimate:
+    """`activated_at`: where the applied version took effect, if any (thinking before it is already left out)."""
     items = list(items)
     minor = is_minor(applied, pending)
-    tokens_now = rendered_tokens(items, applied)
-    tokens_after = rendered_tokens(items, pending)
-    reprocessed = tokens_after - frozen_tokens(applied) if minor else tokens_after
     removed = removed_ids(pending)
-    stale = [item for item in items if item.kind == "thinking" and item.id not in removed]
+    # Thinking sent today: produced after the applied version took effect (all of it, if none has).
+    thinking_now = [i for i in items if i.kind == "thinking" and i.msg_index >= (activated_at or 0)]
+    # Once the pending version takes effect, every thinking block in the history is stale (ADR 0012).
+    stale = [i for i in thinking_now if i.id not in removed]
+    left_out_now = {i.id for i in items if i.kind == "thinking"} - {i.id for i in thinking_now}
+    tokens_now = rendered_tokens(items, applied, left_out_now if activated_at else set())
+    tokens_after = rendered_tokens(items, pending, {i.id for i in items if i.kind == "thinking"})
+    reprocessed = tokens_after - frozen_tokens(applied) if minor else tokens_after
 
     one_time = saving = None
     payback = None
     if price is not None:
         # Reprocessed tokens would have been cache reads; now they are cache writes, once.
-        one_time = reprocessed * (price.cache_write - price.cache_read) / 1_000_000
+        one_time = max(reprocessed, 0) * (price.cache_write - price.cache_read) / 1_000_000
         saving = (tokens_now - tokens_after) * price.cache_read / 1_000_000
         payback = math.ceil(one_time / saving) if saving > 0 else None
     return Estimate(
@@ -95,9 +105,12 @@ def frozen_tokens(plan: Plan) -> int:
     return sum(math.ceil(len(op.summary or "") / 4) for op in plan.operations if op.kind is OperationKind.SUMMARIZE)
 
 
-def rendered_tokens(items: list[ItemFacts], plan: Plan) -> int:
-    """Estimated message tokens of a request rendered with `plan` (system and tools not included)."""
-    removed = removed_ids(plan)
+def rendered_tokens(items: list[ItemFacts], plan: Plan, left_out: set[str]) -> int:
+    """Estimated message tokens of a request rendered with `plan` (system and tools not included).
+
+    `left_out`: thinking items the request leaves out as stale (ADR 0012).
+    """
+    removed = removed_ids(plan) | left_out
     offloaded = {
         item_id for op in plan.operations if op.kind is OperationKind.OFFLOAD for item_id in op.item_ids
     } - removed

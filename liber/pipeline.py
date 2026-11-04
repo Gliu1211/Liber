@@ -110,7 +110,7 @@ async def prepare(
             state, messages, plan_policy, identity.idle_seconds, prepared.context_share
         )
         chosen, rendered, prepared.violations = render_with_plan(
-            parsed, policy.candidates(state, messages, pending_now), reference, prepared
+            parsed, policy.candidates(state, messages, parsed.chain_hashes, pending_now), reference, prepared
         )
         prepared.rendered = rendered
         used = chosen.version
@@ -136,8 +136,13 @@ async def prepare(
         # the empty plan included); not when its edit couldn't be sent. Written before the body is
         # chosen: if the write fails, the except below still sends the client's bytes.
         sent_as_rendered = rendered == reference or to_send is not None
-        if chosen.takes_effect and identity.session_id and sent_as_rendered:
-            await versions.promote_pending(store, identity.session_id, used.number, len(messages))
+        activation = (len(messages), parsed.chain_hashes[-1]) if parsed.chain_hashes else None
+        if chosen.takes_effect and identity.session_id and activation and sent_as_rendered:
+            await versions.promote_pending(store, identity.session_id, used.number, activation)
+        elif needs_activation_point(state, used, messages) and identity.session_id and activation and to_send:
+            # A version applied before activation points were recorded (Session 4a): this clean
+            # turn left out all earlier thinking, so it can serve as the point from now on.
+            await versions.backfill_activation(store, identity.session_id, used.number, activation)
 
         if to_send is not None:
             prepared.outcome = "rendered"
@@ -195,6 +200,15 @@ def render_with_plan(
         return candidate, rendered, []
     rendered = render(parsed, last.version.plan, last.stale_thinking_before)
     return last, rendered, validate(rendered, original=reference)
+
+
+def needs_activation_point(state: versions.PlanState, used: versions.PlanVersion, messages: list[Any]) -> bool:
+    return (
+        used.number > 0
+        and used.number == state.applied.number
+        and state.activated_hash is None
+        and policy.at_clean_turn_boundary(messages)
+    )
 
 
 def offloaded_items(parsed: ParsedRequest, version: versions.PlanVersion) -> list[Item]:

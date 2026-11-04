@@ -96,9 +96,11 @@ def with_betas(headers: Headers, betas: Iterable[str]) -> Headers:
         if value.lower() in present:
             continue
         indexes = [i for i, (name, _) in enumerate(headers) if name == b"anthropic-beta"]
-        if indexes:
+        if indexes and headers[indexes[-1]][1].strip():
             name, joined = headers[indexes[-1]]
             headers[indexes[-1]] = (name, joined + b"," + value)
+        elif indexes:
+            headers[indexes[-1]] = (b"anthropic-beta", value)  # the client's header was empty
         else:
             headers.append((b"anthropic-beta", value))
         present.add(value.lower())

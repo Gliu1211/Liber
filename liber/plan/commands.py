@@ -73,7 +73,8 @@ async def show(store: Store, session_id: str | None = None, pricing: dict[str, M
     if state.pending is not None:
         model = await store.run(lambda db: latest_model(db, session_id))
         price = cost.price_for(model, pricing if pricing is not None else DEFAULT_PRICING)
-        lines += describe_estimate(cost.estimate(items, state.applied.plan, state.pending.plan, price))
+        estimate = cost.estimate(items, state.applied.plan, state.pending.plan, price, state.activated_at)
+        lines += describe_estimate(estimate)
     lines.append("  msg block role       kind         tokens  id")
     lines += [f"  {i.msg_index:>3} {i.block_index:>5} {i.role:10} {i.kind:12} {i.tokens:>6}  {i.id}" for i in items]
     return "\n".join(lines)
@@ -89,18 +90,18 @@ def describe_estimate(estimate: cost.Estimate) -> list[str]:
     """What applying the pending version costs and saves (§6), for `show`."""
     kind = "minor (appends after the frozen blocks)" if estimate.minor else "major (rewrites earlier history)"
     lines = [
-        f"  applying the pending version: {kind}",
+        f"  applying the pending version: {kind} (estimates, from token estimates)",
         f"    tokens per request: about {estimate.tokens_now:,} now, {estimate.tokens_after:,} after",
         f"    reprocessed once: about {estimate.reprocessed_tokens:,} tokens",
         f"    reasoning dropped: {estimate.dropped_thinking_blocks} thinking blocks "
         f"(about {estimate.dropped_thinking_tokens:,} tokens), left out from then on",
     ]
     if estimate.one_time_cost is None or estimate.saving_per_turn is None:
-        lines.append("    cost: no price for this session's model (see LIBER_PRICING)")
+        lines.append("    estimated cost: no price for this session's model (see LIBER_PRICING)")
     else:
         payback = f"{estimate.payback_turns} turns" if estimate.payback_turns is not None else "never (it adds tokens)"
         lines.append(
-            f"    cost: ${estimate.one_time_cost:.4f} once, saves ${estimate.saving_per_turn:.4f} per turn; "
+            f"    estimated cost: ${estimate.one_time_cost:.4f} once, saves ${estimate.saving_per_turn:.4f} per turn; "
             f"pays back after {payback}"
         )
     return lines

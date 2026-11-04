@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from liber.model.items import Plan
-from liber.model.validate import tool_results_in
+from liber.model.validate import in_flight_tool_loop_start, tool_results_in
 from liber.plan.versions import EMPTY, PlanState, PlanVersion
 
 # Context windows by model id prefix (checked 2026-11-04), for the threshold break point.
@@ -34,7 +34,9 @@ CONTEXT_WINDOWS = (
     ("claude-fable-5", 1_000_000),
     ("claude-mythos-5", 1_000_000),
     ("claude-opus-5", 1_000_000),
-    ("claude-opus-4", 1_000_000),
+    ("claude-opus-4-8", 1_000_000),
+    ("claude-opus-4-7", 1_000_000),
+    ("claude-opus-4-6", 1_000_000),
     ("claude-sonnet-5", 1_000_000),
     ("claude-sonnet-4-6", 1_000_000),
     ("claude-haiku-5-5", 1_000_000),
@@ -90,19 +92,40 @@ def pending_takes_effect(
     return state.apply_requested or idle or over_threshold
 
 
-def candidates(state: PlanState, messages: list[Any], pending_now: bool) -> list[Candidate]:
+def stale_thinking_point(state: PlanState, messages: list[Any], chain_hashes: list[str]) -> int:
+    """Thinking in messages before this index is stale and left out (ADR 0012).
+
+    - A session that never had a plan version take effect: nothing (0), so it's sent as is.
+    - A request that continues the request where the version took effect (same chain hash at
+      that position): the thinking from before that point.
+    - Any other request (another branch, an older request resent, or a version applied before
+      activation points were recorded): all thinking before the tool loop in flight, if any.
+      Liber can't tell which of it was produced against which rendering, and leaving out a
+      leading run is always valid. The loop's own thinking was produced against exactly this
+      rendering, since it is cut the same way on every request of the loop.
+    """
+    if state.activated_at is None and state.applied.number == 0:
+        return 0
+    at, last_hash = state.activated_at, state.activated_hash
+    if at is not None and last_hash is not None and len(chain_hashes) >= at and chain_hashes[at - 1] == last_hash:
+        return at
+    loop_start = in_flight_tool_loop_start(messages)
+    return len(messages) if loop_start is None else loop_start
+
+
+def candidates(state: PlanState, messages: list[Any], chain_hashes: list[str], pending_now: bool) -> list[Candidate]:
     """The versions to render this request with, best first; the empty plan is always last.
 
     The pending version first, if it takes effect now; then the applied one; then the empty plan,
     for a request the others don't work for (another branch, earlier history than the plan is
     about, or a plan that fails). Once any version has taken effect in the session, even the
-    empty plan leaves out the thinking from before that point: it was produced against Liber's
-    rendering, not the client's history (ADR 0012).
+    empty plan leaves out stale thinking: it was produced against Liber's rendering, not the
+    client's history (ADR 0012).
     """
-    stale = state.activated_at or 0
+    stale = stale_thinking_point(state, messages, chain_hashes)
     versions = [Candidate(state.applied, False, stale), Candidate(EMPTY, False, stale)]
     if state.pending is not None and pending_now:
-        # Everything in this request was produced before the new version: all of its thinking is stale.
+        # A clean turn: everything in it was produced before the new version, all of it stale.
         versions.insert(0, Candidate(state.pending, True, len(messages)))
     unique: list[Candidate] = []
     for candidate in versions:

@@ -9,6 +9,7 @@ rendering, is kept.
 
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,14 +19,15 @@ from fastapi import FastAPI
 
 from liber import pipeline
 from liber.config import DEFAULT_PRICING
-from liber.model.anthropic import RecentRequests, parse
+from liber.model.anthropic import RecentRequests, parse, render
 from liber.model.items import Kind, Operation, OperationKind, Plan
 from liber.plan import commands, cost, versions
-from liber.plan.apply import summarize_operation
+from liber.plan.apply import PlanNotApplicable, summarize_operation
 from liber.plan.policy import PlanPolicy, context_share, is_minor
 from liber.plan.thinking import BINDING_BETA
 from liber.proxy.forward import with_betas
 from liber.proxy.sse import ReplyCapture
+from liber.session.chain import seconds_between
 from liber.session.store import Store
 from tests.helpers import FakeUpstream, recorded, sse_response
 
@@ -353,3 +355,128 @@ async def test_show_explains_what_applying_the_pending_version_costs(store: Stor
 
     assert "applying the pending version: minor" in shown
     assert "reasoning dropped: 4 thinking blocks" in shown
+
+
+# --- Review findings ----------------------------------------------------------------------------
+
+
+async def test_a_plan_applied_before_activation_points_existed_strips_all_and_records_one(store: Store) -> None:
+    # Session 4a applied versions without recording where; their history's thinking all predates them.
+    recent = RecentRequests()
+    session = await with_summary_requested(store, recent, conversation(2))
+    await pipeline.prepare(store, body(conversation(2)), recent)
+    await store.run(
+        lambda db: db.connection().exec_driver_sql(
+            "UPDATE plans SET activated_at = NULL, activated_hash = NULL WHERE session_id = ?", (session,)
+        )
+    )
+
+    upgraded = await pipeline.prepare(store, body(conversation(3)), recent)
+    state = await versions.load_state(store, session)
+    later = await pipeline.prepare(store, body(conversation(4)), recent)
+
+    assert upgraded.outcome == "rendered" and thinking_texts(json.loads(upgraded.body)) == []
+    assert state.activated_at == 7  # recorded on that clean turn
+    assert thinking_texts(json.loads(later.body)) == ["reasoning 3"]  # produced after it
+
+
+async def test_another_branch_leaves_out_all_its_completed_thinking(store: Store) -> None:
+    # The version took effect on the main branch; this fork's thinking may predate it.
+    recent = RecentRequests()
+    await with_summary_requested(store, recent, conversation(2))
+    await pipeline.prepare(store, body(conversation(2)), recent)  # takes effect at 5 messages
+    fork = conversation(3)
+    fork["messages"][3] = {"role": "assistant", "content": [thinking(9), {"type": "text", "text": "other answer"}]}
+
+    prepared = await pipeline.prepare(store, body(fork), recent)
+
+    assert prepared.outcome == "rendered" and prepared.violations == []
+    assert thinking_texts(json.loads(prepared.body)) == []
+
+
+async def test_an_older_request_resent_mid_tool_loop_keeps_its_loop_and_is_not_a_fallback(store: Store) -> None:
+    recent = RecentRequests()
+    await with_summary_requested(store, recent, conversation(3))
+    await pipeline.prepare(store, body(conversation(3)), recent)  # takes effect at 7 messages
+    older = conversation(1)
+    older["messages"] += [
+        {"role": "assistant", "content": [thinking(5), {"type": "tool_use", "id": "t1", "name": "ls", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+    ]
+
+    prepared = await pipeline.prepare(store, body(older), recent)
+
+    assert prepared.outcome == "rendered" and prepared.violations == []
+    assert thinking_texts(json.loads(prepared.body)) == ["reasoning 5"]  # the loop in flight is untouched
+
+
+async def test_redacted_thinking_is_left_out_like_thinking(store: Store) -> None:
+    recent = RecentRequests()
+    request = conversation(2)
+    request["messages"][3]["content"].insert(0, {"type": "redacted_thinking", "data": "opaque"})
+    await with_summary_requested(store, recent, request)
+
+    sent = json.loads((await pipeline.prepare(store, body(request), recent)).body)
+
+    assert all(block["type"] == "text" for block in sent["messages"][1]["content"])
+
+
+@pytest.mark.parametrize(
+    ("client_thinking", "expected"),
+    [
+        (
+            {"type": "adaptive", "block_binding": {"mismatch_behavior": "drop_block"}},
+            {"type": "adaptive", "block_binding": {"mismatch_behavior": "drop_block"}},  # one spelling only
+        ),
+        (
+            {"type": "enabled", "budget_tokens": 2000},
+            {"type": "enabled", "budget_tokens": 2000, "block_binding": {"prefix_mismatch_behavior": "drop_block"}},
+        ),
+    ],
+)
+async def test_other_thinking_settings(store: Store, client_thinking: Any, expected: Any) -> None:
+    recent = RecentRequests()
+    request = conversation(2, model="claude-opus-4-6", thinking=client_thinking)
+    await with_summary_requested(store, recent, request)
+
+    prepared = await pipeline.prepare(store, body(request), recent)
+
+    assert prepared.outcome == "rendered" and json.loads(prepared.body)["thinking"] == expected
+
+
+def test_a_message_with_only_stale_thinking_makes_the_plan_not_fit() -> None:
+    request = conversation(2)
+    request["messages"][1]["content"] = [thinking(0)]  # e.g. cut off by max_tokens while thinking
+    parsed = parse(request)
+    offload = Operation(kind=OperationKind.OFFLOAD, item_ids=(parsed.items[0].id,))
+
+    with pytest.raises(PlanNotApplicable, match="empty"):
+        render(parsed, Plan(operations=(offload,)), stale_thinking_before=5)
+
+
+async def test_promoting_a_version_that_is_no_longer_pending_does_nothing(store: Store) -> None:
+    recent = RecentRequests()
+    session = await with_summary_requested(store, recent, conversation(2))
+    await versions.create(store, session, (summarize_operation(parse(conversation(4)).items, 2, 3, 2),))
+
+    await versions.promote_pending(store, session, 1, (5, "a" * 64))  # version 2 replaced it meanwhile
+    state = await versions.load_state(store, session)
+
+    assert state.applied.number == 0 and state.pending is not None and state.pending.number == 2
+
+
+def test_idle_time_reads_stored_times_as_utc() -> None:
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+
+    assert seconds_between(datetime(2026, 11, 4, 11, 55), now) == 300.0  # how SQLite gives it back
+    assert seconds_between(datetime(2026, 11, 4, 11, 59, tzinfo=UTC), now) == 60.0
+
+
+def test_beta_merging_with_several_empty_and_differently_cased_headers() -> None:
+    headers = [(b"anthropic-beta", b"one"), (b"anthropic-beta", b"Thinking-Binding-Controls-2026-08-01")]
+    assert with_betas(list(headers), [BINDING_BETA]) == headers  # already there, any case
+    assert with_betas([(b"anthropic-beta", b"")], [BINDING_BETA]) == [(b"anthropic-beta", BINDING_BETA.encode())]
+    assert with_betas([(b"anthropic-beta", b"a"), (b"anthropic-beta", b"b")], [BINDING_BETA])[-1] == (
+        b"anthropic-beta",
+        b"b," + BINDING_BETA.encode(),
+    )

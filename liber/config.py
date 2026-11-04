@@ -22,10 +22,11 @@ class ModelPrice(BaseModel):
     cache_read: float
 
 
-# §6: "pricing ratios come from a user-editable config table, not hard-coded claims". Defaults
-# from Anthropic's published prices as of 2026-11-04 (cache write = 1.25 x input for the
-# 5-minute cache); check the current price list and override with LIBER_PRICING (JSON) if they
-# changed. Keys are model id prefixes; the longest matching one is used.
+# §6: "pricing ratios come from a user-editable config table, not hard-coded claims". Input
+# prices are Anthropic's published ones as of 2026-11-04, as are the cache reads for Fable 5.x,
+# Opus 5.5 and Sonnet 5.5. The rest are derived from the usual ratios (cache write = 1.25 x input
+# for the 5-minute cache, cache read = 0.1 x input). Check the current price list; LIBER_PRICING
+# (JSON) replaces the whole table. Keys are model id prefixes; the longest matching one is used.
 DEFAULT_PRICING = {
     "claude-fable-5": ModelPrice(input=10.0, cache_write=12.5, cache_read=0.25),
     "claude-opus-5-5": ModelPrice(input=4.0, cache_write=5.0, cache_read=0.20),

@@ -202,6 +202,17 @@ def keeps_frozen_prefix(body: bytes, plan: StandardPlan) -> bool:
     return after.startswith(before[:end])
 
 
+def thinking_blocks_in(body: bytes) -> int:
+    request = json.loads(body)
+    return sum(
+        1
+        for message in request["messages"]
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking")
+    )
+
+
 def tokens_sent(result: pipeline.Prepared, tokens_before: int) -> int:
     """Estimated tokens in what actually went upstream: the client's own request unless Liber
     sent a rendered one. A render that failed validation was never sent, so it saves nothing."""
@@ -248,6 +259,8 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
                 "plan_version": result.plan_version,
                 "edit_skipped": result.edit_skipped,
                 "betas": list(result.betas),
+                # Thinking blocks in what was sent (ADR 0012: none on the request a version takes effect).
+                "thinking_sent": thinking_blocks_in(result.body),
                 "outcome": result.outcome,
                 "liber_error": result.error,
                 "known_messages": result.known_messages,

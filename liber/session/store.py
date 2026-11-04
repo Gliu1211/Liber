@@ -211,6 +211,9 @@ class PlanStateRecord(Base):
     # Messages in the request where the applied version took effect. Thinking blocks before that
     # point were produced against other history, so they are stripped (docs/decisions/0012).
     activated_at: Mapped[int | None]
+    # Chain hash of that request's last message: a later request continues the same history only
+    # if its own chain hash at that position is this one (another branch doesn't).
+    activated_hash: Mapped[str | None]
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

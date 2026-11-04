@@ -15,6 +15,7 @@ Version 0 is the empty plan and isn't stored. Plain SQL on the transaction's con
 session/chain.py; the async functions run each step as one Store transaction.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
@@ -23,6 +24,7 @@ import structlog
 from sqlalchemy import Connection, Table, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from liber.model.items import Operation, Plan
 from liber.session.store import SQLITE_BUSY_TIMEOUT_MS, PlanStateRecord, PlanVersionRecord, Store, StoreBusy
@@ -50,6 +52,7 @@ class PlanState:
     pending: PlanVersion | None
     apply_requested: bool
     activated_at: int | None = None  # messages in the request where `applied` took effect (ADR 0012)
+    activated_hash: str | None = None  # chain hash of that request's last message
 
 
 NO_PLAN = PlanState(applied=EMPTY, pending=None, apply_requested=False)
@@ -65,7 +68,7 @@ def read_state(db: Connection, session_id: str) -> PlanState:
         return NO_PLAN
     pending = read_version(db, session_id, row.pending_version) if row.pending_version is not None else None
     applied = read_version(db, session_id, row.applied_version)
-    return PlanState(applied, pending, row.apply_requested, row.activated_at)
+    return PlanState(applied, pending, row.apply_requested, row.activated_at, row.activated_hash)
 
 
 def read_state_or_no_plan(db: Connection, session_id: str) -> PlanState:
@@ -131,12 +134,14 @@ def request_undo(db: Connection, session_id: str, now: datetime) -> PlanVersion:
     return previous
 
 
-def promote(db: Connection, session_id: str, version: int, at_messages: int, now: datetime) -> None:
+def promote(db: Connection, session_id: str, version: int, activation: tuple[int, str], now: datetime) -> None:
     """Make the pending `version` the applied one (a no-op if someone else already did).
 
-    `at_messages`: the length of the request it takes effect on. Thinking blocks before that
-    point were produced against the previous render, so later requests strip them (ADR 0012).
+    `activation`: the length and last chain hash of the request it takes effect on. Thinking from
+    before that point was produced against another rendering, so later requests leave it out
+    (ADR 0012).
     """
+    at_messages, last_hash = activation
     db.execute(
         update(PlanStateRecord)
         .where(PlanStateRecord.session_id == session_id, PlanStateRecord.pending_version == version)
@@ -145,8 +150,28 @@ def promote(db: Connection, session_id: str, version: int, at_messages: int, now
             pending_version=None,
             apply_requested=False,
             activated_at=at_messages,
+            activated_hash=last_hash,
             updated_at=now,
         )
+    )
+
+
+def record_activation(
+    db: Connection, session_id: str, version: int, activation: tuple[int, str], now: datetime
+) -> None:
+    """Note where the applied `version` is in effect from, for a session that has no such note.
+
+    Plans applied before activation points were recorded (Session 4a) have none.
+    """
+    at_messages, last_hash = activation
+    db.execute(
+        update(PlanStateRecord)
+        .where(
+            PlanStateRecord.session_id == session_id,
+            PlanStateRecord.applied_version == version,
+            PlanStateRecord.activated_hash.is_(None),
+        )
+        .values(activated_at=at_messages, activated_hash=last_hash, updated_at=now)
     )
 
 
@@ -181,15 +206,22 @@ async def undo(store: Store, session_id: str) -> PlanVersion:
     return await store.run(lambda db: request_undo(db.connection(), session_id, now), immediate=True)
 
 
-async def promote_pending(store: Store, session_id: str, version: int, at_messages: int) -> None:
+async def promote_pending(store: Store, session_id: str, version: int, activation: tuple[int, str]) -> None:
     """On the request path: as short a wait for the write lock as identification's (§3 budget)."""
     now = datetime.now(UTC)
+    await write_on_request_path(store, lambda db: promote(db.connection(), session_id, version, activation, now))
+
+
+async def backfill_activation(store: Store, session_id: str, version: int, activation: tuple[int, str]) -> None:
+    now = datetime.now(UTC)
+    await write_on_request_path(
+        store, lambda db: record_activation(db.connection(), session_id, version, activation, now)
+    )
+
+
+async def write_on_request_path(store: Store, work: Callable[[Session], None]) -> None:
     try:
-        await store.run(
-            lambda db: promote(db.connection(), session_id, version, at_messages, now),
-            busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
-            immediate=True,
-        )
+        await store.run(work, busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS, immediate=True)
     except OperationalError as exc:
         if "locked" in str(exc.orig) or "busy" in str(exc.orig):
             raise StoreBusy("the database is locked by another writer") from exc

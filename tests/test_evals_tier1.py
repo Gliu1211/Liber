@@ -139,6 +139,13 @@ async def test_metrics_on_the_fixtures() -> None:
     # The beta goes with exactly the requests Liber edited (the fixtures use confirmed models).
     assert all(record["betas"] == [BINDING_BETA] for record in result.trace if record["outcome"] == "rendered")
     assert all(record["betas"] == [] for record in result.trace if record["outcome"] != "rendered")
+    # ADR 0012: when a version takes effect, every earlier thinking block is stale and left out.
+    first_with_version: dict[tuple[str, int], dict[str, Any]] = {}
+    for record in result.trace:
+        if record["outcome"] == "rendered":
+            first_with_version.setdefault((record["session"], record["plan_version"]), record)
+    assert first_with_version and all(record["thinking_sent"] == 0 for record in first_with_version.values())
+    assert any(record["thinking_sent"] > 0 for record in result.trace if record["outcome"] == "rendered")
     lower_is_better = {"fallback_rate", "p95_overhead_ms"}
     assert all(m.direction == ("lower" if name in lower_is_better else "higher") for name, m in metrics.items())
     # The overhead tolerance is the budget left, so the gate fails once p95 goes over budget.
