@@ -72,13 +72,17 @@ class Operation(BaseModel):
     kind: OperationKind
     item_ids: tuple[str, ...]
     note: str | None = None  # e.g. the label shown in an offload pointer note
+    # summarize only: the frozen block's text, fixed when the plan version is created, so every
+    # request renders exactly the same bytes for it (ADR 0004 A2).
+    summary: str | None = None
 
 
 class Plan(BaseModel):
     """An ordered list of operations for one session (§4).
 
-    Session 4 stores plans as immutable versions (pending vs applied, undo). Until then the
-    request path always uses the empty plan, which must leave every request unchanged.
+    Stored as immutable, numbered versions (plan/versions.py): a pending version becomes the
+    applied one at a break point (§6), and undo goes back to the previous one. The empty plan
+    (version 0) leaves every request unchanged.
     """
 
     model_config = ConfigDict(frozen=True)

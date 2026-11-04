@@ -53,3 +53,8 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return self.data_dir / "liber.db"
+
+    @property
+    def blobs_dir(self) -> Path:
+        """Offloaded content, by hash (cache/blobs.py)."""
+        return self.data_dir / "blobs"

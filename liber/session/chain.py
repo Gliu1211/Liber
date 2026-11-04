@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import Connection
 from sqlalchemy.exc import OperationalError
 
+from liber.plan.versions import NO_PLAN, PlanState, read_state
 from liber.session.store import (
     BranchRecord,
     ChainNode,
@@ -187,6 +188,9 @@ class Identity:
     new_branch: bool = False
     parent_branch_id: str | None = None  # the branch's parent (None for a session's first branch)
     fork_depth: int = 0  # messages the branch shares with its parent (0 for a first branch)
+    # The session's edit plan (plan/versions.py), read in the same transaction so the request
+    # path needs only one trip to the database.
+    plan: PlanState = NO_PLAN
 
 
 def new_id() -> str:
@@ -280,6 +284,7 @@ def find_and_register(db: Connection, parsed: "ParsedRequest", now: datetime) ->
         new_branch=new_branch,
         parent_branch_id=parent_branch_id,
         fork_depth=fork_depth,
+        plan=NO_PLAN if new_session else read_state(db, session_id),
     )
 
 

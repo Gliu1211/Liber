@@ -11,8 +11,8 @@ same key order (tested on every fixture and on generated requests). Everything L
 edit is carried through untouched, by reference: top-level fields (model, system, tools, ...),
 message-level fields, and each content block.
 
-Applying plan operations (offload, delete, summarize -> frozen blocks) is Session 4's work, in
-plan/apply.py; until then render() accepts only the empty plan.
+Plan operations (offload, delete, summarize -> frozen blocks) are applied by plan/apply.py, which
+builds new message and block objects for whatever it changes.
 
 Speed (ARCHITECTURE.md §3 latency budget): a client resends the whole conversation on every
 turn, and canonicalizing and hashing every block is most of parse()'s time. So parse() can be
@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from liber.model.items import Item, Kind, Plan, Role
+from liber.plan.apply import apply_plan
 from liber.session import chain
 
 KIND_BY_BLOCK_TYPE = {
@@ -50,10 +51,6 @@ RECENT_CONVERSATIONS = 8
 # Rough token estimates for blocks whose JSON length says little about their token count.
 IMAGE_TOKENS_ESTIMATE = 1600  # a typical ~1 megapixel image
 BINARY_DOCUMENT_TOKENS_ESTIMATE = 3000  # a short PDF
-
-
-class UnsupportedPlan(Exception):
-    """render() was given plan operations it can't apply yet."""
 
 
 class RequestShapeError(ValueError):
@@ -259,15 +256,19 @@ def estimate_tokens(kind: Kind, block: dict[str, Any], canonical: str) -> int:
 
 
 def render(parsed: ParsedRequest, plan: Plan) -> dict[str, Any]:
-    """Rebuild the request from its items, applying `plan` (empty plans only, until Session 4)."""
-    if not plan.is_empty:
-        raise UnsupportedPlan("plan operations are applied from Session 4 (plan/apply.py)")
+    """Rebuild the request from its items, applying `plan` (plan/apply.py).
 
-    blocks_by_message: list[list[dict[str, Any]]] = [[] for _ in parsed.messages]
-    for item in parsed.items:
-        blocks_by_message[item.msg_index].append(item.block)
-
-    messages = [render_message(frame, blocks) for frame, blocks in zip(parsed.messages, blocks_by_message, strict=True)]
+    Raises plan.apply.PlanNotApplicable if the plan doesn't fit this request.
+    """
+    if plan.is_empty:
+        blocks_by_message: list[list[dict[str, Any]]] = [[] for _ in parsed.messages]
+        for item in parsed.items:
+            blocks_by_message[item.msg_index].append(item.block)
+        messages = [
+            render_message(frame, blocks) for frame, blocks in zip(parsed.messages, blocks_by_message, strict=True)
+        ]
+    else:
+        messages = apply_plan(parsed, plan)
     rendered = dict(parsed.original)  # same top-level keys in the same order...
     rendered["messages"] = messages  # ...with only the messages rebuilt
     return rendered
