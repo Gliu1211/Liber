@@ -108,6 +108,57 @@ def root_hash(system: Any, tools: Any) -> str:
     return sha256_hex(canonical_json({"system": system_blocks, "tools": tool_definitions}))
 
 
+def has_numbers(value: Any) -> bool:
+    """Does a decoded JSON value hold a number, true or false anywhere?
+
+    parse() records this per message, because Python's == treats 1, 1.0 and True as equal while
+    their canonical JSON differs (see same_json).
+
+    A loop over a to-do list rather than recursion, so deeply nested JSON (which json.loads
+    accepts) can't hit Python's recursion limit and make the request fall back.
+    """
+    to_visit = [value]
+    while to_visit:
+        current = to_visit.pop()
+        if isinstance(current, dict):
+            to_visit.extend(current.values())
+        elif isinstance(current, list):
+            to_visit.extend(current)
+        elif isinstance(current, int | float):  # bool is a subclass of int: True and False count too
+            return True
+    return False
+
+
+def same_json(a: Any, b: Any) -> bool:
+    """Do two decoded JSON values have the same canonical form? (Without computing it.)
+
+    Like ==, except that 1, 1.0 and True are all different, as are 0.0 and -0.0, because
+    canonical_json writes them differently. Key order doesn't matter, as in canonical form.
+    It walks the values in Python, so parse() uses it only for messages with numbers in them and
+    plain == (which runs in C) for the rest. A loop over pairs still to compare, not recursion,
+    for the same reason as has_numbers.
+    """
+    to_compare = [(a, b)]
+    while to_compare:
+        x, y = to_compare.pop()
+        if type(x) is not type(y):
+            return False
+        if isinstance(x, dict):
+            if x.keys() != y.keys():
+                return False
+            to_compare.extend((value, y[key]) for key, value in x.items())
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                return False
+            to_compare.extend(zip(x, y, strict=True))
+        elif isinstance(x, float):
+            if repr(x) != repr(y):  # the JSON spelling: tells 0.0 from -0.0, and NaN equals NaN
+                return False
+        elif x != y:
+            return False
+    return True
+
+
 def message_hash(previous_hash: str, message: dict[str, Any], block_hashes: list[str]) -> str:
     """h_i = H(h_{i-1} || canonical(message_i)).
 

@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from liber.model.anthropic import parse
-from liber.session.chain import Identity, StoreBusy, canonical_json, content_hash, identify
+from liber.session.chain import Identity, StoreBusy, canonical_json, content_hash, has_numbers, identify, same_json
 from liber.session.store import Store
 
 SYSTEM = "You are a helpful assistant."
@@ -69,6 +71,45 @@ def test_string_and_block_content_are_the_same_conversation() -> None:
     as_blocks["messages"][0]["content"] = [{"type": "text", "text": "hi"}]
 
     assert parse(as_blocks).chain_hashes == parse(request("hi")).chain_hashes
+
+
+def test_same_json_is_equality_of_canonical_form() -> None:
+    # parse() uses == (fast, in C) to spot messages it has already hashed. For JSON without numbers
+    # that means "same canonical form"; with numbers it doesn't, which is what same_json is for.
+    assert 1 == 1.0 == True  # that's the point: == can't tell them apart
+    assert canonical_json(1) != canonical_json(1.0) != canonical_json(True)
+    assert not same_json(1, 1.0) and not same_json(1, True) and not same_json(0.0, -0.0)
+    assert same_json({"a": [1, "x", None]}, {"a": [1, "x", None]})
+    assert same_json({"a": 1, "b": 2}, {"b": 2, "a": 1})  # key order doesn't matter, as in canonical form
+    assert not same_json({"a": [1]}, {"a": [1, 2]}) and not same_json({"a": 1}, {"b": 1})
+
+
+# Small values, so that equal and nearly-equal pairs (1 / 1.0 / True, 0.0 / -0.0) come up often.
+small_scalars = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(-2, 2),
+    st.floats(-2, 2),
+    st.sampled_from([0.0, -0.0, float("nan"), "", "a"]),
+)
+small_json = st.recursive(
+    small_scalars,
+    lambda children: st.lists(children, max_size=3) | st.dictionaries(st.sampled_from(["a", "b"]), children),
+    max_leaves=6,
+)
+
+
+@given(small_json, small_json)
+def test_same_json_agrees_with_canonical_json(a: Any, b: Any) -> None:
+    assert same_json(a, b) == (canonical_json(a) == canonical_json(b))
+    assert same_json(a, copy.deepcopy(a))
+
+
+def test_has_numbers_finds_numbers_and_booleans_anywhere() -> None:
+    assert has_numbers({"input": {"limit": 5}})
+    assert has_numbers([{"is_error": False}])
+    assert has_numbers({"a": [[0.5]]})
+    assert not has_numbers({"role": "user", "content": [{"type": "text", "text": "5"}], "x": None})
 
 
 # --- Identification ---------------------------------------------------------------------------

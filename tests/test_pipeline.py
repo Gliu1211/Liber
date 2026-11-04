@@ -15,6 +15,8 @@ import pytest
 from fastapi import FastAPI
 
 from liber import pipeline
+from liber.model.anthropic import RecentRequests
+from liber.session import chain
 from liber.session.store import Store
 from tests.helpers import FIXTURES, FakeUpstream, recorded
 
@@ -139,22 +141,86 @@ def growing_conversation(full: dict[str, Any]) -> list[bytes]:
 async def test_request_path_overhead_p95_under_10ms(store: Store) -> None:
     full = json.loads(LONG_SESSION.read_text(encoding="utf-8"))
     bodies = growing_conversation(full)
-    await pipeline.prepare(store, bodies[0])  # warm-up (imports, first DB connection)
+    recent = RecentRequests()  # as the app runs it
+    await pipeline.prepare(store, bodies[0], recent)  # warm-up (imports, first DB connection)
 
     timings = []
     for body in bodies:
-        prepared = await pipeline.prepare(store, body)
+        prepared = await pipeline.prepare(store, body, recent)
         assert prepared.outcome == "passthrough", prepared.error or prepared.violations
         assert prepared.overhead_ms is not None
         timings.append(prepared.overhead_ms)
     # Also the worst case: a client that arrives with all 101 messages already in hand.
-    cold = await pipeline.prepare(store, LONG_SESSION.read_bytes().replace(b"Python repository", b"Go repository"))
+    cold_body = LONG_SESSION.read_bytes().replace(b"Python repository", b"Go repository")
+    cold = await pipeline.prepare(store, cold_body, recent)
     assert cold.overhead_ms is not None
     timings.append(cold.overhead_ms)
 
     p95 = statistics.quantiles(timings, n=20)[18]
     assert len(bodies) == 51
     assert p95 < 10, f"p95 overhead {p95:.2f} ms over {len(timings)} requests"
+
+
+# --- Reusing the previous request's work (ADR 0007) -------------------------------------------
+
+
+async def test_the_next_turn_only_hashes_the_new_messages(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    bodies = growing_conversation(json.loads(LONG_SESSION.read_text(encoding="utf-8")))
+    recent = RecentRequests()
+    await pipeline.prepare(store, bodies[-2], recent)
+    hashed: list[Any] = []
+    real_canonical_block = chain.canonical_block
+    monkeypatch.setattr(chain, "canonical_block", lambda block: hashed.append(block) or real_canonical_block(block))
+
+    prepared = await pipeline.prepare(store, bodies[-1], recent)
+
+    assert prepared.outcome == "passthrough"
+    assert (prepared.known_messages, prepared.new_messages) == (99, 2)
+    new_messages = json.loads(bodies[-1])["messages"][99:]
+    assert hashed == [block for message in new_messages for block in message["content"]]
+
+
+async def test_the_same_request_twice_hashes_nothing(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = TOOL_LOOP.read_bytes()
+    recent = RecentRequests()
+    first = await pipeline.prepare(store, raw, recent)
+    monkeypatch.setattr(chain, "canonical_block", boom)  # any hashing of a message would now fail
+
+    retry = await pipeline.prepare(store, raw, recent)
+
+    assert retry.outcome == "passthrough" and retry.body is raw
+    assert (retry.session_id, retry.known_messages, retry.new_messages) == (first.session_id, 5, 0)
+
+
+async def test_deeply_nested_json_is_still_handled(store: Store) -> None:
+    # json.loads accepts ~1000 levels; the walks parse() adds must not give up sooner (a
+    # recursive walk failed at ~330). 300 x (dict + list) = 600 levels.
+    deep: Any = "bottom"
+    for _ in range(300):
+        deep = {"level": [deep, 1]}
+    request = json.loads(TOOL_LOOP.read_bytes())
+    request["messages"][1]["content"][2]["input"] = deep
+    raw = json.dumps(request).encode()
+    recent = RecentRequests()
+
+    first = await pipeline.prepare(store, raw, recent)
+    retry = await pipeline.prepare(store, raw, recent)  # compares the nested message with the cached one
+
+    assert (first.outcome, retry.outcome) == ("passthrough", "passthrough"), (first.error, retry.error)
+
+
+async def test_a_failure_in_the_recent_requests_cache_forwards_the_original(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recent = RecentRequests()
+    monkeypatch.setattr(recent, "find", boom)
+    raw = TOOL_LOOP.read_bytes()
+
+    prepared = await pipeline.prepare(store, raw, recent)
+
+    assert prepared.outcome == "fallback"
+    assert prepared.body is raw
+    assert prepared.error is not None and "RuntimeError" in prepared.error
 
 
 # --- Through the app --------------------------------------------------------------------------
@@ -165,6 +231,9 @@ async def test_outcome_is_recorded_per_request(app: FastAPI, client: httpx.Async
 
     await client.post("/v1/messages", content=raw, headers={"content-type": "application/json"})
     [row] = await recorded(app)
+    [remembered] = app.state.recent_requests.entries  # kept for the conversation's next request
+
+    assert remembered.original == json.loads(raw)
 
     assert upstream.last_request.content == raw
     assert row.liber_outcome == "passthrough"
