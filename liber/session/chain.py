@@ -33,12 +33,15 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import Connection
 from sqlalchemy.exc import OperationalError
 
+from liber.plan.versions import NO_PLAN, PlanState, read_state_or_no_plan
 from liber.session.store import (
+    SQLITE_BUSY_TIMEOUT_MS,
     BranchRecord,
     ChainNode,
     ItemRecord,
     SessionRecord,
     Store,
+    StoreBusy,
     deepest_known_node,
     insert_new,
     touch_branch,
@@ -187,20 +190,18 @@ class Identity:
     new_branch: bool = False
     parent_branch_id: str | None = None  # the branch's parent (None for a session's first branch)
     fork_depth: int = 0  # messages the branch shares with its parent (0 for a first branch)
+    # The session's edit plan (plan/versions.py), read in the same transaction so the request
+    # path needs only one trip to the database.
+    plan: PlanState = NO_PLAN
 
 
 def new_id() -> str:
     return uuid.uuid4().hex
 
 
-class StoreBusy(Exception):
-    """The database is busy; this request goes through without Liber rather than wait (§3 budget)."""
-
-
 # How long a request may wait to be identified before Liber steps aside. Identification normally
 # takes a few milliseconds; long waits only happen when something else holds the database.
 LOCK_WAIT_SECONDS = 0.25
-SQLITE_BUSY_TIMEOUT_MS = 100
 
 
 async def identify(store: Store, parsed: "ParsedRequest") -> Identity:
@@ -280,6 +281,7 @@ def find_and_register(db: Connection, parsed: "ParsedRequest", now: datetime) ->
         new_branch=new_branch,
         parent_branch_id=parent_branch_id,
         fork_depth=fork_depth,
+        plan=NO_PLAN if new_session else read_state_or_no_plan(db, session_id),
     )
 
 

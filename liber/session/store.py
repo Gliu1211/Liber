@@ -8,11 +8,16 @@ Tables so far:
   tree; a session is the family of branches that grew from the same first message.
 - `items`: one row per content block (§4). Items belong to the message that holds them, so
   branches that share a prefix share its items.
+- `plan_versions`, `plans`: each session's edit plan as immutable versions, and which version
+  is applied or pending (plan/versions.py).
+- `content_cache`: what Liber knows about a piece of content by its hash (§7, cache/content.py).
 
 Privacy (hard rule 2, §11): credential headers are never stored. Only the request headers in
 `RECORDED_REQUEST_HEADERS` are kept (an allowlist, so a new or unexpected header is never
 stored by accident). Bodies are stored only when `Settings.record_bodies` is on; the
-conversation tables hold hashes, positions and token counts, never content.
+conversation tables hold hashes, positions and token counts, never content. Content the user
+chose to edit is the exception: an offloaded item's original goes to the blob store (it must
+be restorable), and a plan holds its summaries' text.
 
 Tables are created with `create_all` at startup, and columns added since an older version are
 added in place (`add_missing_columns`). Alembic migrations come once the schema settles (§8).
@@ -37,6 +42,15 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 T = TypeVar("T")
+
+# The request path's writes (identification, applying a plan) wait at most this long for another
+# writer to finish before Liber steps aside (§3 budget, docs/decisions/0003).
+SQLITE_BUSY_TIMEOUT_MS = 100
+
+
+class StoreBusy(Exception):
+    """The database is busy; this request goes through without Liber rather than wait (§3 budget)."""
+
 
 log = structlog.get_logger(__name__)
 
@@ -102,6 +116,8 @@ class RequestRecord(Base):
     liber_error: Mapped[str | None] = mapped_column(Text)  # why it fell back, if it did
     violations: Mapped[str | None] = mapped_column(Text)  # JSON list of validator messages
     overhead_ms: Mapped[float | None]  # time spent in §3 steps 2-5
+    plan_version: Mapped[int | None]  # the session's plan version rendered for this request (None: no plan)
+    edit_skipped: Mapped[str | None] = mapped_column(Text)  # why a plan wasn't used or its edit not sent
 
 
 class SessionRecord(Base):
@@ -164,6 +180,43 @@ class ItemRecord(Base):
     tool_use_id: Mapped[str | None]
     depends_on: Mapped[str | None]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PlanVersionRecord(Base):
+    """One immutable version of a session's edit plan (§4). Version 0, the empty plan, isn't stored."""
+
+    __tablename__ = "plan_versions"
+
+    session_id: Mapped[str] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(primary_key=True)  # 1, 2, 3... per session
+    parent_version: Mapped[int]  # the version it was built on; undo goes back to it (0: none)
+    plan: Mapped[str] = mapped_column(Text)  # the Plan as JSON
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PlanStateRecord(Base):
+    """Which plan versions a session uses (§4): the applied one, and a pending one waiting for a break point."""
+
+    __tablename__ = "plans"
+
+    session_id: Mapped[str] = mapped_column(primary_key=True)
+    applied_version: Mapped[int]  # used on every request; 0 = the empty plan
+    pending_version: Mapped[int | None]
+    apply_requested: Mapped[bool]  # the user asked for pending to be applied (§6 break point 1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ContentCacheRecord(Base):
+    """What Liber knows about a piece of content, by its hash (§7, cache/content.py)."""
+
+    __tablename__ = "content_cache"
+
+    content_hash: Mapped[str] = mapped_column(primary_key=True)
+    blob_path: Mapped[str | None] = mapped_column(Text)  # where an offloaded original is kept
+    tokens: Mapped[int | None]  # exact count, from the worker (Session 5)
+    summary: Mapped[str | None] = mapped_column(Text)  # from the worker (Session 5)
+    topic: Mapped[str | None]  # from the worker (Session 5)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 def add_missing_columns(connection: Connection) -> None:

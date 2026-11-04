@@ -29,6 +29,8 @@ import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
 
+from liber.cache.blobs import BlobStore
+from liber.cache.content import keep_originals
 from liber.config import Settings
 from liber.log import configure_logging
 from liber.model.anthropic import RecentRequests
@@ -83,6 +85,7 @@ def create_app(settings: Settings | None = None, upstream_transport: httpx.Async
     app.state.pending_writes = set()
     # The latest request of each recent conversation, so the next one only hashes what's new (ADR 0007).
     app.state.recent_requests = RecentRequests()
+    app.state.blobs = BlobStore(settings.blobs_dir)  # offloaded originals (§4)
     # Order matters: the specific route first, then the catch-all for everything else.
     app.add_api_route("/v1/messages", proxy_messages, methods=["POST"])
     app.add_api_route("/{path:path}", proxy_other, methods=ALL_METHODS)
@@ -99,6 +102,8 @@ async def proxy_messages(request: Request) -> Response:
     # §3 steps 2-5. prepare() never raises; on any problem it hands back the client's own bytes.
     prepared = await prepare(app.state.store, body, app.state.recent_requests)
     record = start_record(request, body, prepared, settings.record_bodies)
+    if prepared.offloaded:
+        spawn_keep_originals(app, prepared)
 
     try:
         upstream = await open_upstream(app.state.client, request, prepared.body)
@@ -172,6 +177,8 @@ def start_record(request: Request, body: bytes, prepared: Prepared, keep_body: b
             liber_error=prepared.error,
             violations=json.dumps([str(v) for v in prepared.violations]) if prepared.violations else None,
             overhead_ms=prepared.overhead_ms,
+            plan_version=prepared.plan_version,
+            edit_skipped=prepared.edit_skipped,
         )
     except Exception:
         log.exception("recording_failed", path=path)
@@ -251,6 +258,20 @@ async def _write(app: FastAPI, record: RequestRecord) -> None:
         duration_ms=record.duration_ms,
         error=record.error,
     )
+
+
+def spawn_keep_originals(app: FastAPI, prepared: Prepared) -> None:
+    """Store the originals of the items this request's plan offloads, in a background task (§4)."""
+    task = asyncio.create_task(_keep_originals(app, prepared))
+    app.state.pending_writes.add(task)
+    task.add_done_callback(app.state.pending_writes.discard)
+
+
+async def _keep_originals(app: FastAPI, prepared: Prepared) -> None:
+    try:
+        await keep_originals(app.state.store, app.state.blobs, prepared.offloaded)
+    except Exception:
+        log.exception("keeping_offloaded_originals_failed", session_id=prepared.session_id)
 
 
 async def wait_for_pending_writes(app: FastAPI) -> None:

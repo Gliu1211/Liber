@@ -38,9 +38,11 @@ from typing import Any
 from liber import pipeline
 from liber.config import DEFAULT_WAL_CHECKPOINT_SECONDS
 from liber.evals.metrics import Metric, p95, ratio, write_results, write_trace
-from liber.evals.replay import ReplayedRequest, load_sessions, replay
+from liber.evals.replay import ReplayedRequest, SessionFixture, load_sessions, replay
 from liber.model.anthropic import RecentRequests, parse, render
-from liber.model.items import Plan
+from liber.model.items import Kind, Operation, OperationKind, Plan
+from liber.plan import versions
+from liber.plan.apply import exchange_starts, summarize_operation
 from liber.session.store import Store, checkpointing
 
 OVERHEAD_BUDGET_MS = 10.0  # §3: steps 2-5 must add only a few milliseconds
@@ -100,22 +102,104 @@ def check_render(body: bytes, plan: Plan) -> RenderCheck:
     return check
 
 
-async def run_request_path(requests: list[ReplayedRequest]) -> list[pipeline.Prepared]:
+@dataclass(frozen=True)
+class StandardPlan:
+    """A fixture session's standard plan (docs/decisions/0010).
+
+    Version 1 summarizes the first exchange and offloads the large tool results of the next one.
+    Version 2 adds a summary of the second exchange: a minor compaction, which appends a frozen
+    block and must leave everything before it byte-identical (prefix_stability).
+    """
+
+    first: tuple[Operation, ...]
+    second: tuple[Operation, ...]
+
+    def version(self, number: int | None) -> Plan:
+        operations = {1: self.first, 2: self.first + self.second}.get(number or 0, ())
+        return Plan(operations=operations)
+
+
+LARGE_TOOL_RESULT_TOKENS = 200
+
+
+def standard_plan(session: SessionFixture) -> StandardPlan | None:
+    """The standard plan for `session`, from its final request (item ids don't change as it grows).
+
+    None for a session with fewer than three exchanges: there would be nothing live left.
+    """
+    items = parse(session.request).items
+    starts = exchange_starts(session.request["messages"])
+    if len(starts) < 3:
+        return None
+    first = [summarize_operation(items, 0, starts[1] - 1, block_number=1)]
+    large = tuple(
+        item.id
+        for item in items
+        if item.kind is Kind.TOOL_RESULT
+        and item.tokens >= LARGE_TOOL_RESULT_TOKENS
+        and starts[1] <= item.msg_index < starts[2]
+    )
+    if large:
+        first.append(Operation(kind=OperationKind.OFFLOAD, item_ids=large, note="large tool result"))
+    second = (summarize_operation(items, starts[1], starts[2] - 1, block_number=2),)
+    return StandardPlan(tuple(first), second)
+
+
+async def run_request_path(
+    requests: list[ReplayedRequest], plans: dict[str, StandardPlan] | None = None
+) -> list[pipeline.Prepared]:
     """Send every request through pipeline.prepare against a fresh, throwaway database.
 
     Set up as the app sets it up (liber/app.py), as if freshly started: an empty recent-requests
-    cache (ADR 0007) and the background WAL checkpoints (ADR 0008).
+    cache (ADR 0007) and the background WAL checkpoints (ADR 0008). With `plans`, each fixture
+    session gets its standard plan the way a user would make it: version 1 is created and
+    requested after the session's first request, version 2 once version 1 is in use; the request
+    path applies each at a clean turn (§6, ADR 0004 A1). Plan commands run between requests, so
+    they aren't timed.
     """
+    plans = plans or {}
+    liber_session: dict[str, str] = {}  # fixture session -> its Liber session (its first request's)
     with tempfile.TemporaryDirectory() as directory:
         store = Store(Path(directory) / "liber.db")
         await store.create_tables()
         recent = RecentRequests()
+        results = []
         try:
             async with checkpointing(store, DEFAULT_WAL_CHECKPOINT_SECONDS):
                 await pipeline.prepare(store, WARMUP_BODY, recent)
-                return [await pipeline.prepare(store, request.body, recent) for request in requests]
+                for request in requests:
+                    result = await pipeline.prepare(store, request.body, recent)
+                    results.append(result)
+                    plan = plans.get(request.session)
+                    if plan is None or result.session_id is None:
+                        continue
+                    session_id = liber_session.setdefault(request.session, result.session_id)
+                    if session_id != result.session_id:
+                        continue  # e.g. the client compacted its own history: a new session, no plan
+                    state = await versions.load_state(store, session_id)
+                    newest = state.pending or state.applied
+                    if newest.number == 0:
+                        await versions.create(store, session_id, plan.first)
+                        await versions.apply(store, session_id)
+                    elif newest.number == 1 and state.applied.number == 1:
+                        await versions.create(store, session_id, plan.second)
+                        await versions.apply(store, session_id)
         finally:
             await store.close()
+    return results
+
+
+def keeps_frozen_prefix(body: bytes, plan: StandardPlan) -> bool:
+    """Does rendering with version 2 keep version 1's bytes up to the end of its frozen blocks?
+
+    Those bytes (system, tools, earlier frozen blocks) are what the provider's prefix cache has
+    already seen; a minor compaction may only append after them (D5).
+    """
+    before = pipeline.encode_request(render(parse(json.loads(body)), plan.version(1)))
+    after = pipeline.encode_request(render(parse(json.loads(body)), plan.version(2)))
+    last_frozen = pipeline.encode_request({"type": "text", "text": plan.first[0].summary})
+    end = before.index(last_frozen) + len(last_frozen)
+    return after.startswith(before[:end])
 
 
 def tokens_sent(result: pipeline.Prepared, tokens_before: int) -> int:
@@ -137,10 +221,21 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
             raise EvalError(f"session {session.name} replays to no requests")
         requests += replayed
 
-    plan = Plan()  # the plan the request path applies: always empty until Session 4
-    checks = [check_render(request.body, plan) for request in requests]
-    runs = [await run_request_path(requests) for _ in range(TIMING_RUNS)]
+    plans = {session.name: plan for session in sessions if (plan := standard_plan(session)) is not None}
+    runs = [await run_request_path(requests, plans) for _ in range(TIMING_RUNS)]
     prepared = runs[0]  # outcomes don't depend on timing; the first run is the one traced
+    # Each request is checked with the plan version the request path rendered it with.
+    used = [
+        plans[r.session].version(p.plan_version) if r.session in plans else Plan()
+        for r, p in zip(requests, prepared, strict=True)
+    ]
+    checks = [check_render(request.body, plan) for request, plan in zip(requests, used, strict=True)]
+    # Minor compactions: every request rendered with version 2, against version 1 (D5).
+    compacted = [
+        keeps_frozen_prefix(request.body, plans[request.session])
+        for request, result in zip(requests, prepared, strict=True)
+        if result.plan_version == 2
+    ]
 
     trace: list[dict[str, Any]] = []
     for request, check, result in zip(requests, checks, prepared, strict=True):
@@ -150,7 +245,8 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
                 "label": request.label,
                 "index": request.index,
                 "messages": len(json.loads(request.body)["messages"]),
-                "plan_version": None,  # no plans until Session 4
+                "plan_version": result.plan_version,
+                "edit_skipped": result.edit_skipped,
                 "outcome": result.outcome,
                 "liber_error": result.error,
                 "known_messages": result.known_messages,
@@ -199,11 +295,13 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
             "1 - estimated input tokens actually sent / tokens the client sent, over all requests.",
         ),
         "prefix_stability": Metric(
-            1.0,
+            # A run with standard plans but no minor compaction measured nothing: that counts as 0,
+            # so the gate fails, rather than ratio()'s 1.0 for an empty set.
+            ratio(sum(compacted), len(compacted)) if compacted or not plans else 0.0,
             "higher",
             0.0,
-            "Placeholder until Session 4: share of requests whose bytes up to the frozen/live "
-            "boundary are unchanged after a minor compaction.",
+            "Share of requests rendered after a minor compaction (plan version 2) whose bytes up to "
+            "the end of version 1's frozen blocks are unchanged (D5).",
         ),
         "render_determinism": Metric(
             ratio(sum(check.deterministic for check in checks), total),
@@ -227,7 +325,8 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
         "overhead_budget_ms": budget_ms,
         # Not gated, but worth a look: p95 hides single slow requests.
         "max_overhead_ms": max(result.overhead_ms or 0.0 for run in runs for result in run),
-        "plan": "empty (plans arrive in Session 4)",
+        "plans": "standard plan per fixture session with at least 3 exchanges (docs/decisions/0010)",
+        "minor_compactions_checked": len(compacted),
     }
     return Tier1Result(metrics=metrics, trace=trace, summary=summary)
 

@@ -7,15 +7,25 @@ For every POST /v1/messages, `prepare()` decides which bytes go upstream:
        request (RecentRequests, ADR 0007)
     2. identify the conversation and register
        the new messages and items                (session/chain.py)
-    3. render with the session's applied plan    (empty until Session 4 stores plans)
+    3. render with the session's plan: a pending  (plan/policy.py, plan/versions.py,
+       version requested by the user takes        plan/apply.py)
+       effect at a clean turn boundary, else the
+       applied one; a plan that doesn't fit this
+       request is skipped (edit_skipped says why)
     4. validate the rendered request             (model/validate.py)
     5. choose what to send:
-         "passthrough"  nothing changed          -> the client's exact bytes
-         "rendered"     a plan changed it        -> the rendered request (Session 4 onwards)
+         "passthrough"  nothing changed, or an   -> the client's exact bytes
+                        edit was held back
+         "rendered"     a plan changed it        -> the rendered request
          "fallback"     anything went wrong      -> the client's exact bytes, and the reason
 
 (§3 lists identification before parsing; here parsing comes first because the chain hashes that
 identify the conversation are computed from the parsed messages.)
+
+Held back until Session 4b (docs/decisions/0009): an edited request that still contains thinking
+blocks. On current models editing the history before a thinking block invalidates it (ADR 0004),
+and the opt-in that makes the API drop such blocks instead of rejecting the request arrives in
+4b. Until then those requests go through unedited, with the reason recorded.
 
 Hard rule 1: `prepare()` never raises and never returns anything but the client's bytes unless
 a non-empty plan produced a request that passed validation.
@@ -28,13 +38,19 @@ from typing import Any
 
 import structlog
 
-from liber.model.anthropic import RecentRequests, RequestShapeError, parse, render
-from liber.model.items import Plan
-from liber.model.validate import Violation, validate
-from liber.session.chain import StoreBusy, identify
-from liber.session.store import Store
+from liber.model.anthropic import ParsedRequest, RecentRequests, RequestShapeError, parse, render
+from liber.model.items import Item, OperationKind
+from liber.model.validate import THINKING_TYPES, Violation, validate
+from liber.plan import policy, versions
+from liber.plan.apply import PlanNotApplicable
+from liber.session.chain import identify
+from liber.session.store import Store, StoreBusy
 
 log = structlog.get_logger(__name__)
+
+HELD_FOR_THINKING = (
+    "edit held back: the request has thinking blocks, which need preserved-thinking support (Session 4b)"
+)
 
 
 @dataclass
@@ -52,6 +68,9 @@ class Prepared:
     error: str | None = None  # why it fell back (an exception type, or a round-trip mismatch)
     violations: list[Violation] = field(default_factory=list)
     overhead_ms: float | None = None
+    plan_version: int | None = None  # the plan version rendered (None: no plan)
+    edit_skipped: str | None = None  # why a plan wasn't used, or its edit wasn't sent
+    offloaded: list[Item] = field(default_factory=list)  # items whose originals go to the blob store
 
 
 async def prepare(store: Store, raw_body: bytes, recent: RecentRequests | None = None) -> Prepared:
@@ -79,23 +98,46 @@ async def prepare(store: Store, raw_body: bytes, recent: RecentRequests | None =
         prepared.session_id, prepared.branch_id = identity.session_id, identity.branch_id
         prepared.known_messages, prepared.new_messages = identity.known_messages, identity.new_messages
 
-        plan = Plan()  # the session's applied plan; plans are stored from Session 4
-        rendered = render(parsed, plan)
+        state = identity.plan
+        used, rendered, prepared.violations = render_with_plan(parsed, state, reference, prepared)
         prepared.rendered = rendered
-        prepared.violations = validate(rendered, original=reference)
+        if used.number:
+            prepared.plan_version = used.number
+            prepared.offloaded = offloaded_items(parsed, used)
 
+        changed = not used.plan.is_empty and rendered != reference
         if prepared.violations:
-            pass  # stay on "fallback": the violations say why
-        elif plan.is_empty and rendered != reference:
+            return finish(prepared, started)  # stays "fallback": the violations say why
+        if used.plan.is_empty and rendered != reference:
             prepared.error = "round trip changed the request under an empty plan (a parse/render bug)"
-        elif plan.is_empty:
-            prepared.outcome = "passthrough"  # nothing changed: send the client's exact bytes
-        else:
+            return finish(prepared, started)
+        held = changed and has_thinking(rendered)
+        if held:
+            prepared.edit_skipped = HELD_FOR_THINKING
+
+        # A requested version takes effect once a request goes out as it renders it (an undo back
+        # to the empty plan included); not while its edit is held back. Written before the body
+        # is chosen: if the write fails, the except below still sends the client's bytes.
+        pending_was_used = (
+            state.pending is not None
+            and policy.pending_takes_effect(state, request["messages"])
+            and used.number == state.pending.number
+        )
+        if pending_was_used and identity.session_id and not held:
+            await versions.promote_pending(store, identity.session_id, used.number)
+
+        if changed and not held:
             prepared.outcome = "rendered"
             prepared.body = encode_request(rendered)
+        else:
+            prepared.outcome = "passthrough"  # the client's exact bytes
     except Exception as exc:
+        prepared.outcome, prepared.body = "fallback", raw_body  # whatever was decided before the failure
         prepared.error = describe_failure(exc)
+    return finish(prepared, started)
 
+
+def finish(prepared: Prepared, started: float) -> Prepared:
     prepared.overhead_ms = round((time.perf_counter() - started) * 1000, 3)
     if prepared.outcome == "fallback":
         log.warning(
@@ -105,6 +147,57 @@ async def prepare(store: Store, raw_body: bytes, recent: RecentRequests | None =
             session_id=prepared.session_id,
         )
     return prepared
+
+
+def render_with_plan(
+    parsed: ParsedRequest, state: versions.PlanState, reference: Any, prepared: Prepared
+) -> tuple[versions.PlanVersion, dict[str, Any], list[Violation]]:
+    """Render with the first plan version (policy.versions_to_try) that works for this request.
+
+    A version gives way to the next one if it doesn't fit the request, if applying it fails (a
+    bug: one bad plan mustn't stop the session's other versions, or an undo, from working), or
+    if its render doesn't pass the validator. The last candidate is the empty plan; its
+    violations or failure are the request's, and prepare() falls back.
+    """
+    *plans, last = policy.versions_to_try(state, parsed.original["messages"])
+    for version in plans:
+        try:
+            rendered = render(parsed, version.plan)
+        except PlanNotApplicable as exc:
+            prepared.edit_skipped = f"plan version {version.number} not used: {exc}"
+            continue
+        except Exception as exc:
+            prepared.edit_skipped = f"plan version {version.number} not used: it failed ({describe_failure(exc)})"
+            log.warning("plan_failed", plan_version=version.number, error=describe_failure(exc))
+            continue
+        violations = validate(rendered, original=reference)
+        if violations:
+            rules = ", ".join(sorted({violation.rule for violation in violations}))
+            prepared.edit_skipped = f"plan version {version.number} not used: its render broke {rules}"
+            continue
+        return version, rendered, []
+    rendered = render(parsed, last.plan)
+    return last, rendered, validate(rendered, original=reference)
+
+
+def offloaded_items(parsed: ParsedRequest, version: versions.PlanVersion) -> list[Item]:
+    """This request's items that the plan offloads, so their originals can be stored (§4)."""
+    ids = {
+        item_id
+        for operation in version.plan.operations
+        if operation.kind is OperationKind.OFFLOAD
+        for item_id in operation.item_ids
+    }
+    return [item for item in parsed.items if item.id in ids]
+
+
+def has_thinking(request: dict[str, Any]) -> bool:
+    return any(
+        isinstance(block, dict) and block.get("type") in THINKING_TYPES
+        for message in request["messages"]
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+    )
 
 
 def encode_request(request: dict[str, Any]) -> bytes:
@@ -124,6 +217,6 @@ def describe_failure(exc: Exception) -> str:
     a ValueError may repeat a value), and errors are stored and logged even when body
     recording is off.
     """
-    if isinstance(exc, json.JSONDecodeError | RequestShapeError | StoreBusy):
+    if isinstance(exc, json.JSONDecodeError | RequestShapeError | StoreBusy | PlanNotApplicable):
         return f"{type(exc).__name__}: {exc}"  # positions and Liber's own wording, no content
     return type(exc).__name__

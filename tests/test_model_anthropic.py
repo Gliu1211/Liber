@@ -17,8 +17,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from liber.evals.replay import load_sessions, replay
-from liber.model.anthropic import ParsedRequest, RecentRequests, UnsupportedPlan, parse, render
-from liber.model.items import Kind, Operation, OperationKind, Plan, Role
+from liber.model.anthropic import ParsedRequest, RecentRequests, parse, render
+from liber.model.items import Kind, Plan, Role
 from liber.session import chain
 from tests.helpers import FIXTURES
 from tests.requests_strategy import messages, requests
@@ -178,14 +178,6 @@ def test_chain_hashes_cover_everything_before_a_message() -> None:
 
     # Changing message 0 changes the hash of every message after it, too.
     assert all(x != y for x, y in zip(a.chain_hashes, b.chain_hashes, strict=True))
-
-
-def test_render_refuses_operations_until_they_are_implemented() -> None:
-    parsed = parse(load(FIXTURES / "requests" / "simple_text.json"))
-    plan = Plan(operations=(Operation(kind=OperationKind.DELETE, item_ids=(parsed.items[0].id,)),))
-
-    with pytest.raises(UnsupportedPlan):
-        render(parsed, plan)
 
 
 @pytest.mark.parametrize(
