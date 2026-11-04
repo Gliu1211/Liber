@@ -247,6 +247,7 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
                 "messages": len(json.loads(request.body)["messages"]),
                 "plan_version": result.plan_version,
                 "edit_skipped": result.edit_skipped,
+                "betas": list(result.betas),
                 "outcome": result.outcome,
                 "liber_error": result.error,
                 "known_messages": result.known_messages,

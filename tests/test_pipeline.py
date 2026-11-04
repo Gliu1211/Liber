@@ -83,7 +83,7 @@ async def test_any_exception_forwards_the_original_request(
 
 
 async def test_validation_failure_forwards_the_original_request(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
-    def broken_render(parsed: Any, plan: Any) -> dict[str, Any]:
+    def broken_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
         # A render bug that drops the final tool results: the validator must catch it.
         request: dict[str, Any] = json.loads(json.dumps(parsed.original))
         request["messages"][-1]["content"] = [{"type": "text", "text": "oops"}]
@@ -114,7 +114,7 @@ async def test_a_client_request_that_breaks_the_rules_is_still_forwarded(store: 
 async def test_an_empty_plan_that_changes_the_request_is_a_bug_and_falls_back(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def lossy_render(parsed: Any, plan: Any) -> dict[str, Any]:
+    def lossy_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
         request: dict[str, Any] = json.loads(json.dumps(parsed.original))
         request.pop("metadata")  # still a valid request, but not the client's request
         return request
@@ -282,7 +282,7 @@ async def test_a_render_that_edits_shared_blocks_in_place_is_caught(
 ) -> None:
     # render() passes the client's block objects through. A bug that edits one of them in place
     # must not be able to fool the validator, so it compares against a separate copy.
-    def mutating_render(parsed: Any, plan: Any) -> dict[str, Any]:
+    def mutating_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
         thinking = parsed.original["messages"][1]["content"][0]
         thinking["thinking"] = "rewritten"
         return dict(parsed.original)

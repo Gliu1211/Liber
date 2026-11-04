@@ -255,12 +255,13 @@ def estimate_tokens(kind: Kind, block: dict[str, Any], canonical: str) -> int:
     return max(1, math.ceil(len(canonical) / 4))
 
 
-def render(parsed: ParsedRequest, plan: Plan) -> dict[str, Any]:
+def render(parsed: ParsedRequest, plan: Plan, stale_thinking_before: int = 0) -> dict[str, Any]:
     """Rebuild the request from its items, applying `plan` (plan/apply.py).
 
     Raises plan.apply.PlanNotApplicable if the plan doesn't fit this request.
+    `stale_thinking_before` only matters with a non-empty plan (docs/decisions/0012).
     """
-    if plan.is_empty:
+    if plan.is_empty and not stale_thinking_before:
         blocks_by_message: list[list[dict[str, Any]]] = [[] for _ in parsed.messages]
         for item in parsed.items:
             blocks_by_message[item.msg_index].append(item.block)
@@ -268,7 +269,7 @@ def render(parsed: ParsedRequest, plan: Plan) -> dict[str, Any]:
             render_message(frame, blocks) for frame, blocks in zip(parsed.messages, blocks_by_message, strict=True)
         ]
     else:
-        messages = apply_plan(parsed, plan)
+        messages = apply_plan(parsed, plan, stale_thinking_before)
     rendered = dict(parsed.original)  # same top-level keys in the same order...
     rendered["messages"] = messages  # ...with only the messages rebuilt
     return rendered

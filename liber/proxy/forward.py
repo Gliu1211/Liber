@@ -7,7 +7,9 @@ headers, and the client sees the upstream's status, headers and body bytes exact
 chunk by chunk as they arrive. The only headers that change:
 - hop-by-hop headers are dropped (they describe one network connection, not the request);
 - `host` and `content-length` are recomputed by httpx for the upstream connection;
-- `accept-encoding` becomes `identity` (see docs/decisions/0001).
+- `accept-encoding` becomes `identity` (see docs/decisions/0001);
+- on a request Liber edited, `anthropic-beta` gains the values the edit needs (ADR 0004), added
+  to the client's own.
 
 Headers are handled as raw bytes throughout. Decoding them to text and back can fail or change
 bytes for non-ASCII values, and the proxy has no reason to interpret them.
@@ -68,12 +70,38 @@ def _without(headers: Iterable[tuple[bytes, bytes]], drop: frozenset[bytes]) -> 
     return kept
 
 
-def upstream_request_headers(client_headers: Iterable[tuple[bytes, bytes]]) -> Headers:
-    """Headers to send upstream: the client's own, including x-api-key/authorization (D12)."""
+def upstream_request_headers(client_headers: Iterable[tuple[bytes, bytes]], betas: Iterable[str] = ()) -> Headers:
+    """Headers to send upstream: the client's own, including x-api-key/authorization (D12).
+
+    `betas`: values an edited request needs in `anthropic-beta` (ADR 0004), merged in.
+    """
     headers = _without(client_headers, HOP_BY_HOP_HEADERS | RECOMPUTED_REQUEST_HEADERS | {b"accept-encoding"})
     # Ask for an uncompressed body: then the bytes we relay are also bytes we can read for
     # recording. The client still gets a valid response (docs/decisions/0001).
     headers.append((b"accept-encoding", b"identity"))
+    return with_betas(headers, betas)
+
+
+def with_betas(headers: Headers, betas: Iterable[str]) -> Headers:
+    """Add beta values to `anthropic-beta` without replacing the client's (ADR 0004 A3).
+
+    A value the client already sent is left alone; a new one is appended to the client's last
+    `anthropic-beta` header, comma-separated, or sent as a new header if there is none.
+    """
+    present = {
+        value.strip().lower() for name, joined in headers if name == b"anthropic-beta" for value in joined.split(b",")
+    }
+    for beta in betas:
+        value = beta.encode("ascii")
+        if value.lower() in present:
+            continue
+        indexes = [i for i, (name, _) in enumerate(headers) if name == b"anthropic-beta"]
+        if indexes:
+            name, joined = headers[indexes[-1]]
+            headers[indexes[-1]] = (name, joined + b"," + value)
+        else:
+            headers.append((b"anthropic-beta", value))
+        present.add(value.lower())
     return headers
 
 
@@ -99,7 +127,9 @@ def create_upstream_client(settings: Settings, transport: httpx.AsyncBaseTranspo
     )
 
 
-async def open_upstream(client: httpx.AsyncClient, request: Request, body: bytes) -> httpx.Response:
+async def open_upstream(
+    client: httpx.AsyncClient, request: Request, body: bytes, betas: Iterable[str] = ()
+) -> httpx.Response:
     """Forward the request; return as soon as the upstream's status and headers arrive.
 
     The body has not been read yet (`stream=True`), so it can be relayed chunk by chunk.
@@ -112,7 +142,7 @@ async def open_upstream(client: httpx.AsyncClient, request: Request, body: bytes
     upstream_request = client.build_request(
         request.method,
         target,
-        headers=upstream_request_headers(request.headers.raw),
+        headers=upstream_request_headers(request.headers.raw, betas),
         content=body,
     )
     return await client.send(upstream_request, stream=True)

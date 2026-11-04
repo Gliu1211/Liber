@@ -145,7 +145,7 @@ The rendered request must satisfy the Messages API rules. At minimum:
 - First message is from the user; roles alternate.
 - Every `tool_use` in an assistant message has its matching `tool_result` in the following user message, and vice versa.
 - No empty messages or empty content.
-- **Never modify thinking / redacted_thinking blocks**, and never edit the in-flight tool loop (the latest assistant turn with tool calls plus its results).
+- **Never modify thinking / redacted_thinking blocks**, and never edit the in-flight tool loop (the latest assistant turn with tool calls plus its results). The one exception: once a plan version has taken effect in a session, the thinking blocks produced before that point are stale and are left out as a whole leading run, oldest first (ADR 0012). The validator checks that the thinking sent is exactly the tail of the client's.
 - **Preserved thinking (ADR 0004):** on current models a thinking block is only valid if everything before it is unchanged. Any request Liber edits must carry the `thinking-binding-controls-2026-08-01` beta and `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` (merged into the client's headers and `thinking` fields), unless ADR 0004 A3 says to strip or skip instead. Otherwise forward the original.
 - Preserve the client's `cache_control` markers where their target still exists; drop markers on content that was removed; never exceed the API's maximum number of breakpoints; add one breakpoint at the end of the frozen region when there is room. *(Verify the current breakpoint limit.)*
 

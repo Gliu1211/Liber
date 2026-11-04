@@ -35,6 +35,7 @@ from liber.config import Settings
 from liber.log import configure_logging
 from liber.model.anthropic import RecentRequests
 from liber.pipeline import Prepared, prepare
+from liber.plan.policy import PlanPolicy
 from liber.proxy.forward import (
     create_upstream_client,
     describe,
@@ -86,6 +87,11 @@ def create_app(settings: Settings | None = None, upstream_transport: httpx.Async
     # The latest request of each recent conversation, so the next one only hashes what's new (ADR 0007).
     app.state.recent_requests = RecentRequests()
     app.state.blobs = BlobStore(settings.blobs_dir)  # offloaded originals (§4)
+    app.state.plan_policy = PlanPolicy(  # §6 break points
+        idle_apply_seconds=settings.idle_apply_seconds,
+        context_threshold=settings.context_threshold,
+        threshold_auto_apply=settings.threshold_auto_apply,
+    )
     # Order matters: the specific route first, then the catch-all for everything else.
     app.add_api_route("/v1/messages", proxy_messages, methods=["POST"])
     app.add_api_route("/{path:path}", proxy_other, methods=ALL_METHODS)
@@ -100,13 +106,13 @@ async def proxy_messages(request: Request) -> Response:
     body = await request.body()
 
     # §3 steps 2-5. prepare() never raises; on any problem it hands back the client's own bytes.
-    prepared = await prepare(app.state.store, body, app.state.recent_requests)
+    prepared = await prepare(app.state.store, body, app.state.recent_requests, app.state.plan_policy)
     record = start_record(request, body, prepared, settings.record_bodies)
     if prepared.offloaded:
         spawn_keep_originals(app, prepared)
 
     try:
-        upstream = await open_upstream(app.state.client, request, prepared.body)
+        upstream = await open_upstream(app.state.client, request, prepared.body, prepared.betas)
     except Exception as exc:
         return forwarding_failed(app, record, exc, started)
 
@@ -179,6 +185,7 @@ def start_record(request: Request, body: bytes, prepared: Prepared, keep_body: b
             overhead_ms=prepared.overhead_ms,
             plan_version=prepared.plan_version,
             edit_skipped=prepared.edit_skipped,
+            context_share=prepared.context_share,
         )
     except Exception:
         log.exception("recording_failed", path=path)
@@ -225,6 +232,8 @@ def fill_from_reply(record: RequestRecord, reply: CapturedReply, keep_body: bool
     record.cache_creation_input_tokens = reply.usage.cache_creation_input_tokens
     record.response_body = reply.body_text if keep_body else None
     record.error = reply.problem
+    if reply.input_transformations is not None:  # ADR 0004 A4: what the API dropped, if anything
+        record.input_transformations = json.dumps(reply.input_transformations)
 
 
 def elapsed_ms(started: float) -> float:

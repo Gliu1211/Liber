@@ -186,6 +186,10 @@ class StreamAssembler:
     def _apply_message_delta(self, payload: dict[str, Any]) -> None:
         assert self.message is not None
         self.message.update(payload.get("delta") or {})  # stop_reason, stop_sequence, ...
+        # After a mid-stream fallback the final message_delta repeats input_transformations; the
+        # docs don't pin down where on the event, so either place counts. The later one wins.
+        if "input_transformations" in payload:
+            self.message["input_transformations"] = payload["input_transformations"]
         # Usage in message_delta is cumulative, so it replaces earlier numbers. A field that is
         # missing or null keeps its earlier value (same rule as the SDKs).
         usage = self.message.setdefault("usage", {})
@@ -206,6 +210,8 @@ class CapturedReply:
     usage: Usage = field(default_factory=Usage)
     stop_reason: str | None = None
     problem: str | None = None  # error type or parse problem worth recording, if any
+    # What the API changed in the request before the model saw it (ADR 0004 A4); None if absent.
+    input_transformations: list[Any] | None = None
 
 
 class ReplyCapture:
@@ -252,6 +258,7 @@ class ReplyCapture:
             reply.body_text = json.dumps(message, ensure_ascii=False)
             reply.stop_reason = message.get("stop_reason")
             reply.usage = self._safe_usage(message, reply)
+            reply.input_transformations = transformations_of(message)
         return reply
 
     def _json_result(self) -> CapturedReply:
@@ -272,6 +279,7 @@ class ReplyCapture:
             reply.message = body
             reply.stop_reason = body.get("stop_reason")
             reply.usage = self._safe_usage(body, reply)
+            reply.input_transformations = transformations_of(body)
         return reply
 
     @staticmethod
@@ -281,3 +289,14 @@ class ReplyCapture:
         except ValueError as exc:  # pydantic's ValidationError is a ValueError
             reply.problem = f"unexpected usage format: {exc}"
             return Usage()
+
+
+def transformations_of(message: dict[str, Any]) -> list[Any] | None:
+    """The message's top-level `input_transformations` array (ADR 0004 A4), if it has one.
+
+    The API sends it, possibly empty, on every response once the request carries the
+    thinking-binding beta; without the beta it's absent. Entries are kept as sent: the docs say
+    to ignore entry types and reasons one doesn't recognise, so none are filtered here.
+    """
+    value = message.get("input_transformations")
+    return value if isinstance(value, list) else None

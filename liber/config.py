@@ -7,11 +7,34 @@ upstream. Later sessions add the context-window threshold and the pricing table 
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Also used by the Tier 1 harness, which must not depend on the developer's LIBER_* variables.
 DEFAULT_WAL_CHECKPOINT_SECONDS = 1.0
+
+
+class ModelPrice(BaseModel):
+    """One model's input prices in US dollars per million tokens (plan/cost.py)."""
+
+    input: float
+    cache_write: float  # 5-minute prompt cache
+    cache_read: float
+
+
+# §6: "pricing ratios come from a user-editable config table, not hard-coded claims". Defaults
+# from Anthropic's published prices as of 2026-11-04 (cache write = 1.25 x input for the
+# 5-minute cache); check the current price list and override with LIBER_PRICING (JSON) if they
+# changed. Keys are model id prefixes; the longest matching one is used.
+DEFAULT_PRICING = {
+    "claude-fable-5": ModelPrice(input=10.0, cache_write=12.5, cache_read=0.25),
+    "claude-opus-5-5": ModelPrice(input=4.0, cache_write=5.0, cache_read=0.20),
+    "claude-opus-5": ModelPrice(input=5.0, cache_write=6.25, cache_read=0.50),
+    "claude-opus-4": ModelPrice(input=5.0, cache_write=6.25, cache_read=0.50),
+    "claude-sonnet-5": ModelPrice(input=2.0, cache_write=2.5, cache_read=0.20),
+    "claude-sonnet-4-6": ModelPrice(input=3.0, cache_write=3.75, cache_read=0.30),
+    "claude-haiku-5-5": ModelPrice(input=0.10, cache_write=0.125, cache_read=0.01),
+}
 
 
 def _default_data_dir() -> Path:
@@ -47,6 +70,17 @@ class Settings(BaseSettings):
     # 1000 pages (~4 MB); a second of Liber's writes is usually far less than that.
     # Must be > 0: zero would make the background task checkpoint in a tight loop.
     wal_checkpoint_seconds: float = Field(default=DEFAULT_WAL_CHECKPOINT_SECONDS, gt=0)
+
+    # §6 break points (plan/policy.py). Idle: a pending plan version is applied on the next new
+    # turn once the conversation was idle longer than the provider's prompt-cache lifetime.
+    idle_apply_seconds: float = Field(default=300.0, gt=0)
+    # Threshold: requests filling more than this share of the model's context window are flagged;
+    # with threshold_auto_apply, they also apply the pending version (v1: off).
+    context_threshold: float = Field(default=0.7, gt=0, le=1)
+    threshold_auto_apply: bool = False
+
+    # Prices for plan cost estimates (plan/cost.py); see DEFAULT_PRICING.
+    pricing: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_PRICING))
 
     log_level: str = "INFO"
 

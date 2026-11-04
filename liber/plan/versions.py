@@ -49,6 +49,7 @@ class PlanState:
     applied: PlanVersion
     pending: PlanVersion | None
     apply_requested: bool
+    activated_at: int | None = None  # messages in the request where `applied` took effect (ADR 0012)
 
 
 NO_PLAN = PlanState(applied=EMPTY, pending=None, apply_requested=False)
@@ -63,7 +64,8 @@ def read_state(db: Connection, session_id: str) -> PlanState:
     if row is None:
         return NO_PLAN
     pending = read_version(db, session_id, row.pending_version) if row.pending_version is not None else None
-    return PlanState(read_version(db, session_id, row.applied_version), pending, row.apply_requested)
+    applied = read_version(db, session_id, row.applied_version)
+    return PlanState(applied, pending, row.apply_requested, row.activated_at)
 
 
 def read_state_or_no_plan(db: Connection, session_id: str) -> PlanState:
@@ -129,12 +131,22 @@ def request_undo(db: Connection, session_id: str, now: datetime) -> PlanVersion:
     return previous
 
 
-def promote(db: Connection, session_id: str, version: int, now: datetime) -> None:
-    """Make the pending `version` the applied one (a no-op if someone else already did)."""
+def promote(db: Connection, session_id: str, version: int, at_messages: int, now: datetime) -> None:
+    """Make the pending `version` the applied one (a no-op if someone else already did).
+
+    `at_messages`: the length of the request it takes effect on. Thinking blocks before that
+    point were produced against the previous render, so later requests strip them (ADR 0012).
+    """
     db.execute(
         update(PlanStateRecord)
         .where(PlanStateRecord.session_id == session_id, PlanStateRecord.pending_version == version)
-        .values(applied_version=version, pending_version=None, apply_requested=False, updated_at=now)
+        .values(
+            applied_version=version,
+            pending_version=None,
+            apply_requested=False,
+            activated_at=at_messages,
+            updated_at=now,
+        )
     )
 
 
@@ -169,12 +181,12 @@ async def undo(store: Store, session_id: str) -> PlanVersion:
     return await store.run(lambda db: request_undo(db.connection(), session_id, now), immediate=True)
 
 
-async def promote_pending(store: Store, session_id: str, version: int) -> None:
+async def promote_pending(store: Store, session_id: str, version: int, at_messages: int) -> None:
     """On the request path: as short a wait for the write lock as identification's (§3 budget)."""
     now = datetime.now(UTC)
     try:
         await store.run(
-            lambda db: promote(db.connection(), session_id, version, now),
+            lambda db: promote(db.connection(), session_id, version, at_messages, now),
             busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
             immediate=True,
         )

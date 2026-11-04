@@ -59,7 +59,7 @@ Any client that speaks the Anthropic Messages API and lets you set a base URL wo
 | `content_cache` | content hash → where an offloaded original is kept |
 
 `liber_outcome` is `rendered` when Liber sent your session's plan applied, `passthrough` when it
-sent your request unchanged (no plan, or an edit held back: `edit_skipped` says why), or
+sent your request unchanged (no plan, or an edit it couldn't send: `edit_skipped` says why), or
 `fallback` when Liber stepped aside because something failed. To see fallbacks and why:
 
 ```bash
@@ -92,10 +92,17 @@ liber plan apply --session SESSION    # takes effect at the session's next new t
 liber plan undo --session SESSION     # back to the previous version, also at the next new turn
 ```
 
-A plan takes effect only when a request starts a new turn, never in the middle of a tool loop.
-**Current limit:** an edit is held back, and your request sent unchanged, while the request still
-contains thinking blocks. Editing history before them needs the preserved-thinking opt-in from
-the next session (4b). Offloaded originals are kept in `~/.liber/blobs/`.
+A plan takes effect only when a request starts a new turn, never in the middle of a tool loop:
+when you ask for it (`apply`, `undo`), or on its own once the conversation was idle longer than
+the prompt cache lasts (`LIBER_IDLE_APPLY_SECONDS`, §6). `liber plan show` estimates what applying
+the pending version costs: tokens reprocessed once, the saving per turn, the payback in turns,
+and the reasoning it drops.
+
+Edited requests keep thinking valid on current models ([ADR 0012](docs/decisions/0012-strip-stale-thinking.md)):
+thinking blocks from before the plan took effect are left out, and the request carries the
+`drop_block` opt-in with its beta merged into your `anthropic-beta` header. What the API changed
+in a request, if anything, is recorded in `requests.input_transformations`. Offloaded originals
+are kept in `~/.liber/blobs/`.
 
 ## Configuration
 
@@ -109,6 +116,10 @@ Settings are environment variables prefixed with `LIBER_` (see `liber/config.py`
 | `LIBER_DATA_DIR` | `~/.liber` | Holds `liber.db` (and, later, offloaded content). |
 | `LIBER_RECORD_BODIES` | `true` | Store request/response bodies. Usage and latency are always stored. |
 | `LIBER_UPSTREAM_READ_TIMEOUT` | `600` | Longest silence (seconds) tolerated while streaming. |
+| `LIBER_IDLE_APPLY_SECONDS` | `300` | After this long idle, a pending plan version takes effect at the next new turn (§6). |
+| `LIBER_CONTEXT_THRESHOLD` | `0.7` | Share of the model's context window at which a request is flagged (`requests.context_share`). |
+| `LIBER_THRESHOLD_AUTO_APPLY` | `false` | Also apply the pending plan version when the threshold is crossed. |
+| `LIBER_PRICING` | see `liber/config.py` | Prices per model for plan cost estimates (JSON: model prefix → `input`, `cache_write`, `cache_read` in $/MTok). |
 | `LIBER_WAL_CHECKPOINT_SECONDS` | `1.0` | How often a background task copies SQLite's write-ahead log into `liber.db`. Requests never do it ([ADR 0008](docs/decisions/0008-wal-checkpoints-in-the-background.md)). |
 | `LIBER_LOG_LEVEL` | `INFO` | Log level. |
 

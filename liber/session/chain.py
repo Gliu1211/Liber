@@ -193,6 +193,8 @@ class Identity:
     # The session's edit plan (plan/versions.py), read in the same transaction so the request
     # path needs only one trip to the database.
     plan: PlanState = NO_PLAN
+    # Seconds since the conversation's previous request (§6 idle break point); None if new.
+    idle_seconds: float | None = None
 
 
 def new_id() -> str:
@@ -239,6 +241,7 @@ def find_and_register(db: Connection, parsed: "ParsedRequest", now: datetime) ->
     hashes = parsed.chain_hashes
     new_session = new_branch = False
     deepest = deepest_known_node(db, hashes)
+    idle_seconds = seconds_between(deepest.last_seen_at, now) if deepest is not None else None
 
     if deepest is None:
         # Nothing matches beyond the root: a new conversation with its first branch.
@@ -282,7 +285,15 @@ def find_and_register(db: Connection, parsed: "ParsedRequest", now: datetime) ->
         parent_branch_id=parent_branch_id,
         fork_depth=fork_depth,
         plan=NO_PLAN if new_session else read_state_or_no_plan(db, session_id),
+        idle_seconds=idle_seconds,
     )
+
+
+def seconds_between(earlier: datetime, now: datetime) -> float:
+    """SQLite gives back stored times without their time zone; they were stored in UTC."""
+    if earlier.tzinfo is None:
+        earlier = earlier.replace(tzinfo=UTC)
+    return (now - earlier).total_seconds()
 
 
 def register_new_messages(

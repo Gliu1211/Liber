@@ -118,6 +118,11 @@ class RequestRecord(Base):
     overhead_ms: Mapped[float | None]  # time spent in §3 steps 2-5
     plan_version: Mapped[int | None]  # the session's plan version rendered for this request (None: no plan)
     edit_skipped: Mapped[str | None] = mapped_column(Text)  # why a plan wasn't used or its edit not sent
+    # Estimated share of the model's context window the request fills (§6 threshold break point).
+    context_share: Mapped[float | None]
+    # What the API changed in the request before the model saw it, e.g. dropped thinking blocks
+    # (ADR 0004 A4): JSON, as the response reported it. None when the response didn't say.
+    input_transformations: Mapped[str | None] = mapped_column(Text)
 
 
 class SessionRecord(Base):
@@ -203,6 +208,9 @@ class PlanStateRecord(Base):
     applied_version: Mapped[int]  # used on every request; 0 = the empty plan
     pending_version: Mapped[int | None]
     apply_requested: Mapped[bool]  # the user asked for pending to be applied (§6 break point 1)
+    # Messages in the request where the applied version took effect. Thinking blocks before that
+    # point were produced against other history, so they are stripped (docs/decisions/0012).
+    activated_at: Mapped[int | None]
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -401,6 +409,7 @@ class KnownNode:
     head_hash: str  # the branch's newest message
     parent_branch_id: str | None
     fork_depth: int
+    last_seen_at: datetime  # the branch's previous request (before this one)
 
 
 def deepest_known_node(db: Connection, hashes: list[str]) -> KnownNode | None:
@@ -419,6 +428,7 @@ def deepest_known_node(db: Connection, hashes: list[str]) -> KnownNode | None:
             BranchRecord.head_hash,
             BranchRecord.parent_branch_id,
             BranchRecord.fork_depth,
+            BranchRecord.last_seen_at,
         )
         .join(BranchRecord, BranchRecord.id == ChainNode.branch_id)
         # One expanding parameter for the whole list: the compiled query is cached and reused.

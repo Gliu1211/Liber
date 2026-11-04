@@ -19,6 +19,7 @@ import pytest
 from liber import pipeline
 from liber.evals import tier1
 from liber.evals.replay import load_sessions, replay
+from liber.plan.thinking import BINDING_BETA
 from tests.helpers import FIXTURES
 
 SESSIONS = FIXTURES / "sessions"
@@ -128,14 +129,16 @@ async def test_metrics_on_the_fixtures() -> None:
     assert metrics["validity_rate"].value == 1.0
     assert metrics["round_trip_identity"].value == 1.0
     assert metrics["fallback_rate"].value == 0.0
-    # Standard plans (docs/decisions/0010): real savings, held back while thinking blocks remain
-    # (until Session 4b), and every minor compaction keeps the frozen prefix.
-    assert metrics["token_reduction"].value > 0
+    # Standard plans (docs/decisions/0010), sent with preserved-thinking handling (ADR 0012):
+    # real savings, and every minor compaction keeps the frozen prefix.
+    assert metrics["token_reduction"].value > 0.2
     assert metrics["prefix_stability"].value == 1.0
     assert result.summary["minor_compactions_checked"] > 0
     outcomes = {(record["outcome"], record["plan_version"]) for record in result.trace}
-    assert {("rendered", 1), ("rendered", 2), ("passthrough", 1)} <= outcomes
-    assert metrics["render_determinism"].value == 1.0
+    assert {("rendered", 1), ("rendered", 2)} <= outcomes
+    # The beta goes with exactly the requests Liber edited (the fixtures use confirmed models).
+    assert all(record["betas"] == [BINDING_BETA] for record in result.trace if record["outcome"] == "rendered")
+    assert all(record["betas"] == [] for record in result.trace if record["outcome"] != "rendered")
     lower_is_better = {"fallback_rate", "p95_overhead_ms"}
     assert all(m.direction == ("lower" if name in lower_is_better else "higher") for name, m in metrics.items())
     # The overhead tolerance is the budget left, so the gate fails once p95 goes over budget.
@@ -215,8 +218,8 @@ def test_output_is_deterministic_across_processes(tmp_path: Path) -> None:
 async def test_render_determinism_catches_a_render_that_varies(monkeypatch: pytest.MonkeyPatch) -> None:
     real_render = tier1.render
 
-    def jittery_render(parsed: Any, plan: Any) -> dict[str, Any]:
-        rendered = real_render(parsed, plan)
+    def jittery_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
+        rendered = real_render(parsed, plan, stale)
         rendered["metadata"] = {"nonce": random.random()}  # different bytes on every render
         return rendered
 
@@ -231,8 +234,8 @@ async def test_validity_rate_catches_a_render_that_breaks_requests(monkeypatch: 
     # Validity is measured on what the request path itself rendered, so that's what is broken here.
     real_render = pipeline.render
 
-    def breaking_render(parsed: Any, plan: Any) -> dict[str, Any]:
-        rendered = real_render(parsed, plan)
+    def breaking_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
+        rendered = real_render(parsed, plan, stale)
         rendered["messages"] = [{"role": "assistant", "content": "oops"}, *rendered["messages"]]
         return rendered
 
@@ -249,8 +252,8 @@ async def test_validity_rate_catches_a_render_that_breaks_requests(monkeypatch: 
 async def test_round_trip_identity_is_strict_about_key_order(monkeypatch: pytest.MonkeyPatch) -> None:
     real_render = tier1.render
 
-    def reordering_render(parsed: Any, plan: Any) -> dict[str, Any]:
-        rendered = real_render(parsed, plan)
+    def reordering_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
+        rendered = real_render(parsed, plan, stale)
         return dict(reversed(list(rendered.items())))  # equal as a dict, different bytes
 
     monkeypatch.setattr(tier1, "render", reordering_render)
@@ -279,8 +282,8 @@ async def test_prefix_stability_catches_a_compaction_that_rewrites_the_frozen_pr
 ) -> None:
     real_render = tier1.render
 
-    def reordering_render(parsed: Any, plan: Any) -> dict[str, Any]:
-        rendered = real_render(parsed, plan)
+    def reordering_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
+        rendered = real_render(parsed, plan, stale)
         if sum(op.kind == "summarize" for op in plan.operations) == 2:
             # Puts the new frozen block before the old one: not an append (D5).
             first = rendered["messages"][0]
@@ -315,8 +318,8 @@ async def test_token_reduction_counts_only_what_is_sent(monkeypatch: pytest.Monk
     # A render that drops content but fails validation is never sent: no saving may be claimed.
     real_render = pipeline.render
 
-    def lossy_invalid_render(parsed: Any, plan: Any) -> dict[str, Any]:
-        rendered = real_render(parsed, plan)
+    def lossy_invalid_render(parsed: Any, plan: Any, stale: int = 0) -> dict[str, Any]:
+        rendered = real_render(parsed, plan, stale)
         rendered["messages"] = [*rendered["messages"][-1:], {"role": "user", "content": "again"}]
         return rendered
 
