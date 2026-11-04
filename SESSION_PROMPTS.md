@@ -115,6 +115,7 @@ Acceptance criteria:
 Follow CLAUDE.md. Task: background worker (ARCHITECTURE.md §9, D9, D10). Work in liber/worker/.
 
 Build an asyncio worker started from the app lifespan: exact token counts via Anthropic's token-counting endpoint (verify against current docs), summaries and topic labels via a configurable cheap model, all cached by content hash, retries with backoff, never on the request path. Replace Session 4's stub summaries. Conversation text is passed to the model as quoted data only.
+Add the summary coverage check (ARCHITECTURE.md §9): extract hard facts (file paths, identifiers, URLs, numbers with units, error messages) from the original items, check each appears in the summary, store the score and missing facts in the content cache, and append missing ones to the frozen block as a "Key references" list. Deterministic, no LLM.
 Add the `carry_forward_reasoning` setting (default off, ADR 0004 A5): when on, the summarizer also reads the thinking text of the turns it summarizes and adds a short, clearly labeled "earlier decisions and why" section to the frozen block as plain text. Everything else about the summary must be identical whether the flag is on or off, so Tier 2 can compare them fairly.
 
 Acceptance criteria:
@@ -122,6 +123,8 @@ Acceptance criteria:
 - Identical content is never summarized twice (cache hit test).
 - A worker failure never affects the request path (test).
 - Prompt-injection fixture (conversation text instructing the summarizer) does not change the summarizer's instructions or output format.
+- A summary that drops a file path from its original gets that path back in "Key references", and its coverage score reflects the miss; a complete summary gets no list.
+- The coverage check is deterministic: the same original and summary always give the same result.
 - With `carry_forward_reasoning` off, summaries never include thinking text; with it on, the only difference is the labeled notes section (test with a fake model).
 - `make check` passes.
 ```
@@ -133,11 +136,12 @@ Acceptance criteria:
 ```
 Follow CLAUDE.md. Task: dashboard (ARCHITECTURE.md §10, D11). Work in liber/dashboard/.
 
-Build a FastAPI + Jinja + HTMX dashboard served by the same app, bound to 127.0.0.1: session list with branches; item table (role, kind, tokens, topic, status); topic map with token totals; select items -> offload / summarize / delete into the pending plan; cost/payback preview; Apply and Undo; per-session chart of input tokens and cache reads vs writes.
+Build a FastAPI + Jinja + HTMX dashboard served by the same app, bound to 127.0.0.1: session list showing one conversation per session, the active branch only (§10; abandoned branches hidden, at most a "rewound here" marker); summary previews side by side with the original and its coverage result; item table (role, kind, tokens, topic, status); topic map with token totals; select items -> offload / summarize / delete into the pending plan; cost/payback preview; Apply and Undo; per-session chart of input tokens and cache reads vs writes.
 
 Acceptance criteria:
 - Route tests for every action using the test client.
 - Apply goes through the same plan code as the CLI (no duplicate logic).
+- After a rewind, the dashboard shows only the new active branch.
 - `make check` passes.
 ```
 

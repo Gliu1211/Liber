@@ -76,3 +76,8 @@ Template:
 - Done: ADRs 0009 and 0010 accepted and PR #6 (Session 4a) merged; ADR 0009's cache-breakpoint question resolved ("don't add one"). Request-path budget raised to 20 ms p95 (ADR 0011), defined once in `tier1.OVERHEAD_BUDGET_MS` and used by both the in-suite test and the eval gate. CLAUDE.md: new ADRs are always Proposed; no queued follow-up tasks.
 - Why: on a 2-vCPU container, 4a's p95 was 7.4-9.5 ms against the old 10 ms budget, and the latency test failed 1 in 3 `make check` runs.
 - Next step: owner records `evals/baseline.json` (`make eval-baseline`) in its own PR, then Session 4b.
+
+## 2026-11-04 — Owner decisions: ARCHITECTURE §16 open questions resolved
+- Summary quality: deterministic coverage check + "Key references" list + side-by-side preview (§9; Session 5 prompt updated).
+- Frozen-block merging: only in a major compaction; minor stays append-only (D6).
+- Dashboard: one conversation per session, the active branch only (§10; Session 6 prompt updated).

@@ -58,6 +58,7 @@ Model APIs are stateless: the client resends the **entire** conversation on ever
 ### D6 — Minor vs major compaction · Decided
 - **Minor:** frequent, cheap; appends a new frozen block at the frozen/live boundary.
 - **Major:** rare, expensive; rebuilds the whole rendered context (merge small frozen blocks, re-summarize). Triggered by user edits to early content or by idle time (cache already expired).
+- **Merging frozen blocks happens only in a major compaction** (owner, 2026-11-04). Merging rewrites the start of the context, which restarts the prompt cache and drops thinking (ADR 0004), so by definition it is major. Minor compactions stay strictly append-only (Tier 1 `prefix_stability`). Prefer running a merge when the session has been idle past the cache lifetime, when the rewrite costs nothing extra.
 - Analogy: minor/major GC, or LSM-tree compaction.
 
 ### D7 — Session identification: message hash chain · Provisional
@@ -194,13 +195,22 @@ A background asyncio task (same process in v1) that processes new items:
 - writes results to the content-addressed cache;
 - never blocks the request path; failures are retried with backoff and logged.
 
+### Summary quality check (owner, 2026-11-04)
+A summary can silently drop something that matters later (a file path, a decision, a constraint). Every summary goes through a **deterministic coverage check** before it can be used, with no LLM involved:
+1. Extract the "hard facts" from the original items with patterns: file paths, identifiers (function, class and variable names in code spans), URLs, numbers with units, error messages and quoted strings.
+2. Check each one appears in the summary (exact or normalized match).
+3. Store the coverage score and the missing facts with the summary in the content cache. Missing facts are appended to the frozen block as a short "Key references" list, so they survive even when the prose dropped them, and are shown in the dashboard.
+
+Backstops: the dashboard shows summary and original side by side before Apply (§10), originals are kept on disk and undo always works (§4), and Tier 2's needle tests plus an LLM judge measure overall summary quality (§12).
+
 ---
 
 ## 10. Dashboard (v1)
 
-- Session list (with branches), item table: role, kind, tokens, topic, status.
+- Session list, item table: role, kind, tokens, topic, status.
+- **One conversation per session: the active branch** (owner, 2026-11-04). Branches exist internally because Liber only sees requests and must not apply a plan to messages a rewound history doesn't contain (D7). Users think in one conversation, so the dashboard shows only the branch the latest request used. Abandoned branches (from a rewind, an edited prompt or a retry) are hidden; at most a small "rewound here" marker shows where the conversation diverged.
 - Topic map: items grouped by topic with token totals.
-- Select items/ranges → offload / summarize / delete → **pending plan** with cost/payback preview → Apply → undo via version history.
+- Select items/ranges → offload / summarize / delete → **pending plan** with cost/payback preview and, for summaries, the original side by side with the coverage result (§9) → Apply → undo via version history.
 - Per-session chart of input tokens, cache reads vs writes over time.
 
 ---
@@ -363,6 +373,7 @@ CI (`.github/workflows/ci.yml`) runs `make check` on every push and PR, so the g
 
 ## 16. Open questions
 
-- Summary quality checks (how to detect a summary that lost something important).
-- Whether to merge small frozen blocks during minor compaction or only in major.
-- How to present branches in the dashboard without confusing users.
+None open. Resolved (owner, 2026-11-04):
+- **Summary quality checks** → deterministic coverage check with a "Key references" list, side-by-side preview, and Tier 2 needle tests (§9).
+- **Merging small frozen blocks** → only in a major compaction; minor stays append-only (D6).
+- **Branches in the dashboard** → show only the active branch; hide abandoned ones (§10).
