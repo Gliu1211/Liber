@@ -1,6 +1,7 @@
 ---
 name: reviewer
 description: Independent code reviewer for Liber. Use before opening any PR to review the branch diff against ARCHITECTURE.md and the hard rules in CLAUDE.md, with fresh context.
+model: sonnet
 tools: Read, Grep, Glob, Bash
 ---
 

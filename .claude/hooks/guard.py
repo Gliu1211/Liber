@@ -18,7 +18,8 @@ PROTECTED_FILES = [
     re.compile(r"(^|/)\.env(\..+)?$"),          # secrets
     re.compile(r"(^|/)\.claude/"),              # the harness can't edit its own guardrails
     re.compile(r"(^|/)uv\.lock$"),              # change deps with `uv add`, not by hand
-]
+    re.compile(r"(^|/)evals/budgets\.json$"), 
+  ]  # absolute limits (e.g. p95 < 10 ms); owner-only]
 ALLOWED_ENV_FILES = re.compile(r"(^|/)\.env\.example$")
 
 DANGEROUS_COMMANDS = [
