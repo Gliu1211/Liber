@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI
 
 from liber import pipeline
+from liber.evals.tier1 import OVERHEAD_BUDGET_MS
 from liber.model.anthropic import RecentRequests
 from liber.session import chain
 from liber.session.store import Store
@@ -138,7 +139,7 @@ def growing_conversation(full: dict[str, Any]) -> list[bytes]:
     return bodies
 
 
-async def test_request_path_overhead_p95_under_10ms(store: Store) -> None:
+async def test_request_path_overhead_p95_within_budget(store: Store) -> None:
     full = json.loads(LONG_SESSION.read_text(encoding="utf-8"))
     bodies = growing_conversation(full)
     recent = RecentRequests()  # as the app runs it
@@ -158,7 +159,10 @@ async def test_request_path_overhead_p95_under_10ms(store: Store) -> None:
 
     p95 = statistics.quantiles(timings, n=20)[18]
     assert len(bodies) == 51
-    assert p95 < 10, f"p95 overhead {p95:.2f} ms over {len(timings)} requests"
+    # One budget for the test and the eval gate (ADR 0011), so they can never disagree.
+    assert p95 < OVERHEAD_BUDGET_MS, (
+        f"p95 overhead {p95:.2f} ms over {len(timings)} requests (budget {OVERHEAD_BUDGET_MS:g} ms)"
+    )
 
 
 # --- Reusing the previous request's work (ADR 0007) -------------------------------------------

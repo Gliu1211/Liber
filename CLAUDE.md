@@ -23,6 +23,8 @@ Liber is a local API proxy that lets users choose what stays in an LLM's context
 4. **Loop:** implement the smallest piece → `make check` → diagnose from the output → fix → repeat. A Stop hook runs `make check` and blocks finishing while it fails.
 5. **Independent review:** run the `reviewer` subagent on your diff; fix real findings or explain why not.
 6. **Hand off:** append an entry to `docs/PROGRESS.md` (done, decisions, open issues, next step). Record any new design decision as an ADR in `docs/decisions/`.
+   - New ADRs are always **Proposed**. Only the owner changes an ADR's status.
+   - Don't start or queue follow-up tasks. List proposed follow-ups in `docs/PROGRESS.md` for the owner to decide.
 7. **PR:** one task per PR, conventional-commit title, description with a **"How it works"** walkthrough.
 
 ## Learning mode (the owner must be able to explain every line)

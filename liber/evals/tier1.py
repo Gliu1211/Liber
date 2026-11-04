@@ -45,7 +45,7 @@ from liber.plan import versions
 from liber.plan.apply import exchange_starts, summarize_operation
 from liber.session.store import Store, checkpointing
 
-OVERHEAD_BUDGET_MS = 10.0  # §3: steps 2-5 must add only a few milliseconds
+OVERHEAD_BUDGET_MS = 20.0  # §3 / ADR 0011: request-path p95 budget for steps 2-5
 DEFAULT_SESSIONS = Path("tests/fixtures/sessions")
 DEFAULT_OUT = Path("evals/results/latest.json")
 
