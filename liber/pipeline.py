@@ -43,8 +43,8 @@ from liber.model.items import Item, OperationKind
 from liber.model.validate import THINKING_TYPES, Violation, validate
 from liber.plan import policy, versions
 from liber.plan.apply import PlanNotApplicable
-from liber.session.chain import StoreBusy, identify
-from liber.session.store import Store
+from liber.session.chain import identify
+from liber.session.store import Store, StoreBusy
 
 log = structlog.get_logger(__name__)
 
@@ -99,32 +99,45 @@ async def prepare(store: Store, raw_body: bytes, recent: RecentRequests | None =
         prepared.known_messages, prepared.new_messages = identity.known_messages, identity.new_messages
 
         state = identity.plan
-        used, rendered = render_with_plan(parsed, state, prepared)
+        used, rendered, prepared.violations = render_with_plan(parsed, state, reference, prepared)
         prepared.rendered = rendered
-        prepared.violations = validate(rendered, original=reference)
         if used.number:
             prepared.plan_version = used.number
             prepared.offloaded = offloaded_items(parsed, used)
 
+        changed = not used.plan.is_empty and rendered != reference
         if prepared.violations:
-            pass  # stay on "fallback": the violations say why
-        elif used.plan.is_empty and rendered != reference:
+            return finish(prepared, started)  # stays "fallback": the violations say why
+        if used.plan.is_empty and rendered != reference:
             prepared.error = "round trip changed the request under an empty plan (a parse/render bug)"
-        elif used.plan.is_empty or rendered == reference:
-            prepared.outcome = "passthrough"  # nothing changed: send the client's exact bytes
-        else:
-            if state.pending is not None and used.number == state.pending.number and identity.session_id:
-                # The requested version fits and is valid at a clean turn boundary: it is now applied.
-                await versions.promote_pending(store, identity.session_id, used.number)
-            if has_thinking(rendered):
-                prepared.outcome = "passthrough"
-                prepared.edit_skipped = HELD_FOR_THINKING
-            else:
-                prepared.outcome = "rendered"
-                prepared.body = encode_request(rendered)
-    except Exception as exc:
-        prepared.error = describe_failure(exc)
+            return finish(prepared, started)
+        held = changed and has_thinking(rendered)
+        if held:
+            prepared.edit_skipped = HELD_FOR_THINKING
 
+        # A requested version takes effect once a request goes out as it renders it (an undo back
+        # to the empty plan included); not while its edit is held back. Written before the body
+        # is chosen: if the write fails, the except below still sends the client's bytes.
+        pending_was_used = (
+            state.pending is not None
+            and policy.pending_takes_effect(state, request["messages"])
+            and used.number == state.pending.number
+        )
+        if pending_was_used and identity.session_id and not held:
+            await versions.promote_pending(store, identity.session_id, used.number)
+
+        if changed and not held:
+            prepared.outcome = "rendered"
+            prepared.body = encode_request(rendered)
+        else:
+            prepared.outcome = "passthrough"  # the client's exact bytes
+    except Exception as exc:
+        prepared.outcome, prepared.body = "fallback", raw_body  # whatever was decided before the failure
+        prepared.error = describe_failure(exc)
+    return finish(prepared, started)
+
+
+def finish(prepared: Prepared, started: float) -> Prepared:
     prepared.overhead_ms = round((time.perf_counter() - started) * 1000, 3)
     if prepared.outcome == "fallback":
         log.warning(
@@ -137,18 +150,34 @@ async def prepare(store: Store, raw_body: bytes, recent: RecentRequests | None =
 
 
 def render_with_plan(
-    parsed: ParsedRequest, state: versions.PlanState, prepared: Prepared
-) -> tuple[versions.PlanVersion, dict[str, Any]]:
-    """Render with the first plan version (policy.versions_to_try) that fits this request.
+    parsed: ParsedRequest, state: versions.PlanState, reference: Any, prepared: Prepared
+) -> tuple[versions.PlanVersion, dict[str, Any], list[Violation]]:
+    """Render with the first plan version (policy.versions_to_try) that works for this request.
 
-    The last candidate is always the empty plan, which fits every request.
+    A version gives way to the next one if it doesn't fit the request, if applying it fails (a
+    bug: one bad plan mustn't stop the session's other versions, or an undo, from working), or
+    if its render doesn't pass the validator. The last candidate is the empty plan; its
+    violations or failure are the request's, and prepare() falls back.
     """
-    for version in policy.versions_to_try(state, parsed.original["messages"]):
+    *plans, last = policy.versions_to_try(state, parsed.original["messages"])
+    for version in plans:
         try:
-            return version, render(parsed, version.plan)
+            rendered = render(parsed, version.plan)
         except PlanNotApplicable as exc:
             prepared.edit_skipped = f"plan version {version.number} not used: {exc}"
-    raise AssertionError("the empty plan always fits")  # unreachable: versions_to_try ends with it
+            continue
+        except Exception as exc:
+            prepared.edit_skipped = f"plan version {version.number} not used: it failed ({describe_failure(exc)})"
+            log.warning("plan_failed", plan_version=version.number, error=describe_failure(exc))
+            continue
+        violations = validate(rendered, original=reference)
+        if violations:
+            rules = ", ".join(sorted({violation.rule for violation in violations}))
+            prepared.edit_skipped = f"plan version {version.number} not used: its render broke {rules}"
+            continue
+        return version, rendered, []
+    rendered = render(parsed, last.plan)
+    return last, rendered, validate(rendered, original=reference)
 
 
 def offloaded_items(parsed: ParsedRequest, version: versions.PlanVersion) -> list[Item]:

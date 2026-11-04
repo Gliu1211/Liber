@@ -33,6 +33,9 @@ if TYPE_CHECKING:  # only for type hints; anthropic.py imports this module
     from liber.model.anthropic import ParsedRequest
 
 OFFLOADABLE = {Kind.TEXT: "text", Kind.TOOL_RESULT: "tool result", Kind.IMAGE: "image", Kind.DOCUMENT: "document"}
+# Deletable on their own. Not thinking (§5), and not other kinds: server tool calls and their
+# results (web search, MCP...) are pairs this module doesn't know how to keep together.
+DELETABLE = {Kind.TEXT, Kind.TOOL_USE, Kind.TOOL_RESULT, Kind.IMAGE, Kind.DOCUMENT}
 
 
 class PlanNotApplicable(Exception):
@@ -89,6 +92,8 @@ def apply_plan(parsed: "ParsedRequest", plan: Plan) -> list[dict[str, Any]]:
     """The request's messages with `plan` applied. Raises PlanNotApplicable if it doesn't fit."""
     items = {item.id: item for item in parsed.items}
     for operation in plan.operations:
+        if not operation.item_ids:
+            raise PlanNotApplicable(f"a {operation.kind} operation with no items")
         if any(item_id not in items for item_id in operation.item_ids):
             raise PlanNotApplicable("the plan refers to messages this request doesn't have")
 
@@ -115,6 +120,8 @@ def apply_plan(parsed: "ParsedRequest", plan: Plan) -> list[dict[str, Any]]:
             if operation.kind is OperationKind.DELETE:
                 if item.kind is Kind.THINKING:
                     raise PlanNotApplicable("thinking blocks are never edited (§5)")
+                if item.kind not in DELETABLE:
+                    raise PlanNotApplicable(f"a {item.kind} block can't be deleted on its own")
                 removed.add(position)
             elif operation.kind is OperationKind.OFFLOAD:
                 if item.kind not in OFFLOADABLE:
@@ -177,10 +184,10 @@ def frozen_region(
 def with_tool_partners(targets: list[Item], all_items: list[Item]) -> list[Item]:
     """Deleting a tool call deletes its result, and the other way round (§4)."""
     chosen = {item.id for item in targets}
+    calls_of_chosen_results = {item.depends_on for item in targets if item.depends_on is not None}
     for item in all_items:
-        calls_a_target = item.depends_on in chosen  # a result of a chosen tool call
-        answered_by_target = any(t.depends_on == item.id for t in targets)  # the call of a chosen result
-        if calls_a_target or answered_by_target:
+        result_of_a_chosen_call = item.depends_on in chosen
+        if result_of_a_chosen_call or item.id in calls_of_chosen_results:
             chosen.add(item.id)
     return [item for item in all_items if item.id in chosen]
 

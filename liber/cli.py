@@ -88,6 +88,7 @@ def run_plan_command(args: argparse.Namespace, settings: Settings) -> int:
     async def run() -> str:
         store = Store(settings.db_path)
         try:
+            await store.create_tables()  # a database from before plans existed lacks their tables
             if args.plan_command == "show":
                 return await commands.show(store, args.session)
             if args.plan_command == "create":
@@ -104,6 +105,9 @@ def run_plan_command(args: argparse.Namespace, settings: Settings) -> int:
         print(asyncio.run(run()))
     except PlanError as exc:
         print(f"liber plan: {exc}")
+        return 1
+    except Exception as exc:  # e.g. the database is locked by a long write, or damaged
+        print(f"liber plan: failed ({type(exc).__name__}: {exc})")
         return 1
     return 0
 

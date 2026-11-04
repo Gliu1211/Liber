@@ -23,18 +23,25 @@ def at_clean_turn_boundary(messages: list[Any]) -> bool:
     return messages[-1].get("role") == "user" and not tool_results_in(messages[-1])
 
 
+def pending_takes_effect(state: PlanState, messages: list[Any]) -> bool:
+    """Is this request where the requested pending version is tried (break point + A1)?"""
+    return state.pending is not None and state.apply_requested and at_clean_turn_boundary(messages)
+
+
 def versions_to_try(state: PlanState, messages: list[Any]) -> list[PlanVersion]:
-    """The plan versions to render this request with, best first.
+    """The plan versions to render this request with, best first; the empty plan is always last.
 
     A requested pending version first, if the request is at a clean turn boundary; then the
-    applied one; then the empty plan, for a request the applied plan doesn't fit (another
-    branch, or earlier history than the plan is about).
+    applied one; then the empty plan, for a request the others don't work for (another
+    branch, earlier history than the plan is about, or a plan that fails).
     """
     candidates = [state.applied, EMPTY]
-    if state.pending is not None and state.apply_requested and at_clean_turn_boundary(messages):
+    if state.pending is not None and pending_takes_effect(state, messages):
         candidates.insert(0, state.pending)
     unique: list[PlanVersion] = []
     for version in candidates:
         if version.number not in [chosen.number for chosen in unique]:
             unique.append(version)
+        if version.number == 0:
+            break  # the empty plan fits every request (e.g. undo back to it): nothing after it is needed
     return unique

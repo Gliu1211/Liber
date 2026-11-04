@@ -283,3 +283,47 @@ def test_operations_inside_a_summarized_range_are_superseded() -> None:
     with_offload = rendered_with(SIX_TURNS, offload_in_range, summary)
 
     assert with_offload == rendered_with(SIX_TURNS, summary)
+
+
+# --- Review findings ----------------------------------------------------------------------------
+
+
+def test_blocks_of_other_kinds_cannot_be_deleted_on_their_own() -> None:
+    # A server tool call and its result are a pair Liber doesn't pair up; deleting one would
+    # leave the other orphaned, which the validator doesn't check.
+    request = chat("u0")
+    request["messages"] = [
+        {"role": "user", "content": "search the web"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "x"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srv_1", "content": []},
+                {"type": "text", "text": "Found it."},
+            ],
+        },
+        {"role": "user", "content": "thanks"},
+    ]
+    parsed = parse(request)
+    server_call = ids_in(parsed, kind=Kind.OTHER)[0]
+
+    with pytest.raises(PlanNotApplicable, match="can't be deleted"):
+        render(parsed, Plan(operations=(Operation(kind=OperationKind.DELETE, item_ids=(server_call,)),)))
+
+
+def test_an_operation_with_no_items_does_not_apply() -> None:
+    parsed = parse(SIX_TURNS)
+
+    for kind in OperationKind:
+        with pytest.raises(PlanNotApplicable, match="no items"):
+            render(parsed, Plan(operations=(Operation(kind=kind, item_ids=(), summary="x"),)))
+
+
+def test_deleting_an_exchange_next_to_a_system_message_stays_valid() -> None:
+    request = chat("u0", "a0", "u1", "a1", "u2")
+    request["messages"].insert(3, {"role": "system", "content": "Be terse from now on."})  # after u1
+    parsed = parse(request)
+
+    result = rendered_with(request, Operation(kind=OperationKind.DELETE, item_ids=tuple(ids_in(parsed, message=1))))
+
+    assert [m["content"] for m in result["messages"]] == ["u1", "Be terse from now on.", "a1", "u2"]

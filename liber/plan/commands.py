@@ -9,6 +9,8 @@ the range starts where the live region starts and must end just before a user me
 starts a new exchange (§5); the request path checks the same rules again (plan/apply.py).
 """
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -80,8 +82,28 @@ async def create(
     delete: tuple[str, ...] = (),
     note: str | None = None,
 ) -> str:
-    """Make a new pending plan version: the newest version plus these edits."""
-    items = await store.run(lambda db: latest_branch_items(db, session_id))
+    """Make a new pending plan version: the newest version plus these edits.
+
+    One transaction (BEGIN IMMEDIATE): two commands run at once can't both build on the same
+    version and number their summaries alike.
+    """
+    now = datetime.now(UTC)
+    version = await store.run(
+        lambda db: create_now(db, session_id, summarize_through, offload, delete, note, now), immediate=True
+    )
+    return f"Created plan version {version.number} (pending). To use it: liber plan apply --session {session_id}"
+
+
+def create_now(
+    db: Session,
+    session_id: str,
+    summarize_through: int | None,
+    offload: tuple[str, ...],
+    delete: tuple[str, ...],
+    note: str | None,
+    now: datetime,
+) -> versions.PlanVersion:
+    items = latest_branch_items(db, session_id)
     if not items:
         raise PlanError(f"no session {session_id}")
     by_id = {item.id: item for item in items}
@@ -89,22 +111,21 @@ async def create(
     if unknown:
         raise PlanError(f"no such item in the session's latest branch: {', '.join(unknown)}")
 
+    connection = db.connection()
+    state = versions.read_state(connection, session_id)
     operations: list[Operation] = []
     if summarize_through is not None:
-        operations.append(await summary_through(store, session_id, items, summarize_through))
+        operations.append(summary_through(state, items, summarize_through))
     if offload:
         operations.append(Operation(kind=OperationKind.OFFLOAD, item_ids=offload, note=note))
     if delete:
         operations.append(Operation(kind=OperationKind.DELETE, item_ids=delete))
     if not operations:
         raise PlanError("nothing to do: give --summarize-through, --offload or --delete")
-
-    version = await versions.create(store, session_id, tuple(operations))
-    return f"Created plan version {version.number} (pending). To use it: liber plan apply --session {session_id}"
+    return versions.create_version(connection, session_id, tuple(operations), now)
 
 
-async def summary_through(store: Store, session_id: str, items: list[ItemRecord], last: int) -> Operation:
-    state = await versions.load_state(store, session_id)
+def summary_through(state: versions.PlanState, items: list[ItemRecord], last: int) -> Operation:
     base = state.pending or state.applied
     by_id = {item.id: item for item in items}
     summaries = [op for op in base.plan.operations if op.kind is OperationKind.SUMMARIZE]

@@ -30,13 +30,29 @@ rule 1.
      (tested).
    - Per session, as §4 says: items keep their ids across branches that share a prefix. A plan
      that names items a branch doesn't have doesn't fit it (decision 3).
-2. **When a version takes effect** (`plan/policy.py`): a requested pending version is tried
-   first, but only on a request that ends at a clean turn boundary (ADR 0004 A1). The request
-   path promotes it if it fits and the result passes the validator. Otherwise the applied
-   version is used, and if that doesn't fit either, the empty plan. Once applied, a version is
-   used on every request, including mid-loop ones, so the rendered history never flips between
-   versions. 4a implements break point 1, the user asking (`liber plan apply`); idle and
-   threshold come in 4b.
+2. **When a version takes effect** (`plan/policy.py`, `pipeline.render_with_plan`): a
+   requested pending version is tried first, but only on a request that ends at a clean turn
+   boundary (ADR 0004 A1). Then comes the applied version, then the empty plan, which fits every
+   request and is always last.
+   - **When a candidate gives way to the next:** it doesn't fit the request, applying it fails
+     (a bug), or its render doesn't pass the validator. One bad version therefore can't stop
+     the session's other versions, or an undo, from working. Only a failure of the empty plan
+     makes the request fall back.
+   - **When the pending version is promoted to applied:** only when the request goes out the
+     way it renders it, including an undo back to the empty plan. A version whose edit is held
+     back (decision 4) stays pending, so "applied" always means "sent".
+   - **The promotion write** happens before the body is chosen, with identification's 100 ms
+     busy timeout. If the write fails, the request is sent unedited (fallback) and the next
+     clean turn tries again.
+   - **Once applied**, a version is used on every request, including mid-loop ones, so the
+     rendered history doesn't flip between versions.
+   - **Break points:** 4a implements break point 1, the user asking (`liber plan apply`); idle
+     and threshold come in 4b.
+   - **Undo** goes to the parent of the applied version: the version it was built on, which may
+     itself never have been applied if it was replaced while pending.
+   - **Race with the CLI:** if `liber plan create` replaces the pending version between a
+     request's read and its promotion, the promotion becomes a no-op. That request was sent with
+     the older pending version; the next clean turn uses the newer one.
 3. **Applying a plan** (`plan/apply.py`, called from `render()`):
    - **Summarize:** a range of whole exchanges, starting where the live region starts and
      ending just before a user message that starts an exchange (§5), becomes a frozen block.
@@ -55,9 +71,17 @@ rule 1.
        `cache_control` marker.
      - Tool calls, thinking and unknown blocks can't be offloaded.
    - **Delete:** a tool call takes its result with it and the other way round. A message left
-     empty takes its whole exchange with it. Thinking blocks are never deleted on their own.
+     empty takes its whole exchange with it. Thinking blocks, and blocks of other kinds (server
+     tool calls and their results), are never deleted on their own: Liber doesn't know how to
+     keep those pairs together, and the validator doesn't check them.
    - **What plans never touch:** the latest exchange, the turn in progress. This is stricter
-     than §5's in-flight loop, which for Claude Code is the same exchange.
+     than §5's in-flight loop, which for Claude Code is the same exchange. One exception is by
+     design (D8): when every earlier exchange is summarized, the frozen blocks go in front of
+     the current turn's first user message, but its own content stays as it was.
+   - **Pointer notes are computed when rendering.** The note includes the item's estimated
+     tokens. Its bytes stay the same only while the estimate is a fixed function of the content
+     (it is: `parse()`'s estimate, not the worker's exact count). Changing the estimator
+     would change already-sent bytes once.
    - **Superseded operations:** operations on items a summary covers have no effect.
    - **A plan that doesn't fit:** it names items the request doesn't have, or a summary isn't
      at an exchange boundary. It raises `PlanNotApplicable`, the next candidate version is
@@ -79,7 +103,8 @@ rule 1.
      wait for the worker.
    - Stored even while an edit is held back, so the original is there when 4b sends it.
 6. **The plan state is read in identification's transaction** (`Identity.plan`), not in a
-   separate database trip, to stay within §3's budget.
+   separate database trip, to stay within §3's budget. A damaged plan row reads as "no plan"
+   (logged), so it can't stop the conversation from being registered.
 
 ## Consequences
 - **What 4a reduces today** (`token_reduction` 0.75% on the fixtures): only requests without
@@ -91,4 +116,9 @@ rule 1.
 - **Stub summaries can make tiny exchanges longer** (Tier 1's chat fixtures send more tokens,
   not fewer). 4b's cost model should refuse compactions that don't pay.
 - **The CLI and the proxy share the database.** A CLI write takes the write lock briefly; the
-  request path's 100 ms busy timeout covers it.
+  request path's 100 ms busy timeout covers it. `liber plan create` reads and writes in one
+  transaction.
+- **Hold-back flip-flops within a turn.** A clean-turn request whose summaries removed all its
+  thinking can be sent edited, while a later request in the same turn that includes new thinking
+  is sent unedited. That's safe, but the prompt cache misses each time it switches. 4b's
+  `drop_block` removes the hold-back and with it the flip-flop.

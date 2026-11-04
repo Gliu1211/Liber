@@ -19,11 +19,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
+import structlog
 from sqlalchemy import Connection, Table, func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 
 from liber.model.items import Operation, Plan
-from liber.session.store import PlanStateRecord, PlanVersionRecord, Store
+from liber.session.store import SQLITE_BUSY_TIMEOUT_MS, PlanStateRecord, PlanVersionRecord, Store, StoreBusy
+
+log = structlog.get_logger(__name__)
 
 
 class PlanError(Exception):
@@ -60,6 +64,19 @@ def read_state(db: Connection, session_id: str) -> PlanState:
         return NO_PLAN
     pending = read_version(db, session_id, row.pending_version) if row.pending_version is not None else None
     return PlanState(read_version(db, session_id, row.applied_version), pending, row.apply_requested)
+
+
+def read_state_or_no_plan(db: Connection, session_id: str) -> PlanState:
+    """read_state for the request path: a damaged plan row means no plan, not a failed request.
+
+    It runs inside identification's transaction, so an error here would also stop the
+    conversation from being registered. Logged without the row's content.
+    """
+    try:
+        return read_state(db, session_id)
+    except Exception as exc:
+        log.warning("plan_state_unreadable", session_id=session_id, error=type(exc).__name__)
+        return NO_PLAN
 
 
 def read_version(db: Connection, session_id: str, number: int) -> PlanVersion:
@@ -153,5 +170,15 @@ async def undo(store: Store, session_id: str) -> PlanVersion:
 
 
 async def promote_pending(store: Store, session_id: str, version: int) -> None:
+    """On the request path: as short a wait for the write lock as identification's (§3 budget)."""
     now = datetime.now(UTC)
-    await store.run(lambda db: promote(db.connection(), session_id, version, now), immediate=True)
+    try:
+        await store.run(
+            lambda db: promote(db.connection(), session_id, version, now),
+            busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
+            immediate=True,
+        )
+    except OperationalError as exc:
+        if "locked" in str(exc.orig) or "busy" in str(exc.orig):
+            raise StoreBusy("the database is locked by another writer") from exc
+        raise

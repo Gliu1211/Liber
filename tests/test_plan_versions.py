@@ -19,7 +19,7 @@ from liber.model.anthropic import RecentRequests, parse
 from liber.model.items import Kind, Operation, OperationKind
 from liber.plan import versions
 from liber.plan.apply import summarize_operation
-from liber.session.store import Store
+from liber.session.store import Store, StoreBusy
 from tests.helpers import FIXTURES, FakeUpstream, recorded
 
 
@@ -200,3 +200,127 @@ async def test_plan_outcomes_are_recorded(app: FastAPI, client: httpx.AsyncClien
 
     assert (rows[-1].liber_outcome, rows[-1].plan_version, rows[-1].edit_skipped) == ("rendered", 1, None)
     assert json.loads(upstream.last_request.content)["messages"][0]["content"][0]["text"].startswith("<liber:summary")
+
+
+# --- Review findings ----------------------------------------------------------------------------
+
+
+async def test_undo_back_to_no_plan_takes_effect_and_stays(store: Store) -> None:
+    recent = RecentRequests()
+    session = await start_session(store, recent)
+    await versions.create(store, session, (summary_of_first_exchange(chat(*TURNS)),))
+    await versions.apply(store, session)
+    await pipeline.prepare(store, body(chat(*TURNS[:7])), recent)  # v1 applied
+
+    await versions.undo(store, session)
+    clean_turn = await pipeline.prepare(store, body(chat(*TURNS[:7])), recent)
+    later = await pipeline.prepare(store, body(chat(*TURNS)), recent)
+    state = await versions.load_state(store, session)
+
+    assert (state.applied.number, state.pending) == (0, None)
+    assert (clean_turn.outcome, later.outcome) == ("passthrough", "passthrough")
+    assert later.plan_version is None  # no flip back to version 1
+
+
+async def test_a_pending_version_that_breaks_the_request_gives_way_to_the_applied_one(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recent = RecentRequests()
+    session = await start_session(store, recent)
+    final = chat(*TURNS)
+    await versions.create(store, session, (summary_of_first_exchange(final),))
+    await versions.apply(store, session)
+    await pipeline.prepare(store, body(chat(*TURNS[:7])), recent)  # v1 applied
+    await versions.create(store, session, (summarize_operation(parse(final).items, 2, 3, block_number=2),))
+    await versions.apply(store, session)
+    real_render = pipeline.render
+
+    def render_breaking_version_2(parsed: Any, plan: Any) -> dict[str, Any]:
+        rendered = real_render(parsed, plan)
+        if len(plan.operations) == 2:  # version 2 renders a request the API would reject
+            rendered["messages"] = [{"role": "assistant", "content": "oops"}, *rendered["messages"]]
+        return rendered
+
+    monkeypatch.setattr(pipeline, "render", render_breaking_version_2)
+
+    prepared = await pipeline.prepare(store, body(final), recent)
+    state = await versions.load_state(store, session)
+
+    assert (prepared.outcome, prepared.plan_version) == ("rendered", 1)
+    assert prepared.edit_skipped is not None and "version 2 not used" in prepared.edit_skipped
+    assert state.applied.number == 1 and state.pending is not None and state.pending.number == 2
+
+
+async def test_a_held_back_edit_is_not_marked_applied(store: Store) -> None:
+    request = json.loads((FIXTURES / "requests" / "long_session_101.json").read_text(encoding="utf-8"))
+    recent = RecentRequests()
+    first = await pipeline.prepare(store, body(request), recent)
+    assert first.session_id is not None
+    tool_result = next(i for i in parse(request).items if i.kind is Kind.TOOL_RESULT)
+    await versions.create(store, first.session_id, (Operation(kind=OperationKind.OFFLOAD, item_ids=(tool_result.id,)),))
+    await versions.apply(store, first.session_id)
+
+    await pipeline.prepare(store, body(request), recent)
+    state = await versions.load_state(store, first.session_id)
+
+    assert state.applied.number == 0  # never sent, so never in effect
+    assert state.pending is not None and state.pending.number == 1 and state.apply_requested
+
+
+async def test_if_applying_a_version_cannot_be_recorded_the_original_is_sent(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recent = RecentRequests()
+    session = await start_session(store, recent)
+    await versions.create(store, session, (summary_of_first_exchange(chat(*TURNS)),))
+    await versions.apply(store, session)
+
+    async def locked(*args: Any) -> None:
+        raise StoreBusy("the database is locked by another writer")
+
+    monkeypatch.setattr(versions, "promote_pending", locked)
+    raw = body(chat(*TURNS[:7]))
+
+    prepared = await pipeline.prepare(store, raw, recent)
+
+    assert prepared.outcome == "fallback" and prepared.body is raw
+    assert prepared.error is not None and "StoreBusy" in prepared.error
+
+
+async def test_a_plan_that_crashes_gives_way_to_the_next_version(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    recent = RecentRequests()
+    session = await start_session(store, recent)
+    await versions.create(store, session, (summary_of_first_exchange(chat(*TURNS)),))
+    await versions.apply(store, session)
+    real_render = pipeline.render
+
+    def crashing_with_plans(parsed: Any, plan: Any) -> dict[str, Any]:
+        if not plan.is_empty:
+            raise RuntimeError("a bug in applying plans")
+        return real_render(parsed, plan)
+
+    monkeypatch.setattr(pipeline, "render", crashing_with_plans)
+
+    prepared = await pipeline.prepare(store, body(chat(*TURNS[:7])), recent)
+
+    assert prepared.outcome == "passthrough" and prepared.plan_version is None
+    assert prepared.edit_skipped is not None and "RuntimeError" in prepared.edit_skipped
+
+
+async def test_a_damaged_plan_row_means_no_plan_not_a_broken_session(store: Store) -> None:
+    recent = RecentRequests()
+    session = await start_session(store, recent)
+
+    def damage(db: Any) -> None:  # the applied version points at a row that doesn't exist
+        db.connection().exec_driver_sql(
+            "INSERT INTO plans (session_id, applied_version, pending_version, apply_requested, updated_at) "
+            "VALUES (?, 7, NULL, 0, '2026-11-04')",
+            (session,),
+        )
+
+    await store.run(damage)
+
+    prepared = await pipeline.prepare(store, body(chat(*TURNS[:7])), recent)
+
+    assert prepared.outcome == "passthrough" and prepared.session_id == session
+    assert prepared.new_messages == 2  # the conversation was still registered

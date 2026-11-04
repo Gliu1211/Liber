@@ -295,7 +295,9 @@ async def evaluate(sessions_dir: Path, budget_ms: float = OVERHEAD_BUDGET_MS) ->
             "1 - estimated input tokens actually sent / tokens the client sent, over all requests.",
         ),
         "prefix_stability": Metric(
-            ratio(sum(compacted), len(compacted)),
+            # A run with standard plans but no minor compaction measured nothing: that counts as 0,
+            # so the gate fails, rather than ratio()'s 1.0 for an empty set.
+            ratio(sum(compacted), len(compacted)) if compacted or not plans else 0.0,
             "higher",
             0.0,
             "Share of requests rendered after a minor compaction (plan version 2) whose bytes up to "

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
+import structlog
 from sqlalchemy import Connection, Table, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -20,6 +21,8 @@ from liber.cache.blobs import BlobStore
 from liber.model.items import Item
 from liber.session import chain
 from liber.session.store import ContentCacheRecord, Store
+
+log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -50,27 +53,33 @@ def record_blob(db: Connection, content_hash: str, blob_path: str, now: datetime
 
 
 async def keep_originals(store: Store, blobs: BlobStore, items: list[Item]) -> int:
-    """Store offloaded items' originals and note where they are. Returns how many were new.
+    """Store offloaded items' originals and note where they are. Returns how many were stored.
 
     For the app's background tasks: file writes happen in a worker thread, never on the
-    request path. A blob that already exists is left alone.
+    request path. An intact blob is left alone; each item is handled on its own, so one failure
+    doesn't lose the others.
     """
 
-    def write_new() -> list[tuple[str, str]]:
-        written = []
+    def write_all() -> list[tuple[str, str]]:
+        stored = []
         for item in items:
-            if blobs.get(item.content_hash) is None:
+            try:
                 data = chain.canonical_block(item.block).encode("utf-8")  # what content_hash covers
-                written.append((item.content_hash, str(blobs.put(item.content_hash, data))))
-        return written
+                stored.append((item.content_hash, str(blobs.put(item.content_hash, data))))
+            except Exception as exc:
+                log.warning("offloaded_original_not_stored", content_hash=item.content_hash, error=type(exc).__name__)
+        return stored
 
-    written = await asyncio.to_thread(write_new)
-    if written:
+    stored = await asyncio.to_thread(write_all)
+    if stored:
         now = datetime.now(UTC)
-        await store.run(lambda db: record_blobs(db.connection(), written, now))
-    return len(written)
+        await store.run(lambda db: record_blobs(db.connection(), stored, now))
+    return len(stored)
 
 
-def record_blobs(db: Connection, written: list[tuple[str, str]], now: datetime) -> None:
-    for content_hash, path in written:
-        record_blob(db, content_hash, path, now)
+def record_blobs(db: Connection, stored: list[tuple[str, str]], now: datetime) -> None:
+    """Note each blob's path in the cache, unless it's already noted (no write per request)."""
+    for content_hash, path in stored:
+        entry = lookup(db, content_hash)
+        if entry is None or entry.blob_path != path:
+            record_blob(db, content_hash, path, now)

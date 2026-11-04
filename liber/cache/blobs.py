@@ -35,9 +35,11 @@ class BlobStore:
         path = self.path_for(content_hash)
         if hashlib.sha256(data).hexdigest() != content_hash:
             raise ValueError("the data doesn't match its hash")
-        if path.exists():
-            return path
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.get(content_hash) is not None:
+            return path  # already there and intact (a damaged file is rewritten below)
+        # mkdir's mode only applies to the directory it creates last, so make the root first.
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, exist_ok=True)
         # Write to a temporary file in the same directory, then rename: a reader (or a crash)
         # never sees a half-written blob. mkstemp creates the file with mode 0600.
         descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
@@ -51,5 +53,9 @@ class BlobStore:
         return path
 
     def get(self, content_hash: str) -> bytes | None:
+        """The blob's bytes, or None if it's missing or damaged (its bytes don't match its name)."""
         path = self.path_for(content_hash)
-        return path.read_bytes() if path.exists() else None
+        if not path.exists():
+            return None
+        data = path.read_bytes()
+        return data if hashlib.sha256(data).hexdigest() == content_hash else None

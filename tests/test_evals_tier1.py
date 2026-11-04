@@ -270,6 +270,8 @@ async def test_fallback_rate_counts_requests_liber_stepped_aside_from(monkeypatc
 
     assert result.metrics["fallback_rate"].value == 1.0
     assert all(record["outcome"] == "fallback" for record in result.trace)
+    # No plan was ever applied, so no minor compaction was measured: that fails, not passes.
+    assert result.metrics["prefix_stability"].value == 0.0
 
 
 async def test_prefix_stability_catches_a_compaction_that_rewrites_the_frozen_prefix(

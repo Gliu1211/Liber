@@ -106,3 +106,17 @@ def test_the_cli_runs_plan_commands_against_the_data_directory(
 
     assert shown.value.code == 0
     assert refused.value.code == 1 and "liber plan:" in capsys.readouterr().out
+
+
+def test_a_database_error_is_one_line_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("LIBER_DATA_DIR", str(tmp_path))
+    (tmp_path / "liber.db").write_bytes(b"this is not a SQLite database" * 100)
+
+    with pytest.raises(SystemExit) as failed:
+        cli.main(["plan", "show"])
+
+    assert failed.value.code == 1
+    output = capsys.readouterr().out
+    assert output.startswith("liber plan: failed (") and "Traceback" not in output

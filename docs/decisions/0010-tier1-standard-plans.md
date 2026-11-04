@@ -18,8 +18,9 @@ three exchanges:
   it appends a frozen block.
 
 **How plans enter the replay** (`run_request_path(requests, plans)`): as a user would make
-them. After the session's first request, version 1 is created and requested. Once a request
-has been rendered with version 1, version 2 is created and requested. The request path applies
+them. After the session's first request, version 1 is created and requested. Once version 1 is
+applied (an edit with it was sent), version 2 is created and requested. In sessions whose
+edits are held back for thinking (ADR 0009), version 1 stays pending, so version 2 never comes. The request path applies
 each at the next clean turn that it fits (ADR 0009). Branch requests whose history lacks the
 plan's items use the empty plan. A branch that starts a new session (the client's own
 compaction) gets no plan. Plan commands run between requests and aren't timed.
@@ -30,7 +31,8 @@ compaction) gets no plan. Plan commands run between requests and aren't timed.
 - `prefix_stability`: of the requests rendered with version 2 on the request path, the share
   where rendering with version 2 keeps version 1's bytes up to the end of its frozen block
   (system, tools and the earlier frozen block), i.e. a minor compaction only appended (D5).
-  `summary.minor_compactions_checked` counts them (43 today). Tolerance 0.
+  `summary.minor_compactions_checked` counts them (7 today). A run with standard plans but no
+  minor compaction scores 0, which fails the gate, rather than a vacuous 1.0. Tolerance 0.
 - `validity_rate`, `render_determinism` and `round_trip_identity` are unchanged in definition.
   The first two are now measured with the plan version each request was actually rendered with;
   round trip is still always the empty plan.

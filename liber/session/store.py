@@ -43,6 +43,15 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 T = TypeVar("T")
 
+# The request path's writes (identification, applying a plan) wait at most this long for another
+# writer to finish before Liber steps aside (§3 budget, docs/decisions/0003).
+SQLITE_BUSY_TIMEOUT_MS = 100
+
+
+class StoreBusy(Exception):
+    """The database is busy; this request goes through without Liber rather than wait (§3 budget)."""
+
+
 log = structlog.get_logger(__name__)
 
 # The only request headers worth keeping: they change how the API behaves. Never credentials.

@@ -66,3 +66,15 @@ async def test_offloading_keeps_the_original_where_the_content_cache_says(
     assert entry.blob_path == str(app.state.blobs.path_for(tool_result.content_hash))
     assert stored == chain.canonical_block(tool_result.block).encode("utf-8")
     assert hashlib.sha256(stored).hexdigest() == tool_result.content_hash
+
+
+def test_a_damaged_blob_reads_as_missing_and_is_rewritten(tmp_path: Path) -> None:
+    blobs = BlobStore(tmp_path / "blobs")
+    data = b"the original"
+    digest = hashlib.sha256(data).hexdigest()
+    path = blobs.put(digest, data)
+    path.write_bytes(b"bit rot")
+
+    assert blobs.get(digest) is None
+    assert blobs.put(digest, data) == path and blobs.get(digest) == data
+    assert stat.S_IMODE((tmp_path / "blobs").stat().st_mode) == 0o700  # the store's root too
