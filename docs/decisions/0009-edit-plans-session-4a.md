@@ -1,6 +1,6 @@
 # 0009: Edit plans in Session 4a: versions, rendering, and what is held back until 4b
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-04)
 - Date: 2026-11-04
 
 ## Context
@@ -89,7 +89,8 @@ rule 1.
    - **No new cache breakpoint at the frozen boundary yet.** §5 suggests adding one when
      there's room, but whether there's room depends on how many markers the client sent, which
      can vary per request. Adding it only sometimes would change the frozen prefix's bytes and
-     break A2. Left as an open question.
+     break A2. **Decided (owner):** don't add one. The client's own markers already cover
+     caching, and byte-stable rendering (A2) matters more.
 4. **Held back until 4b:** if the rendered request still contains thinking or
    redacted_thinking blocks, Liber sends the client's request unedited. The outcome is
    `passthrough`, with `edit_skipped` explaining. Edits whose summaries removed every thinking

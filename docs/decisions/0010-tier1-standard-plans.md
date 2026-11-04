@@ -1,6 +1,6 @@
 # 0010: Tier 1 standard plans, and the real token_reduction and prefix_stability
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-04)
 - Date: 2026-11-04
 
 ## Context
