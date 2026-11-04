@@ -1,0 +1,81 @@
+{
+ "description": "One conversation plus what clients do to history: a retry of an earlier turn, an edited prompt (fork), and the client's own compaction (history rewritten from the start).",
+ "request": {
+  "model": "claude-opus-5-5",
+  "max_tokens": 1024,
+  "system": "You are a poet.",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a haiku about rain."
+   },
+   {
+    "role": "assistant",
+    "content": "Soft rain on the roof /\nthe gutters hum their one note /\nmorning comes slowly"
+   },
+   {
+    "role": "user",
+    "content": "Now one about snow."
+   },
+   {
+    "role": "assistant",
+    "content": "Snow without a sound /\nthe street forgets its own name /\nfootprints, then nothing"
+   },
+   {
+    "role": "user",
+    "content": "Which one do you prefer?"
+   },
+   {
+    "role": "assistant",
+    "content": "The snow one: the silence does more work."
+   },
+   {
+    "role": "user",
+    "content": "Write a third, about fog."
+   }
+  ]
+ },
+ "branches": [
+  {
+   "note": "retry: the client resends an earlier turn unchanged",
+   "keep_messages": 3,
+   "messages": []
+  },
+  {
+   "note": "edited prompt: the user changed message 3, forking the conversation",
+   "keep_messages": 2,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Now one about wind."
+    },
+    {
+     "role": "assistant",
+     "content": "Wind turns every page /\nof a book left on the sill /\nno one reads it twice"
+    },
+    {
+     "role": "user",
+     "content": "Lovely. One about the sea?"
+    }
+   ]
+  },
+  {
+   "note": "client compaction: everything before replaced by a summary",
+   "keep_messages": 0,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Summary so far: the user asked for haiku about rain and snow and preferred the snow one."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood. What next?"
+    },
+    {
+     "role": "user",
+     "content": "A haiku about fog, please."
+    }
+   ]
+  }
+ ]
+}

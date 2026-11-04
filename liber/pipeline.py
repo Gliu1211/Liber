@@ -42,6 +42,7 @@ class Prepared:
     body: bytes
     outcome: str = "fallback"  # "passthrough", "rendered" or "fallback"
     request: Any = None  # the decoded client request (None if it wasn't JSON), for recording
+    rendered: dict[str, Any] | None = None  # what render() produced, whether or not it was sent
     session_id: str | None = None
     branch_id: str | None = None
     known_messages: int | None = None
@@ -69,6 +70,7 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
 
         plan = Plan()  # the session's applied plan; plans are stored from Session 4
         rendered = render(parsed, plan)
+        prepared.rendered = rendered
         prepared.violations = validate(rendered, original=reference)
 
         if prepared.violations:
@@ -79,7 +81,7 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
             prepared.outcome = "passthrough"  # nothing changed: send the client's exact bytes
         else:
             prepared.outcome = "rendered"
-            prepared.body = json.dumps(rendered, ensure_ascii=False, separators=(",", ":")).encode()
+            prepared.body = encode_request(rendered)
     except Exception as exc:
         prepared.error = describe_failure(exc)
 
@@ -92,6 +94,16 @@ async def prepare(store: Store, raw_body: bytes) -> Prepared:
             session_id=prepared.session_id,
         )
     return prepared
+
+
+def encode_request(request: dict[str, Any]) -> bytes:
+    """The bytes Liber sends for a request it rendered.
+
+    One fixed encoding (key order as built, no spaces, UTF-8 as-is) so the same history and plan
+    always produce the same bytes: preserved thinking and the prompt cache both depend on it
+    (ADR 0004 A2; measured by the Tier 1 metric render_determinism).
+    """
+    return json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def describe_failure(exc: Exception) -> str:
