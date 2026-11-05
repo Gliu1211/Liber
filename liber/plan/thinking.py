@@ -66,16 +66,49 @@ def bind_thinking(rendered: dict[str, Any]) -> Binding:
             return Binding(None, reason="not sent edited: thinking in edited history isn't confirmed for this model")
         return Binding(rendered)  # no thinking block in it: nothing to keep valid, no field to risk
 
-    drop_block = {"prefix_mismatch_behavior": "drop_block"}
-    if isinstance(thinking, dict) and thinking.get("type") in ("adaptive", "enabled"):
-        return Binding({**rendered, "thinking": {**thinking, "block_binding": drop_block}}, (BINDING_BETA,))
-    if thinking is None and model.startswith(ADAPTIVE_BY_DEFAULT):
-        # Same thinking as sending nothing on these models, now with the opt-in.
-        return Binding({**rendered, "thinking": {"type": "adaptive", "block_binding": drop_block}}, (BINDING_BETA,))
+    opted_in = with_drop_block(rendered, model, thinking)
+    if opted_in is not None:
+        return Binding(opted_in, (BINDING_BETA,))
     # Thinking set some other way ("between_tools" takes no other field, older models without
     # adaptive thinking): no opt-in possible. Stale thinking is already left out, so the blocks
     # that remain were produced against this same history (ADR 0004 A3's "strip" path).
     return Binding(rendered)
+
+
+def fallback_opt_in(request: Any) -> Binding | None:
+    """For a fallback in a session Liber has already edited (CLAUDE.md hard rule 1, ADR 0012).
+
+    The client's own request is sent, messages unchanged, but its thinking may have been produced
+    against Liber's rendering, which an enforced account would reject. So it gets the drop_block
+    opt-in (the API then drops such blocks instead of failing), when the model is confirmed, the
+    client hasn't chosen a `prefix_mismatch_behavior` itself, and the API accepts the field for its
+    thinking setting. None: send the client's bytes as they are.
+    """
+    if not isinstance(request, dict) or not isinstance(request.get("messages"), list):
+        return None
+    thinking = request.get("thinking")
+    if isinstance(thinking, dict) and "block_binding" in thinking:
+        return None  # the client's own choice
+    model = request.get("model")
+    if not (isinstance(model, str) and model.startswith(KNOWN_THINKING_MODELS)):
+        return None
+    opted_in = with_drop_block(request, model, thinking)
+    return Binding(opted_in, (BINDING_BETA,)) if opted_in is not None else None
+
+
+def with_drop_block(request: dict[str, Any], model: str, thinking: Any) -> dict[str, Any] | None:
+    """`request` with the drop_block opt-in in `thinking`, or None where the API doesn't accept it.
+
+    Accepted with thinking type "adaptive" or "enabled"; when `thinking` is left out, only on models
+    where that already means adaptive (adding it then changes nothing about how the model thinks).
+    Everything else in the request, messages included, is the same object.
+    """
+    drop_block = {"prefix_mismatch_behavior": "drop_block"}
+    if isinstance(thinking, dict) and thinking.get("type") in ("adaptive", "enabled"):
+        return {**request, "thinking": {**thinking, "block_binding": drop_block}}
+    if thinking is None and model.startswith(ADAPTIVE_BY_DEFAULT):
+        return {**request, "thinking": {"type": "adaptive", "block_binding": drop_block}}
+    return None
 
 
 def has_thinking(request: dict[str, Any]) -> bool:

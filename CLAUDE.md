@@ -6,12 +6,12 @@ Liber is a local API proxy that lets users choose what stays in an LLM's context
 
 ## Hard rules (also enforced by hooks and CI where possible)
 
-1. **Never break the user's session.** Any Liber failure → forward the original request unmodified and log it.
+1. **Never break the user's session.** Any Liber failure → forward the original request unmodified and log it. One owner-approved amendment: in a session Liber has already edited, the fallback still sends the client's messages unchanged but adds the `drop_block` opt-in (beta merged into `anthropic-beta`, `thinking.block_binding` added) when the model is confirmed and the client hasn't set `prefix_mismatch_behavior` itself (ADR 0012).
 2. **Never store or log credentials.** Pass `x-api-key` / `authorization` through untouched; scrub fixtures.
 3. **Bind to 127.0.0.1** by default.
 4. **No LLM or extra network calls on the request path.** Background worker only.
 5. **Never auto-edit frozen blocks** (D5); only a major compaction (D6) rebuilds them.
-6. **Never modify thinking blocks or the in-flight tool loop** (§5). The one exception: leaving out a leading run of stale thinking blocks (the oldest ones, produced before the session's plan version took effect) per ADR 0012. Removing that run whole doesn't change any block that remains.
+6. **Never modify thinking blocks or the in-flight tool loop** (§5). The one exception: leaving out a leading run of stale thinking blocks (the oldest ones, stale as defined in ADR 0012). Removing that run whole doesn't change any block that remains.
 7. **Tests and Tier 1 evals run offline.** No real API keys in tests or CI.
 8. **Never edit `evals/baseline.json` to make a change pass.** Baseline updates are their own PR (§12).
 

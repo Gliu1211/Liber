@@ -29,7 +29,9 @@ stale and left out on every later request, even with the empty plan (ADR 0012). 
 never had a plan is always sent byte-identical.
 
 Hard rule 1: `prepare()` never raises and never returns anything but the client's bytes unless
-a plan (or stale thinking) changed the request and the result passed validation.
+a plan (or stale thinking) changed the request and the result passed validation. One amendment:
+a fallback in a session Liber has already edited carries the drop_block opt-in, messages
+unchanged (`add_fallback_opt_in`).
 """
 
 import json
@@ -85,6 +87,7 @@ async def prepare(
     """
     started = time.perf_counter()
     prepared = Prepared(body=raw_body)
+    edited_session = False  # known once the conversation is identified
     try:
         request = json.loads(raw_body)
         prepared.request = request
@@ -103,6 +106,8 @@ async def prepare(
         prepared.known_messages, prepared.new_messages = identity.known_messages, identity.new_messages
 
         state = identity.plan
+        # Liber has edited this session before: its fallbacks need the drop_block opt-in (rule 1).
+        edited_session = state.activated_at is not None or state.applied.number > 0
         messages = request["messages"]
         estimated_tokens = sum(item.tokens for item in parsed.items)
         prepared.context_share = policy.context_share(request.get("model"), estimated_tokens)
@@ -119,11 +124,11 @@ async def prepare(
             prepared.offloaded = offloaded_items(parsed, used)
 
         if prepared.violations:
-            return finish(prepared, started)  # stays "fallback": the violations say why
+            return finish(prepared, started, raw_body, edited_session)  # "fallback": the violations say why
         untouched = used.plan.is_empty and chosen.stale_thinking_before == 0
         if untouched and rendered != reference:
             prepared.error = "round trip changed the request under an empty plan (a parse/render bug)"
-            return finish(prepared, started)
+            return finish(prepared, started, raw_body, edited_session)
 
         # An edited request keeps its thinking valid, or goes out unedited (plan/thinking.py).
         to_send: dict[str, Any] | None = None
@@ -155,10 +160,12 @@ async def prepare(
         # Whatever was decided before the failure: the client's own bytes and headers.
         prepared.outcome, prepared.body, prepared.betas = "fallback", raw_body, ()
         prepared.error = describe_failure(exc)
-    return finish(prepared, started)
+    return finish(prepared, started, raw_body, edited_session)
 
 
-def finish(prepared: Prepared, started: float) -> Prepared:
+def finish(prepared: Prepared, started: float, raw_body: bytes, edited_session: bool) -> Prepared:
+    if prepared.outcome == "fallback" and edited_session:
+        add_fallback_opt_in(prepared, raw_body)
     prepared.overhead_ms = round((time.perf_counter() - started) * 1000, 3)
     if prepared.outcome == "fallback":
         log.warning(
@@ -168,6 +175,26 @@ def finish(prepared: Prepared, started: float) -> Prepared:
             session_id=prepared.session_id,
         )
     return prepared
+
+
+def add_fallback_opt_in(prepared: Prepared, raw_body: bytes) -> None:
+    """Hard rule 1's one amendment (owner-approved; ADR 0012).
+
+    In a session Liber has already edited, the client's history can hold thinking produced against
+    Liber's rendering, which an enforced account rejects. The fallback still sends the client's
+    messages unchanged, but with the drop_block opt-in (plan/thinking.fallback_opt_in), so the API
+    drops such blocks instead of failing. Decoded afresh from the client's bytes: nothing Liber
+    did to its own copy can leak into it. If anything goes wrong here, the bytes go as they came.
+    """
+    try:
+        binding = thinking.fallback_opt_in(json.loads(raw_body))
+        if binding is None or binding.request is None:
+            return
+        prepared.body, prepared.betas = encode_request(binding.request), binding.betas
+        prepared.error = f"{prepared.error or 'validation failed'}; sent with the drop_block opt-in (edited session)"
+    except Exception as exc:
+        prepared.body, prepared.betas = raw_body, ()
+        log.warning("fallback_opt_in_failed", error=type(exc).__name__)
 
 
 def render_with_plan(

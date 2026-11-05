@@ -11,7 +11,9 @@ Before a compaction is applied, the user sees (`liber plan show`, later the dash
   stale from then on and left out (ADR 0012). That loss isn't priced; it's shown.
 
 Everything is an estimate from the items' token estimates (D9), not from the content, so it
-works from the database alone. Prices come from Settings.pricing (config.py), never from here.
+works from the database alone. Prices come from Settings.pricing (config.py), never from here;
+a model with a long-prompt tier is priced per request by its estimated message tokens (system
+and tools aren't counted, so a request just over the threshold may be priced at the lower rates).
 """
 
 import math
@@ -78,9 +80,11 @@ def estimate(
     one_time = saving = None
     payback = None
     if price is not None:
+        # Each request pays the rates for its size (some models charge more for long prompts).
+        rates_now, rates_after = price.rates_for(tokens_now), price.rates_for(tokens_after)
         # Reprocessed tokens would have been cache reads; now they are cache writes, once.
-        one_time = max(reprocessed, 0) * (price.cache_write - price.cache_read) / 1_000_000
-        saving = (tokens_now - tokens_after) * price.cache_read / 1_000_000
+        one_time = max(reprocessed, 0) * (rates_after.cache_write - rates_after.cache_read) / 1_000_000
+        saving = (tokens_now * rates_now.cache_read - tokens_after * rates_after.cache_read) / 1_000_000
         payback = math.ceil(one_time / saving) if saving > 0 else None
     return Estimate(
         minor=minor,

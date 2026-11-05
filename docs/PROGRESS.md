@@ -86,3 +86,10 @@ Template:
 - make check: pass (269 tests; Tier 1 values move the baseline: `token_reduction`)
 - Proposed follow-ups (owner decides): a dashboard or CLI view of `input_transformations` per session; summaries from the worker (Session 5) so compactions stop costing tokens on small exchanges.
 - Next step: owner reviews 4b, then Sessions 5 and 6.
+
+## 2026-11-05 — Pricing tiers; fallback opt-in in edited sessions (owner-approved rule 1 amendment)
+- Done: `claude-sonnet-5-5` price entry (cache read 0.10). `ModelPrice` gets an optional `long_prompt` tier (`above_tokens` + rates); Haiku 5.5 is 0.10/0.125/0.01 up to 100k tokens, 0.50/0.625/0.05 above; `cost.estimate` prices each request at the tier its estimated message tokens fall in. A fallback in a session Liber has already edited keeps the client's messages unchanged but adds the drop_block opt-in (beta + `thinking.block_binding`) when the model is confirmed, the client hasn't set `prefix_mismatch_behavior`, and the API accepts the field for its thinking setting (`pipeline.add_fallback_opt_in`, `thinking.fallback_opt_in`). CLAUDE.md rules 1 and 6 and ADR 0012's remaining-risk section updated.
+- Decisions: hard rule 1 amendment (owner). The opt-in is skipped where the API would reject the field (`between_tools`, older non-adaptive settings): adding it there would itself cause a 400.
+- Open issues: a failure before the conversation is identified (undecodable body, database too busy) can't know the session was edited, so it stays byte-for-byte. Tier thresholds compare message tokens only (system and tools aren't estimated).
+- make check: pass (278 tests). Reviewer skipped at the owner's request.
+- Next step: owner review; then Sessions 5 and 6.
