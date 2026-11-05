@@ -82,20 +82,28 @@ its own:
   edits are now sent. `prefix_stability` stays at 1.0, now over 43 minor compactions.
 - **Branches and idle time.** Forks of an edited session lose their completed-turn reasoning on
   each new turn. The idle break point measures from the deepest matched branch's last request.
-- **Remaining risk: the client's own request after an edit.** In each case below Liber sends the
-  client's request unedited (hard rule 1, or the client's choice). In a session Liber has
-  already edited, that request can carry thinking produced against Liber's rendering, which an
-  enforced account rejects with a 400:
-  - something in Liber fails;
-  - the client switches to `prefix_mismatch_behavior: "error"`;
+- **Fallbacks after an edit carry the opt-in** (owner-approved amendment to hard rule 1,
+  2026-11-05). A request that falls back because something in Liber failed, or because a render
+  failed the validator, keeps the client's messages unchanged. In a session Liber has already
+  edited, it gets the `drop_block` opt-in (beta merged into `anthropic-beta`,
+  `thinking.block_binding` added) under three conditions:
+  - the model is confirmed;
+  - the client hasn't set `prefix_mismatch_behavior` itself;
+  - the API accepts the field for its thinking setting.
+
+  Thinking produced against Liber's rendering is then dropped by the API (with every thinking
+  block after it) instead of failing the request. The session continues and loses that
+  reasoning. The opt-in is added from a fresh decode of the client's bytes, and if adding it
+  fails, the bytes go as they came (`pipeline.add_fallback_opt_in`).
+- **Remaining risk: the client's own request after an edit, without the opt-in.** In each case
+  below Liber sends the client's request as it came, and in a session Liber has already edited
+  it can carry thinking produced against Liber's rendering, which an enforced account rejects
+  with a 400:
+  - the client set `prefix_mismatch_behavior: "error"` (its choice);
   - the conversation moves to a model Liber hasn't confirmed;
-  - leaving out stale thinking would empty a message (a turn cut off while thinking), so no
-    version fits.
-- **Fallbacks after an edit, specifically.** A request that falls back because something in
-  Liber failed is sent byte-for-byte, as hard rule 1 requires. In a session Liber has edited,
-  that request can carry thinking produced against Liber's rendering, which an enforced account
-  rejects with a 400. Avoiding it would mean editing a request after Liber itself failed.
-  Fallbacks are rare (fallback rate 0 on the fixtures); revisit if they show up in
-  `liber_outcome = 'fallback'` rows for edited sessions.
+  - the thinking setting takes no other field (`"between_tools"`, or older models without
+    adaptive thinking);
+  - Liber fails before it knows the conversation (an undecodable body, or the database too busy
+    to identify it), so it can't tell the session was edited.
 - **Revisit when** the beta goes GA or changes name, or if the docs change what `drop_block`
   drops.

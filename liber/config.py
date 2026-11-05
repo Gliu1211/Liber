@@ -14,27 +14,50 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_WAL_CHECKPOINT_SECONDS = 1.0
 
 
-class ModelPrice(BaseModel):
-    """One model's input prices in US dollars per million tokens (plan/cost.py)."""
+class Rates(BaseModel):
+    """Input prices in US dollars per million tokens."""
 
     input: float
     cache_write: float  # 5-minute prompt cache
     cache_read: float
 
 
+class LongPromptRates(Rates):
+    above_tokens: int  # these rates apply to requests with more input tokens than this
+
+
+class ModelPrice(Rates):
+    """One model's prices (plan/cost.py). Some models charge more per token for long prompts."""
+
+    long_prompt: LongPromptRates | None = None
+
+    def rates_for(self, input_tokens: int) -> Rates:
+        """The rates a request with `input_tokens` input tokens is charged at."""
+        if self.long_prompt is not None and input_tokens > self.long_prompt.above_tokens:
+            return self.long_prompt
+        return self
+
+
 # §6: "pricing ratios come from a user-editable config table, not hard-coded claims". Input
-# prices are Anthropic's published ones as of 2026-11-04, as are the cache reads for Fable 5.x,
-# Opus 5.5 and Sonnet 5.5. The rest are derived from the usual ratios (cache write = 1.25 x input
-# for the 5-minute cache, cache read = 0.1 x input). Check the current price list; LIBER_PRICING
-# (JSON) replaces the whole table. Keys are model id prefixes; the longest matching one is used.
+# prices are Anthropic's published ones as of 2026-11-04, as are the cache reads for Fable 5.x
+# and Opus 5.5; Sonnet 5.5 and Haiku 5.5 (both tiers) are as given by the owner on 2026-11-05.
+# The rest are derived from the usual ratios (cache write = 1.25 x input for the 5-minute cache,
+# cache read = 0.1 x input). Check the current price list; LIBER_PRICING (JSON) replaces the
+# whole table. Keys are model id prefixes; the longest matching one is used.
 DEFAULT_PRICING = {
     "claude-fable-5": ModelPrice(input=10.0, cache_write=12.5, cache_read=0.25),
     "claude-opus-5-5": ModelPrice(input=4.0, cache_write=5.0, cache_read=0.20),
     "claude-opus-5": ModelPrice(input=5.0, cache_write=6.25, cache_read=0.50),
     "claude-opus-4": ModelPrice(input=5.0, cache_write=6.25, cache_read=0.50),
+    "claude-sonnet-5-5": ModelPrice(input=2.0, cache_write=2.5, cache_read=0.10),
     "claude-sonnet-5": ModelPrice(input=2.0, cache_write=2.5, cache_read=0.20),
     "claude-sonnet-4-6": ModelPrice(input=3.0, cache_write=3.75, cache_read=0.30),
-    "claude-haiku-5-5": ModelPrice(input=0.10, cache_write=0.125, cache_read=0.01),
+    "claude-haiku-5-5": ModelPrice(
+        input=0.10,
+        cache_write=0.125,
+        cache_read=0.01,
+        long_prompt=LongPromptRates(above_tokens=100_000, input=0.50, cache_write=0.625, cache_read=0.05),
+    ),
 }
 
 

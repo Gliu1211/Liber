@@ -480,3 +480,63 @@ def test_beta_merging_with_several_empty_and_differently_cased_headers() -> None
         b"anthropic-beta",
         b"b," + BINDING_BETA.encode(),
     )
+
+
+# --- Fallbacks in an edited session (hard rule 1 amendment) -------------------------------------
+
+
+async def edited_then_failing(store: Store, monkeypatch: pytest.MonkeyPatch, **request: Any) -> pipeline.Prepared:
+    """A session where version 1 took effect, then a request on which rendering fails."""
+    recent = RecentRequests()
+    await with_summary_requested(store, recent, conversation(2, **request))
+    await pipeline.prepare(store, body(conversation(2, **request)), recent)
+
+    def broken(*args: Any) -> Any:
+        raise RuntimeError("a bug in rendering")
+
+    monkeypatch.setattr(pipeline, "render", broken)
+    return await pipeline.prepare(store, body(conversation(3, **request)), recent)
+
+
+async def test_a_fallback_in_an_edited_session_adds_the_opt_in_to_the_clients_own_request(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = await edited_then_failing(store, monkeypatch)
+    sent = json.loads(prepared.body)
+
+    assert prepared.outcome == "fallback"
+    assert sent["messages"] == conversation(3)["messages"]  # the client's messages, thinking included
+    assert sent["thinking"] == {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+    assert prepared.betas == (BINDING_BETA,)
+    assert prepared.error is not None and "RuntimeError" in prepared.error and "opt-in" in prepared.error
+
+
+@pytest.mark.parametrize(
+    "request_settings",
+    [
+        {"thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}}},  # client's choice
+        {"model": "some-future-model"},  # not confirmed
+        {"model": "claude-sonnet-5-5", "thinking": {"type": "between_tools"}},  # takes no other field
+    ],
+)
+async def test_a_fallback_without_the_conditions_sends_the_bytes_as_they_came(
+    store: Store, monkeypatch: pytest.MonkeyPatch, request_settings: dict[str, Any]
+) -> None:
+    prepared = await edited_then_failing(store, monkeypatch, **request_settings)
+
+    assert prepared.outcome == "fallback" and prepared.betas == ()
+    assert prepared.body == body(conversation(3, **request_settings))
+
+
+async def test_a_fallback_in_a_session_never_edited_sends_the_bytes_as_they_came(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: Any) -> Any:
+        raise RuntimeError("a bug in rendering")
+
+    monkeypatch.setattr(pipeline, "render", broken)
+    raw = body(conversation(3))
+
+    prepared = await pipeline.prepare(store, raw, RecentRequests())
+
+    assert prepared.outcome == "fallback" and prepared.body is raw and prepared.betas == ()
