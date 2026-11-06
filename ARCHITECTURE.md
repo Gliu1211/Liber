@@ -210,7 +210,7 @@ A background asyncio task (same process in v1) that processes new items:
 - Bind to `127.0.0.1` only by default.
 - Never store or log credential headers.
 - Context often contains code and secrets: everything stays local; nothing is sent anywhere except the upstream provider the client already uses (and the summarizer model the user configures).
-- Recording request bodies is on by default for undo/evals and can be disabled; a `liber purge` command deletes stored data.
+- Recording request bodies is on by default for undo/evals and can be disabled with `LIBER_RECORD_BODIES=false`. That setting covers request/response bodies only: summaries, exact token counts, plan versions and offloaded blobs are always stored, because compaction needs them (owner, 2026-11-06, ADR 0013). A `liber purge` command deletes all stored data, all of these included.
 - Independently of recording, the running proxy keeps the latest decoded request of up to 8 recent conversations in memory (ADR 0007); nothing of it is written to disk.
 
 ---
