@@ -82,12 +82,16 @@ server-side fallback for refusals.
 ## Consequences
 - **Privacy.** With the worker on, every completed exchange is sent to the summary model on the
   configured upstream (§11 allows "the summarizer model the user configures") and its summary is
-  stored in `liber.db`, even with `LIBER_RECORD_BODIES=false`. Open question for the owner: should
-  body recording off also keep summaries out of the database (in memory only, so the CLI couldn't
-  use them)?
+  stored in `liber.db`, even with `LIBER_RECORD_BODIES=false`. **Owner decision (2026-11-06):
+  accepted.** Summaries are what make compaction possible, and the CLI runs in a separate process,
+  so they must be stored. `LIBER_RECORD_BODIES` covers request/response bodies only; the README
+  and ARCHITECTURE.md §11 say so, and `liber purge` must delete summaries, token counts, plan
+  versions and blobs too.
 - **Cost.** Every completed exchange of every session is summarized once, whether or not a plan
   ever uses it; long exchanges are cut to 4,000 characters per block and 60,000 per exchange.
-  Counting calls are free but rate-limited.
+  Counting calls are free but rate-limited. **Owner decision (2026-11-06): no call cap in v1.** A
+  summary call is a few thousand tokens on Haiku 5.5, so even a 200-exchange session costs cents,
+  once. A daily call cap is a later option if real use shows a need.
 - **Restart.** Waiting jobs are in memory only; after a restart a session's next request brings
   its history back.
 - **§13 layout.** `worker/` holds `client.py` (model interface, SDK client, retries), `tokens.py`,

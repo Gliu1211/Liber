@@ -102,3 +102,8 @@ Template:
 - make check: pass (323 tests; Tier 1 `token_reduction` 0.304 with fixture summaries, other metrics unchanged; the owner records `evals/baseline.json`)
 - Proposed follow-ups (owner decides): a one-off live check of the worker against the API with a real key (count_tokens with tool blocks, structured output on Haiku 5.5); a per-job call cap; whether `LIBER_RECORD_BODIES=false` should keep summaries out of the database; Tier 2's carry-forward ablation (§12).
 - Next step: owner reviews Session 5 and decides ADR 0013. Then Session 6 (dashboard).
+
+## 2026-11-06 — Owner decisions on Session 5; live check script
+- Decisions (ADR 0013, ARCHITECTURE.md §11): summaries, token counts, plan versions and blobs are stored even with `LIBER_RECORD_BODIES=false`, and `liber purge` must delete them all; no worker call cap in v1. ADR 0013's status itself is still Proposed.
+- Done: `liber/evals/live.py`, an owner-run live end-to-end check (`ANTHROPIC_API_KEY=... uv run python -m liber.evals.live`). It runs a six-turn thinking + tool conversation through a throwaway proxy, summarizes turns 1-4, applies the plan, sends two more turns, and checks: no 400s, no fallbacks, compaction sent, the API dropped no thinking (ADR 0012), context got smaller, worker wrote summaries, the planted fact survived. Decision logic tested offline (tests/test_live_check.py).
+- Open: the live check hasn't been run yet (no API key). Run it before Session 6.
