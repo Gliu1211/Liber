@@ -20,11 +20,14 @@ and tools aren't counted, so a request just over the threshold may be priced at 
 import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from liber.config import ModelPrice
 from liber.model.items import OperationKind, Plan
 from liber.plan.policy import is_minor
+
+if TYPE_CHECKING:  # only for type hints
+    from liber.cache.exchanges import Exchange
 
 POINTER_NOTE_TOKENS = 45  # about the size of an offload pointer note (plan/apply.py)
 
@@ -66,21 +69,27 @@ class CountedItem:
     tokens: int
 
 
-def with_exact_counts(items: Sequence[ItemFacts], exchanges: Sequence[Any], exact: dict[str, int]) -> list[ItemFacts]:
+def with_exact_counts(
+    items: Sequence[ItemFacts], exchanges: Sequence["Exchange[Any]"], exact: dict[str, int]
+) -> list[ItemFacts]:
     """`items`, with each exactly counted exchange's estimates scaled to its exact count.
 
-    `exchanges`: cache/exchanges.Exchange values; `exact`: their counts by key. Counts leave out
-    thinking (worker/tokens.py), so thinking items keep their estimates.
+    `exact`: counts by exchange key. Counts leave out thinking and mid-conversation system messages
+    (worker/tokens.py), so those items keep their estimates. The shares add up to the exact count.
     """
     corrected: dict[str, int] = {}
     for exchange in exchanges:
-        if exchange.key not in exact:
+        counted = [item for item in exchange.items if item.kind != "thinking" and item.role != "system"]
+        if exchange.key not in exact or not counted:
             continue
-        counted = [item for item in exchange.items if item.kind != "thinking"]
         estimated = sum(item.tokens for item in counted)
-        for item in counted:
+        remaining = exact[exchange.key]
+        for number, item in enumerate(counted):
             share = item.tokens / estimated if estimated else 1 / len(counted)
-            corrected[item.id] = round(exact[exchange.key] * share)
+            # The last item takes what's left, so rounding never changes the total.
+            tokens = remaining if number == len(counted) - 1 else min(round(exact[exchange.key] * share), remaining)
+            corrected[item.id] = tokens
+            remaining -= tokens
     return [
         CountedItem(item.id, item.kind, item.msg_index, corrected[item.id]) if item.id in corrected else item
         for item in items

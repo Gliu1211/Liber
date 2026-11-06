@@ -213,6 +213,8 @@ def summary_through(
     if last + 1 not in starts:
         raise PlanError(f"a summary must end just before a user message that starts an exchange; {last + 1} isn't one")
     in_range = [e for e in exchanges.completed_exchanges(items) if first <= e.first and e.last <= last]
+    if not in_range:
+        raise PlanError(f"messages {first}-{last} hold no completed exchange to summarize")
     written = exchanges.cached_summaries(db.connection(), [e.key for e in in_range], writer.summarizer)
     missing = [
         e for e in in_range if e.key not in written or (writer.carry_forward_reasoning and written[e.key].notes is None)
@@ -220,8 +222,11 @@ def summary_through(
     if missing:
         ranges = ", ".join(f"{e.first}-{e.last}" for e in missing)
         raise PlanError(
-            f"not ready: the summaries of messages {ranges} aren't written yet. The background worker "
-            "writes them while the proxy runs (it needs LIBER_WORKER_API_KEY); try again in a minute."
+            f"not ready: the summaries of messages {ranges} aren't written yet. The background worker writes "
+            "them while `liber serve` runs with LIBER_WORKER_API_KEY set, usually within a minute of the "
+            "session's last request. If this persists, the proxy's log says why (look for worker_off or "
+            "worker_gave_up); a summary the worker gave up on is tried again after the proxy restarts. "
+            "Meanwhile you can summarize through an earlier message, or offload or delete items instead."
         )
     chosen = [written[e.key] for e in in_range]
     if not writer.carry_forward_reasoning:

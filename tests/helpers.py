@@ -152,7 +152,7 @@ class FakeModel:
     """
 
     def __init__(self) -> None:
-        self.counts: list[tuple[str, list[dict[str, Any]]]] = []
+        self.counts: list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]] = []
         self.calls: list[dict[str, Any]] = []
         self.failures: list[Exception] = []
         self.reply: Callable[[dict[str, Any]], dict[str, Any]] | None = None
@@ -164,11 +164,11 @@ class FakeModel:
     def notes_calls(self) -> list[dict[str, Any]]:
         return [call for call in self.calls if "notes" in call["schema"]["properties"]]
 
-    async def count_tokens(self, model: str, messages: list[dict[str, Any]]) -> int:
-        self.counts.append((model, messages))
+    async def count_tokens(self, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
+        self.counts.append((model, messages, tools))
         if self.failures:
             raise self.failures.pop(0)
-        return len(json.dumps(messages)) // 4
+        return len(json.dumps(messages)) // 4 + len(json.dumps(tools)) // 4
 
     async def structured(
         self, model: str, system: str, prompt: str, schema: dict[str, Any], max_tokens: int

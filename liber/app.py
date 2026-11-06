@@ -140,13 +140,20 @@ async def proxy_messages(request: Request) -> Response:
 
 
 def create_worker(settings: Settings, store: Store, model_client: ModelClient | None) -> Worker | None:
-    """The §9 worker, or None (off) without LIBER_WORKER_API_KEY and without a test's fake client."""
-    if model_client is None:
-        if settings.worker_api_key is None:
-            log.info("worker_off", reason="LIBER_WORKER_API_KEY is not set")
-            return None
-        model_client = AnthropicModelClient(settings.worker_api_key.get_secret_value(), settings.upstream_base_url)
-    return Worker(store, model_client, settings.summary_model, settings.carry_forward_reasoning)
+    """The §9 worker, or None (off) without LIBER_WORKER_API_KEY and without a test's fake client.
+
+    The proxy starts either way: a worker that can't be built is logged and left off (hard rule 1).
+    """
+    try:
+        if model_client is None:
+            if settings.worker_api_key is None:
+                log.info("worker_off", reason="LIBER_WORKER_API_KEY is not set")
+                return None
+            model_client = AnthropicModelClient(settings.worker_api_key.get_secret_value(), settings.upstream_base_url)
+        return Worker(store, model_client, settings.summary_model, settings.carry_forward_reasoning)
+    except Exception as exc:
+        log.error("worker_off", reason=f"the worker could not start ({type(exc).__name__})")
+        return None
 
 
 async def proxy_other(request: Request) -> Response:

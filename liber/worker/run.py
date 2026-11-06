@@ -19,10 +19,14 @@ MAX_WAITING sessions wait; past that the oldest is dropped (its next request bri
 One task works through them in turn, so two requests holding the same exchange can't both
 summarize it: the second finds it in the cache.
 
-Retries (`with_retries`): a call the model can't take now (rate limits, overload, the network)
-is tried again after 1, 2, 4 s; if it still fails, the exchange is left for the session's next
-request. A call that can't succeed (a refusal, a reply of the wrong shape, a bad request) isn't
-tried again until the proxy restarts.
+Failures (`with_retries`, `attempt`):
+- a call the model can't take now (rate limits, overload, the network) is tried again after 1,
+  2, 4 s; if it still fails, the rest of the job is left for the session's next request, so an
+  outage costs one wait per job, not one per exchange;
+- a call that can't succeed for this exchange (a refusal, a reply of the wrong shape, a bad
+  request) isn't tried again for it until the proxy restarts;
+- a sign that no call can succeed (a wrong key, no permission, an unknown model) turns the worker
+  off until the proxy restarts, with one log line saying why.
 """
 
 import asyncio
@@ -41,12 +45,13 @@ from liber.model.anthropic import ParsedRequest
 from liber.model.items import ExchangeSummary, Item
 from liber.session.store import Store
 from liber.worker import summarize
-from liber.worker.client import ModelClient, ModelUnavailable, with_retries
+from liber.worker.client import ModelClient, ModelUnavailable, WorkerMisconfigured, with_retries
 from liber.worker.tokens import TokenCounter
 
 log = structlog.get_logger(__name__)
 
 MAX_WAITING = 32
+MAX_GAVE_UP = 100_000  # remembered failures; past this the memory is cleared (and they're tried again)
 
 T = TypeVar("T")
 
@@ -87,7 +92,8 @@ class Worker:
         self.counter = TokenCounter(client)
         self.waiting: dict[str, Job] = {}  # by session, oldest first
         self.wake = asyncio.Event()
-        self.gave_up: set[tuple[str, str]] = set()  # (what, exchange key) that can't succeed
+        self.gave_up: set[tuple[str, str, str]] = set()  # (what, exchange key, model) that can't succeed
+        self.disabled: str | None = None  # why no call can succeed, once that's known
 
     def submit(self, session_id: str, parsed: ParsedRequest) -> None:
         """Queue a request's history for the worker. For the request path: instant, never raises."""
@@ -119,10 +125,14 @@ class Worker:
 
     async def process(self, job: Job) -> None:
         """Count and summarize the job's completed exchanges that aren't in the cache yet."""
-        found = exchanges.completed_exchanges(job.items)
-        if not found:
+        if self.disabled is not None:
             return
-        keys = [exchange.key for exchange in found]
+        # Hashing a long history takes a while; not on the event loop, which serves requests.
+        found = await asyncio.to_thread(exchanges.completed_exchanges, job.items)
+        unique = list({exchange.key: exchange for exchange in found}.values())  # repeats: once
+        if not unique:
+            return
+        keys = [exchange.key for exchange in unique]
         model = job.model
 
         def read(db: Any) -> tuple[dict[str, int], dict[str, ExchangeSummary]]:
@@ -131,26 +141,44 @@ class Worker:
             return tokens, exchanges.cached_summaries(connection, keys, self.summarizer)
 
         known_tokens, known_summaries = await self.store.run(read)
-        for exchange in found:
-            if model and exchange.key not in known_tokens:
-                await self.attempt("count", exchange, partial(self.count, model, exchange))
-            summary = known_summaries.get(exchange.key)
-            if summary is None:
-                summary = await self.attempt("summary", exchange, partial(self.write_summary, exchange))
-            # Notes are a separate call, after the summary: the summary is the same with or without them.
-            if summary is not None and self.carry_forward_reasoning and summary.notes is None:
-                await self.attempt("notes", exchange, partial(self.write_notes, exchange, summary))
+        try:
+            for exchange in unique:
+                if model and exchange.key not in known_tokens:
+                    await self.attempt("count", exchange, model, partial(self.count, model, exchange))
+                summary = known_summaries.get(exchange.key)
+                if summary is None:
+                    summary = await self.attempt(
+                        "summary", exchange, self.summary_model, partial(self.write_summary, exchange)
+                    )
+                # Notes are a separate call, after the summary: the summary is the same with or without them.
+                if summary is not None and self.carry_forward_reasoning and summary.notes is None:
+                    await self.attempt(
+                        "notes", exchange, self.summary_model, partial(self.write_notes, exchange, summary)
+                    )
+        except ModelUnavailable as exc:
+            log.warning("worker_model_unavailable", reason=str(exc), session_id=job.session_id, left_for_later=True)
+        except WorkerMisconfigured as exc:
+            self.disabled = str(exc)
+            log.error("worker_off", reason=f"{exc}: check LIBER_WORKER_API_KEY and LIBER_SUMMARY_MODEL")
 
-    async def attempt(self, what: str, exchange: Exchange[Item], work: Callable[[], Awaitable[T]]) -> T | None:
-        """`work()`, or None if it failed (logged; never raised)."""
-        if (what, exchange.key) in self.gave_up:
+    async def attempt(
+        self, what: str, exchange: Exchange[Item], model: str, work: Callable[[], Awaitable[T]]
+    ) -> T | None:
+        """`work()`, or None if it can't succeed for this exchange (logged).
+
+        ModelUnavailable and WorkerMisconfigured go up: they're about the model, not this exchange.
+        """
+        failure = (what, exchange.key, model)
+        if failure in self.gave_up:
             return None
         try:
             return await work()
-        except ModelUnavailable as exc:
-            log.warning("worker_model_unavailable", what=what, reason=str(exc), exchange=exchange.key[:12])
+        except (ModelUnavailable, WorkerMisconfigured):
+            raise
         except Exception as exc:
-            self.gave_up.add((what, exchange.key))
+            if len(self.gave_up) >= MAX_GAVE_UP:
+                self.gave_up.clear()
+            self.gave_up.add(failure)
             log.warning("worker_gave_up", what=what, error=type(exc).__name__, exchange=exchange.key[:12])
         return None
 
@@ -188,6 +216,12 @@ async def running(worker: Worker | None) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        task.cancel()  # an unfinished summary is lost; the session's next request brings it back
+        # An unfinished summary is lost; the session's next request brings it back. A database
+        # write already handed to a thread finishes there before the store closes its connections.
+        task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        close = getattr(worker.client, "aclose", None)
+        if close is not None:
+            with suppress(Exception):
+                await close()

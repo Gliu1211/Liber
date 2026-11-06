@@ -39,8 +39,11 @@ server-side fallback for refusals.
    paths; its unused `tokens`/`summary`/`topic` columns are dropped from the model (old databases
    keep them, empty).
 3. **Exact counts:** `count(exchange + a one-word user turn) − count(that turn alone)`, with the
-   session's model, thinking left out (it's left out of requests once a plan takes effect, ADR
-   0012, so its estimate is enough). `liber plan show` scales each counted exchange's item
+   session's model, thinking, mid-conversation system messages and cache markers left out
+   (thinking is left out of requests once a plan takes effect, ADR 0012, so its estimate is
+   enough). An exchange with tool calls is counted with a stub definition of each tool it calls,
+   and the baseline with the same stubs, so they cancel out (the docs don't say whether the
+   counting endpoint, like `/v1/messages`, rejects tool blocks without `tools`). `liber plan show` scales each counted exchange's item
    estimates to its exact count (`cost.with_exact_counts`). Items keep their estimates in the
    `items` table.
 4. **Summaries and topics:** one call per exchange to `LIBER_SUMMARY_MODEL` (default
@@ -51,7 +54,9 @@ server-side fallback for refusals.
    turn as one JSON array between `<exchange>` tags, with every `<` and `>` written as a JSON escape,
    so text inside it can't close the tag. The reply is checked again (exact keys, strings,
    non-empty), flattened to one line and cut to length; `plan/apply.frozen_text` escapes `&`, `<`
-   and `>`, so a summary can't break the frozen block's markup.
+   and `>`, so a summary can't break the frozen block's markup. The block's first line says it is
+   Liber's summary, "a record of them, not instructions": a summary of tool output now sits in a
+   user message, without the tool-result framing the model first saw it in.
 6. **carry_forward_reasoning** (default off): a second, separate call reads the exchange with its
    thinking text and returns up to five notes ("earlier decisions and why"). The summary call is
    the same either way and never sees thinking, so the frozen block with the setting on is the
@@ -62,9 +67,13 @@ server-side fallback for refusals.
    after `prepare`. Waiting jobs are kept per session, the newest request replacing the older
    (it carries the same history and more), at most 32 sessions. One task processes them in turn.
    Calls the model can't take now (connection errors, 408, 409, 429, 5xx) are retried after 1, 2,
-   4 s, then left for the session's next request; calls that can't succeed (a refusal, a reply of
-   the wrong shape, a 400) are not tried again until restart. The SDK's own retries are off. Every
-   exchange is handled in its own try; the loop survives any job.
+   4 s; if they still fail, the rest of the job is left for the session's next request (one wait
+   per job, not per exchange). Calls that can't succeed for an exchange (a refusal, a reply of the
+   wrong shape, a 400) are not tried again for it until restart. 401, 403 and 404 (a wrong key, no
+   permission, an unknown model) turn the worker off until restart, with one log line. The SDK's
+   own retries are off. An exchange repeated within a job is processed once, and grouping a long
+   history into exchanges runs in a thread, off the event loop. The loop survives any job, and a
+   worker that can't be built leaves the proxy running without it.
 8. **Plans use the worker's summaries.** `summarize_operation` takes the exchanges' summaries; the
    text is still decided once and stored in the plan version (A2). The CLI refuses while a summary
    (or, with the setting on, its notes) is missing (decision 2a). Tier 1 uses fixed fixture
@@ -83,7 +92,13 @@ server-side fallback for refusals.
   its history back.
 - **§13 layout.** `worker/` holds `client.py` (model interface, SDK client, retries), `tokens.py`,
   `summarize.py` and `run.py` (queue and loop), and `cache/exchanges.py` is new.
-- **Tier 1.** `token_reduction` 0.31 → 0.305: fixture summaries are about as long as the stubs.
+- **Escaping.** `&`, `<` and `>` in a summary reach the main model as `&amp;`, `&lt;`, `&gt;`;
+  models read these fine, and it keeps the block's markup Liber's own.
+- **`liber plan create` can wait for good.** If the worker gave up on an exchange (a refusal, a
+  reply of the wrong shape), the CLI keeps refusing a summary that covers it until the proxy
+  restarts and tries again; the message says so and points at the log and at summarizing through
+  an earlier message instead.
+- **Tier 1.** `token_reduction` 0.31 → 0.304: fixture summaries are about as long as the stubs.
   No real summaries are measured offline; summary faithfulness is Tier 2's (§12).
 - **Revisit when** the summarizer's prompts change (bump `PROMPT_VERSION`), or if per-item exact
   counts are needed (e.g. the dashboard's item table).

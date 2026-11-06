@@ -23,9 +23,9 @@ from liber.plan import commands
 from liber.plan.apply import NOTES_HEADING, frozen_text
 from liber.session.store import Store
 from liber.worker import summarize
-from liber.worker.client import ModelReplyRejected, ModelUnavailable, with_retries
+from liber.worker.client import ModelReplyRejected, ModelUnavailable, WorkerMisconfigured, with_retries
 from liber.worker.run import Job, Retry, Worker
-from liber.worker.tokens import END_TURN, counted_messages
+from liber.worker.tokens import END_TURN, counted_messages, stub_tool
 from tests.helpers import FakeModel, FakeUpstream, recorded, summarize_now
 
 MODEL = "claude-opus-5-5"
@@ -86,7 +86,7 @@ async def test_the_worker_counts_and_summarizes_every_completed_exchange(store: 
     assert [(e.first, e.last) for e in found] == [(0, 1), (2, 3), (4, 5)]  # not message 6, the turn in progress
     assert set(await summaries_in(store, THREE_EXCHANGES)) == set(keys)
     assert set(counts) == set(keys)
-    assert all(m == MODEL for m, _ in model.counts)  # counted with the session's own model
+    assert all(m == MODEL for m, _, _ in model.counts)  # counted with the session's own model
     assert {call["model"] for call in model.calls} == {DEFAULT_SUMMARY_MODEL}  # summarized by the cheap one
 
 
@@ -122,8 +122,8 @@ async def test_token_counts_leave_out_thinking_and_end_on_a_user_turn(store: Sto
 
     await worker_for(store, model).process(job(request))
 
-    [(_, baseline), (_, counted)] = model.counts
-    assert baseline == [END_TURN]
+    [(_, baseline, no_tools), (_, counted, _)] = model.counts
+    assert baseline == [END_TURN] and no_tools == []
     assert counted == [*counted_messages(exchange), END_TURN]
     assert counted[:2] == [
         {"role": "user", "content": [{"type": "text", "text": "u0"}]},
@@ -144,17 +144,60 @@ async def test_unavailable_calls_are_retried_with_exponential_backoff(store: Sto
     assert len(await summaries_in(store, request)) == 1
 
 
-async def test_after_the_last_attempt_the_exchange_waits_for_the_next_request(store: Store) -> None:
+async def test_after_the_last_attempt_the_job_waits_for_the_next_request(store: Store) -> None:
     model = FakeModel()
     worker = worker_for(store, model, attempts=2)
-    request = conversation("u0", "a0", "u1")
-    model.failures = [ModelUnavailable("down")] * 4  # count: 2 attempts, summary: 2 attempts
+    model.failures = [ModelUnavailable("down")] * 2  # the first count, both attempts
 
-    await worker.process(job(request))
-    assert await summaries_in(store, request) == {}
+    await worker.process(job(THREE_EXCHANGES))
+    # An outage stops the whole job (one wait per job, not per exchange): nothing else was tried.
+    assert len(model.counts) == 2 and model.calls == []  # the first count, 2 attempts
+    assert await summaries_in(store, THREE_EXCHANGES) == {}
 
-    await worker.process(job(request))  # the session's next request: tried again, and it works
-    assert len(await summaries_in(store, request)) == 1
+    await worker.process(job(THREE_EXCHANGES))  # the session's next request: tried again, and it works
+    assert len(await summaries_in(store, THREE_EXCHANGES)) == 3
+
+
+async def test_a_wrong_key_or_model_turns_the_worker_off_until_restart(store: Store) -> None:
+    model = FakeModel()
+    worker = worker_for(store, model)
+    model.failures = [WorkerMisconfigured("HTTP 401")]
+
+    await worker.process(job(THREE_EXCHANGES))
+    await worker.process(job(THREE_EXCHANGES, session_id="s2"))
+
+    assert worker.disabled == "HTTP 401"
+    assert len(model.counts) == 1 and model.calls == []  # one failed call, then nothing
+
+
+async def test_an_exchange_repeated_in_one_request_is_summarized_once(store: Store) -> None:
+    model = FakeModel()
+    repeated = conversation("run the tests", "all pass", "run the tests", "all pass", "u2")
+
+    await worker_for(store, model).process(job(repeated))
+
+    assert len(model.summary_calls()) == 1
+
+
+async def test_a_tool_exchange_is_counted_with_stub_tools_on_both_sides(store: Store) -> None:
+    model = FakeModel()
+    call = {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"cmd": "ls"}}
+    result = {
+        "type": "tool_result",
+        "tool_use_id": "toolu_1",
+        "content": "a.py",
+        "cache_control": {"type": "ephemeral"},
+    }
+    request = conversation("list files", [call], [result], "a.py is there", "u1")
+
+    await worker_for(store, model).process(job(request))
+
+    [(_, baseline, baseline_tools), (_, counted, tools)] = model.counts
+    assert baseline == [END_TURN] and baseline_tools == tools == [stub_tool("bash")]
+    assert counted[2] == {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.py"}],
+    }
 
 
 async def test_a_reply_that_cant_succeed_is_not_tried_again(store: Store) -> None:
@@ -299,6 +342,23 @@ async def test_with_carry_forward_on_the_only_difference_is_the_labelled_notes_s
     assert lines_on[:heading] == lines_off[:-1] and lines_on[-1] == lines_off[-1] == "</liber:summary>"
     assert all(line.startswith("- decided ") for line in lines_on[heading + 1 : -1])
     assert len(lines_on[heading + 1 : -1]) == 2
+
+
+async def test_notes_written_with_the_setting_on_are_not_used_with_it_off(tmp_path: Path) -> None:
+    store = Store(tmp_path / "notes.db")
+    await store.create_tables()
+    try:
+        prepared = await pipeline.prepare(store, json.dumps(WITH_THINKING).encode())
+        assert prepared.session_id is not None and prepared.parsed is not None
+        await summarize_now(store, prepared.session_id, prepared.parsed, carry_forward=True)  # notes stored
+        await commands.create(store, prepared.session_id, summarize_through=3, carry_forward_reasoning=False)
+        state = await commands.versions.load_state(store, prepared.session_id)
+    finally:
+        await store.close()
+
+    assert state.pending is not None
+    [operation] = state.pending.plan.operations
+    assert NOTES_HEADING not in (operation.summary or "") and "decided" not in (operation.summary or "")
 
 
 async def test_no_notes_call_when_the_thinking_has_no_text(store: Store) -> None:

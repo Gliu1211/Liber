@@ -19,9 +19,8 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, TypeVar
 
-import httpx2
 import structlog
-from anthropic import APIConnectionError, APIStatusError, AsyncAnthropic
+from anthropic import APIConnectionError, APIStatusError, AsyncAnthropic, DefaultAsyncHttpxClient
 
 log = structlog.get_logger(__name__)
 
@@ -36,9 +35,13 @@ class ModelReplyRejected(Exception):
     """The model answered, but not with something Liber can use (a refusal, cut off, not JSON)."""
 
 
+class WorkerMisconfigured(Exception):
+    """No call can succeed: the key is wrong or lacks permission, or the model doesn't exist."""
+
+
 class ModelClient(Protocol):
-    async def count_tokens(self, model: str, messages: list[dict[str, Any]]) -> int:
-        """Input tokens of a request with these messages, for `model`'s tokenizer."""
+    async def count_tokens(self, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
+        """Input tokens of a request with these messages and tool definitions, for `model`'s tokenizer."""
         ...
 
     async def structured(
@@ -50,20 +53,30 @@ class ModelClient(Protocol):
 
 class AnthropicModelClient:
     def __init__(
-        self, api_key: str, base_url: str, timeout_seconds: float = 60.0, http_client: httpx2.AsyncClient | None = None
+        self,
+        api_key: str,
+        base_url: str,
+        timeout_seconds: float = 60.0,
+        http_client: DefaultAsyncHttpxClient | None = None,
     ) -> None:
         """`http_client`: tests pass one on a fake transport, so the real request shape is checked offline."""
         self.sdk = AsyncAnthropic(
             api_key=api_key, base_url=base_url, max_retries=0, timeout=timeout_seconds, http_client=http_client
         )
 
-    async def count_tokens(self, model: str, messages: list[dict[str, Any]]) -> int:
+    async def count_tokens(self, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
         try:
-            result = await self.sdk.messages.count_tokens(model=model, messages=messages)  # type: ignore[arg-type]
+            if tools:
+                result = await self.sdk.messages.count_tokens(model=model, messages=messages, tools=tools)  # type: ignore[arg-type]
+            else:
+                result = await self.sdk.messages.count_tokens(model=model, messages=messages)  # type: ignore[arg-type]
         except Exception as exc:
             raise_if_unavailable(exc)
             raise
         return result.input_tokens
+
+    async def aclose(self) -> None:
+        await self.sdk.close()
 
     async def structured(
         self, model: str, system: str, prompt: str, schema: dict[str, Any], max_tokens: int
@@ -97,11 +110,18 @@ class AnthropicModelClient:
 
 
 def raise_if_unavailable(exc: Exception) -> None:
-    """Retry what the SDK itself would retry: connection errors, 408, 409, 429 and 5xx."""
+    """Sort an SDK error: worth retrying (what the SDK itself would retry: connection errors, 408,
+    409, 429, 5xx), or a sign that no call will work (401, 403, 404). Anything else is raised as is.
+
+    Only the status code goes into the new error: the SDK's own message quotes the response.
+    """
     if isinstance(exc, APIConnectionError):  # includes timeouts
         raise ModelUnavailable(type(exc).__name__) from exc
-    if isinstance(exc, APIStatusError) and (exc.status_code in (408, 409, 429) or exc.status_code >= 500):
-        raise ModelUnavailable(f"HTTP {exc.status_code}") from exc
+    if isinstance(exc, APIStatusError):
+        if exc.status_code in (408, 409, 429) or exc.status_code >= 500:
+            raise ModelUnavailable(f"HTTP {exc.status_code}") from exc
+        if exc.status_code in (401, 403, 404):
+            raise WorkerMisconfigured(f"HTTP {exc.status_code}") from exc
 
 
 async def with_retries(

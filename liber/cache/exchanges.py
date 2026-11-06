@@ -56,13 +56,23 @@ class Exchange(Generic[ItemT]):
 
 
 def completed_exchanges(items: Iterable[ItemT]) -> list[Exchange[ItemT]]:
-    """The conversation's exchanges, oldest first, without the latest one (the turn in progress)."""
+    """The conversation's exchanges, oldest first, without the latest one (the turn in progress).
+
+    `items` in conversation order. One pass over them: sessions can have thousands of items.
+    """
     items = list(items)
     tool_results = {item.msg_index for item in items if item.kind == "tool_result"}
     starts = sorted({item.msg_index for item in items if item.role == "user"} - tool_results)
+    groups: list[list[ItemT]] = [[] for _ in starts]
+    position = -1  # the exchange the current item belongs to (-1: before the first)
+    for item in items:
+        while position + 1 < len(starts) and item.msg_index >= starts[position + 1]:
+            position += 1
+        if position >= 0:
+            groups[position].append(item)
     exchanges = []
-    for first, following in itertools.pairwise(starts):
-        covered = tuple(item for item in items if first <= item.msg_index < following)
+    for number, (first, following) in enumerate(itertools.pairwise(starts)):
+        covered = tuple(groups[number])
         exchanges.append(Exchange(first, following - 1, covered, exchange_key(covered, first)))
     return exchanges
 
