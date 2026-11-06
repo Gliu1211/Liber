@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from liber.cache import exchanges
 from liber.config import DEFAULT_PRICING, DEFAULT_SUMMARY_MODEL, ModelPrice
-from liber.model.items import ExchangeSummary, Operation, OperationKind
+from liber.model.items import ExchangeSummary, Operation, OperationKind, Plan
 from liber.plan import cost, versions
 from liber.plan.apply import summarize_operation
 from liber.plan.versions import PlanError
@@ -187,7 +187,35 @@ def create_now(
         operations.append(Operation(kind=OperationKind.DELETE, item_ids=delete))
     if not operations:
         raise PlanError("nothing to do: give --summarize-through, --offload or --delete")
+    refuse_unless_smaller(db, session_id, items, state, tuple(operations))
     return versions.create_version(connection, session_id, tuple(operations), now)
+
+
+def refuse_unless_smaller(
+    db: Session, session_id: str, items: list[ItemRecord], state: versions.PlanState, operations: tuple[Operation, ...]
+) -> None:
+    """Refuse a version whose requests wouldn't be smaller than what is sent now (owner, 2026-11-06).
+
+    Every compaction costs something once: the prompt cache restarts from the edit and older
+    reasoning is dropped (ADR 0012). One that doesn't shrink the request pays that and gains
+    nothing, e.g. a summary longer than the short exchanges it replaces, or a pointer note bigger
+    than the item it offloads. Uses the same estimate `liber plan show` prints, so the numbers
+    in the refusal match what show would say.
+    """
+    base = state.pending or state.applied  # a new version builds on the newest one
+    candidate = Plan(operations=base.plan.operations + operations)
+    model = latest_model(db, session_id)
+    done = exchanges.completed_exchanges(items)
+    exact = exchanges.cached_tokens(db.connection(), [e.key for e in done], model) if model else {}
+    counted = cost.with_exact_counts(items, done, exact)
+    # Compared with the applied version: that is what requests send today (a pending one isn't sent).
+    estimate = cost.estimate(counted, state.applied.plan, candidate, None, state.activated_at)
+    if estimate.tokens_after >= estimate.tokens_now:
+        raise PlanError(
+            f"this plan wouldn't make the conversation smaller (about {estimate.tokens_now:,} tokens per "
+            f"request now, {estimate.tokens_after:,} after), so it isn't worth the cache restart. "
+            "Summarize a longer range, or offload or delete larger items."
+        )
 
 
 @dataclass(frozen=True)
