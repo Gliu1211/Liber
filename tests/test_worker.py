@@ -449,11 +449,12 @@ async def test_the_app_runs_the_worker_in_the_background(settings: Settings, ups
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://liber.test") as client:
             response = await client.post("/v1/messages", content=body, headers={"content-type": "application/json"})
-        for _ in range(100):  # the worker runs on its own time; give it a moment
-            if len(model.summary_calls()) == 3:
+        stored: dict[str, ExchangeSummary] = {}
+        for _ in range(200):  # the worker runs on its own time; wait until its writes have landed
+            stored = await summaries_in(app.state.store, THREE_EXCHANGES)
+            if len(stored) == 3:
                 break
             await asyncio.sleep(0.01)
-        stored = await summaries_in(app.state.store, THREE_EXCHANGES)
 
     assert response.status_code == 200
     assert len(stored) == 3
