@@ -1,11 +1,8 @@
-"""The content-addressed cache: what Liber knows about a piece of content, by its hash (ARCHITECTURE.md §7).
-
-    content_hash -> {blob path, tokens, summary, topic}
+"""The content-addressed cache for offloaded originals: content hash -> blob path (ARCHITECTURE.md §7).
 
 Hashes never change, so an entry stays valid in every session that contains the same content.
-Session 4a fills in blob paths (offloaded items). Exact token counts, summaries and topics are
-the worker's (Session 5); an in-memory LRU layer in front of the table can come with it, once
-something reads entries on the request path.
+The worker's exact token counts, summaries and topics are kept per exchange, and per model,
+in cache/exchanges.py (docs/decisions/0013).
 """
 
 import asyncio
@@ -29,9 +26,6 @@ log = structlog.get_logger(__name__)
 class ContentEntry:
     content_hash: str
     blob_path: str | None
-    tokens: int | None
-    summary: str | None
-    topic: str | None
 
 
 def lookup(db: Connection, content_hash: str) -> ContentEntry | None:
@@ -40,7 +34,7 @@ def lookup(db: Connection, content_hash: str) -> ContentEntry | None:
     ).first()
     if row is None:
         return None
-    return ContentEntry(row.content_hash, row.blob_path, row.tokens, row.summary, row.topic)
+    return ContentEntry(row.content_hash, row.blob_path)
 
 
 def record_blob(db: Connection, content_hash: str, blob_path: str, now: datetime) -> None:

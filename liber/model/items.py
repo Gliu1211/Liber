@@ -77,6 +77,18 @@ class Operation(BaseModel):
     summary: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ExchangeSummary:
+    """What the worker wrote about one exchange (D10): its frozen-block entry is built from this."""
+
+    topic: str  # a few words naming what the exchange is about
+    summary: str  # plain text
+    # carry_forward_reasoning (ADR 0004 A5): earlier decisions and why, one per line, from the
+    # exchange's thinking text. None: not used (the setting is off) or not written yet; "": no
+    # thinking text to read.
+    notes: str | None = None
+
+
 class Plan(BaseModel):
     """An ordered list of operations for one session (§4).
 

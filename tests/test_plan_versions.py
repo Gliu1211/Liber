@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI
 
 from liber import pipeline
+from liber.evals.tier1 import fixture_summaries
 from liber.model.anthropic import RecentRequests, parse
 from liber.model.items import Operation, OperationKind
 from liber.plan import versions
@@ -48,7 +49,7 @@ TURNS = ["u0", "a0", "u1", "a1", "u2", "a2", "u3", "a3", "u4"]
 
 
 def summary_of_first_exchange(request: dict[str, Any]) -> Operation:
-    return summarize_operation(parse(request).items, first=0, last=1, block_number=1)
+    return summarize_operation(parse(request).items, first=0, last=1, block_number=1, summaries=fixture_summaries(1))
 
 
 async def start_session(store: Store, recent: RecentRequests) -> str:
@@ -135,7 +136,9 @@ async def test_undo_restores_the_previous_render_exactly(store: Store) -> None:
     session = await start_session(store, recent)
     final = chat(*TURNS)
     first_summary = summary_of_first_exchange(final)
-    second_summary = summarize_operation(parse(final).items, first=2, last=3, block_number=2)
+    second_summary = summarize_operation(
+        parse(final).items, first=2, last=3, block_number=2, summaries=fixture_summaries(1)
+    )
     await versions.create(store, session, (first_summary,))
     await versions.apply(store, session)
     with_v1 = await pipeline.prepare(store, body(final), recent)
@@ -211,7 +214,9 @@ async def test_a_pending_version_that_breaks_the_request_gives_way_to_the_applie
     await versions.create(store, session, (summary_of_first_exchange(final),))
     await versions.apply(store, session)
     await pipeline.prepare(store, body(chat(*TURNS[:7])), recent)  # v1 applied
-    await versions.create(store, session, (summarize_operation(parse(final).items, 2, 3, block_number=2),))
+    await versions.create(
+        store, session, (summarize_operation(parse(final).items, 2, 3, block_number=2, summaries=fixture_summaries(1)),)
+    )
     await versions.apply(store, session)
     real_render = pipeline.render
 

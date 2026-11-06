@@ -19,6 +19,7 @@ from fastapi import FastAPI
 
 from liber import pipeline
 from liber.config import DEFAULT_PRICING
+from liber.evals.tier1 import fixture_summaries
 from liber.model.anthropic import RecentRequests, parse, render
 from liber.model.items import Kind, Operation, OperationKind, Plan
 from liber.plan import commands, cost, versions
@@ -81,7 +82,7 @@ async def with_summary_requested(store: Store, recent: RecentRequests, final: di
     """A session that has seen `final` minus its last turn, with a summary of exchange 0 requested."""
     first = await pipeline.prepare(store, body({**final, "messages": final["messages"][:3]}), recent)
     assert first.session_id is not None
-    summary = summarize_operation(parse(final).items, first=0, last=1, block_number=1)
+    summary = summarize_operation(parse(final).items, first=0, last=1, block_number=1, summaries=fixture_summaries(1))
     await versions.create(store, first.session_id, (summary,))
     await versions.apply(store, first.session_id)
     return first.session_id
@@ -236,7 +237,9 @@ async def test_the_upstream_gets_the_merged_header_and_the_response_is_recorded(
     await client.post("/v1/messages", content=body({**request, "messages": request["messages"][:3]}), headers=headers)
     [first] = await recorded(app)
     assert first.session_id is not None
-    await versions.create(store, first.session_id, (summarize_operation(parse(request).items, 0, 1, 1),))
+    await versions.create(
+        store, first.session_id, (summarize_operation(parse(request).items, 0, 1, 1, summaries=fixture_summaries(1)),)
+    )
     await versions.apply(store, first.session_id)
     dropped = [{"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"}]
     message_start = {
@@ -286,7 +289,7 @@ async def test_a_pending_version_takes_effect_on_its_own_after_an_idle_period(st
     first = await pipeline.prepare(store, body({**request, "messages": request["messages"][:3]}), recent)
     assert first.session_id is not None
     await versions.create(
-        store, first.session_id, (summarize_operation(parse(request).items, 0, 1, 1),)
+        store, first.session_id, (summarize_operation(parse(request).items, 0, 1, 1, summaries=fixture_summaries(1)),)
     )  # not requested
 
     busy = await pipeline.prepare(store, body(request), recent)  # default: 5 minutes idle needed
@@ -301,7 +304,9 @@ async def test_the_threshold_is_recorded_and_applies_only_when_opted_in(store: S
     request = conversation(2)
     first = await pipeline.prepare(store, body({**request, "messages": request["messages"][:3]}), recent)
     assert first.session_id is not None
-    await versions.create(store, first.session_id, (summarize_operation(parse(request).items, 0, 1, 1),))
+    await versions.create(
+        store, first.session_id, (summarize_operation(parse(request).items, 0, 1, 1, summaries=fixture_summaries(1)),)
+    )
 
     flagged = await pipeline.prepare(store, body(request), recent, PlanPolicy(context_threshold=1e-9))
     applied = await pipeline.prepare(
@@ -318,8 +323,8 @@ async def test_the_threshold_is_recorded_and_applies_only_when_opted_in(store: S
 
 def test_versions_that_only_add_operations_are_minor() -> None:
     items = parse(conversation(4)).items
-    first = summarize_operation(items, 0, 1, 1)
-    second = summarize_operation(items, 2, 3, 2)
+    first = summarize_operation(items, 0, 1, 1, summaries=fixture_summaries(1))
+    second = summarize_operation(items, 2, 3, 2, summaries=fixture_summaries(1))
 
     assert is_minor(Plan(operations=(first,)), Plan(operations=(first, second)))
     assert not is_minor(Plan(operations=(first, second)), Plan(operations=(first,)))  # an undo
@@ -328,8 +333,8 @@ def test_versions_that_only_add_operations_are_minor() -> None:
 
 def test_cost_estimate_for_a_minor_compaction() -> None:
     items = parse(conversation(4)).items
-    first = summarize_operation(items, 0, 1, 1)
-    second = summarize_operation(items, 2, 3, 2)
+    first = summarize_operation(items, 0, 1, 1, summaries=fixture_summaries(1))
+    second = summarize_operation(items, 2, 3, 2, summaries=fixture_summaries(1))
     applied, pending = Plan(operations=(first,)), Plan(operations=(first, second))
 
     estimate = cost.estimate(items, applied, pending, DEFAULT_PRICING["claude-opus-5-5"])
@@ -457,7 +462,9 @@ def test_a_message_with_only_stale_thinking_makes_the_plan_not_fit() -> None:
 async def test_promoting_a_version_that_is_no_longer_pending_does_nothing(store: Store) -> None:
     recent = RecentRequests()
     session = await with_summary_requested(store, recent, conversation(2))
-    await versions.create(store, session, (summarize_operation(parse(conversation(4)).items, 2, 3, 2),))
+    await versions.create(
+        store, session, (summarize_operation(parse(conversation(4)).items, 2, 3, 2, summaries=fixture_summaries(1)),)
+    )
 
     await versions.promote_pending(store, session, 1, (5, "a" * 64))  # version 2 replaced it meanwhile
     state = await versions.load_state(store, session)

@@ -10,14 +10,17 @@ Tables so far:
   branches that share a prefix share its items.
 - `plan_versions`, `plans`: each session's edit plan as immutable versions, and which version
   is applied or pending (plan/versions.py).
-- `content_cache`: what Liber knows about a piece of content by its hash (§7, cache/content.py).
+- `content_cache`: where offloaded originals are kept, by content hash (§7, cache/content.py).
+- `exchange_tokens`, `exchange_summaries`: the background worker's exact token counts and
+  summaries, by exchange content (§9, cache/exchanges.py).
 
 Privacy (hard rule 2, §11): credential headers are never stored. Only the request headers in
 `RECORDED_REQUEST_HEADERS` are kept (an allowlist, so a new or unexpected header is never
 stored by accident). Bodies are stored only when `Settings.record_bodies` is on; the
 conversation tables hold hashes, positions and token counts, never content. Content the user
 chose to edit is the exception: an offloaded item's original goes to the blob store (it must
-be restorable), and a plan holds its summaries' text.
+be restorable), a plan holds its summaries' text, and the worker's summaries are kept per
+exchange (only when the worker is on, LIBER_WORKER_API_KEY).
 
 Tables are created with `create_all` at startup, and columns added since an older version are
 added in place (`add_missing_columns`). Alembic migrations come once the schema settles (§8).
@@ -218,15 +221,48 @@ class PlanStateRecord(Base):
 
 
 class ContentCacheRecord(Base):
-    """What Liber knows about a piece of content, by its hash (§7, cache/content.py)."""
+    """Where an offloaded original is kept, by its content hash (§7, cache/content.py).
+
+    (Databases from before Session 5 also have tokens/summary/topic columns here, never filled:
+    the worker's results depend on the model, so they live in the two tables below.)
+    """
 
     __tablename__ = "content_cache"
 
     content_hash: Mapped[str] = mapped_column(primary_key=True)
-    blob_path: Mapped[str | None] = mapped_column(Text)  # where an offloaded original is kept
-    tokens: Mapped[int | None]  # exact count, from the worker (Session 5)
-    summary: Mapped[str | None] = mapped_column(Text)  # from the worker (Session 5)
-    topic: Mapped[str | None]  # from the worker (Session 5)
+    blob_path: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ExchangeTokensRecord(Base):
+    """An exchange's exact token count from the counting endpoint (D9, cache/exchanges.py).
+
+    Counts depend on the model's tokenizer, so the key includes the model.
+    """
+
+    __tablename__ = "exchange_tokens"
+
+    exchange_key: Mapped[str] = mapped_column(primary_key=True)
+    model: Mapped[str] = mapped_column(primary_key=True)
+    tokens: Mapped[int]
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ExchangeSummaryRecord(Base):
+    """The worker's summary and topic of an exchange (D10, cache/exchanges.py).
+
+    `summarizer` names the model and prompt version that wrote it: a different summarizer writes
+    its own row. This is conversation content derived from the client's history, kept so a plan
+    can be made from another process (the CLI).
+    """
+
+    __tablename__ = "exchange_summaries"
+
+    exchange_key: Mapped[str] = mapped_column(primary_key=True)
+    summarizer: Mapped[str] = mapped_column(primary_key=True)
+    topic: Mapped[str] = mapped_column(Text)
+    summary: Mapped[str] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text)  # carry_forward_reasoning only (ADR 0004 A5)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

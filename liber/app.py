@@ -1,14 +1,15 @@
 """The FastAPI application: routes and lifespan (ARCHITECTURE.md §3, §13).
 
-Request path (Session 2: conversations are identified and checked; no edits yet):
+Request path:
 
     POST /v1/messages
       1. read the raw body                       (§3 step 1)
       2. pipeline.prepare(): parse, identify the conversation, render with the applied plan,
          validate, and choose the bytes to send  (§3 steps 2-5)
-      3. forward those bytes upstream            (§3 step 6)
-      4. relay the response chunk by chunk, while ReplyCapture watches a copy
-      5. when the body ends, record the exchange (§3 step 7) in a background task
+      3. hand the identified request to the background worker, without waiting (§9)
+      4. forward those bytes upstream            (§3 step 6)
+      5. relay the response chunk by chunk, while ReplyCapture watches a copy
+      6. when the body ends, record the exchange (§3 step 7) in a background task
 
     any other method/path
       forward and relay unchanged, no recording
@@ -46,30 +47,37 @@ from liber.proxy.forward import (
 )
 from liber.proxy.sse import CapturedReply, ReplyCapture
 from liber.session.store import RequestRecord, Store, checkpointing, recordable_headers
+from liber.worker.client import AnthropicModelClient, ModelClient
+from liber.worker.run import Worker, running
 
 log = structlog.get_logger(__name__)
 
 ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
 
-def create_app(settings: Settings | None = None, upstream_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
-    """Build the app. Tests pass `upstream_transport` to swap the real network for a fake."""
+def create_app(
+    settings: Settings | None = None,
+    upstream_transport: httpx.AsyncBaseTransport | None = None,
+    model_client: ModelClient | None = None,
+) -> FastAPI:
+    """Build the app. Tests pass `upstream_transport` and `model_client` to swap the network for fakes."""
     settings = settings or Settings()
     configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Startup: open the database and the shared upstream client, and start checkpointing
-        # the database in the background (requests never do it, docs/decisions/0008). (The
-        # background worker from §9 will also start here.)
+        # Startup: open the database and the shared upstream client, start checkpointing the
+        # database in the background (requests never do it, docs/decisions/0008), and start the
+        # background worker if it has a key (§9).
         # mode=0o700: the database holds conversation bodies, so only the owner may read it (§11).
         settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         store = Store(settings.db_path)
         await store.create_tables()
         app.state.store = store
         app.state.client = create_upstream_client(settings, upstream_transport)
+        app.state.worker = create_worker(settings, store, model_client)
         try:
-            async with checkpointing(store, settings.wal_checkpoint_seconds):
+            async with checkpointing(store, settings.wal_checkpoint_seconds), running(app.state.worker):
                 try:
                     yield
                 finally:
@@ -110,6 +118,8 @@ async def proxy_messages(request: Request) -> Response:
     record = start_record(request, body, prepared, settings.record_bodies)
     if prepared.offloaded:
         spawn_keep_originals(app, prepared)
+    if app.state.worker is not None and prepared.session_id and prepared.parsed is not None:
+        app.state.worker.submit(prepared.session_id, prepared.parsed)  # instant; never raises (§9)
 
     try:
         upstream = await open_upstream(app.state.client, request, prepared.body, prepared.betas)
@@ -127,6 +137,23 @@ async def proxy_messages(request: Request) -> Response:
         # Nothing has been sent to the client yet, so it can still get a clean error.
         await upstream.aclose()
         return forwarding_failed(app, record, exc, started)
+
+
+def create_worker(settings: Settings, store: Store, model_client: ModelClient | None) -> Worker | None:
+    """The §9 worker, or None (off) without LIBER_WORKER_API_KEY and without a test's fake client.
+
+    The proxy starts either way: a worker that can't be built is logged and left off (hard rule 1).
+    """
+    try:
+        if model_client is None:
+            if settings.worker_api_key is None:
+                log.info("worker_off", reason="LIBER_WORKER_API_KEY is not set")
+                return None
+            model_client = AnthropicModelClient(settings.worker_api_key.get_secret_value(), settings.upstream_base_url)
+        return Worker(store, model_client, settings.summary_model, settings.carry_forward_reasoning)
+    except Exception as exc:
+        log.error("worker_off", reason=f"the worker could not start ({type(exc).__name__})")
+        return None
 
 
 async def proxy_other(request: Request) -> Response:

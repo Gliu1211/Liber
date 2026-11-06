@@ -40,7 +40,7 @@ from liber.config import DEFAULT_WAL_CHECKPOINT_SECONDS
 from liber.evals.metrics import Metric, p95, ratio, write_results, write_trace
 from liber.evals.replay import ReplayedRequest, SessionFixture, load_sessions, replay
 from liber.model.anthropic import RecentRequests, parse, render
-from liber.model.items import Kind, Operation, OperationKind, Plan
+from liber.model.items import ExchangeSummary, Kind, Operation, OperationKind, Plan
 from liber.plan import versions
 from liber.plan.apply import exchange_starts, summarize_operation
 from liber.session.store import Store, checkpointing
@@ -122,6 +122,21 @@ class StandardPlan:
 LARGE_TOOL_RESULT_TOKENS = 200
 
 
+def fixture_summaries(count: int) -> tuple[ExchangeSummary, ...]:
+    """Stand-ins for the worker's summaries of `count` exchanges: fixed text, no model (Tier 1 is offline).
+
+    About the length of a real one (a sentence or two), so token_reduction stays representative.
+    """
+    return tuple(
+        ExchangeSummary(
+            topic=f"fixture exchange {number}",
+            summary="The user asked for a change; the assistant read the relevant files, made the edit "
+            "and ran the tests, which passed. Nothing is left open from this exchange.",
+        )
+        for number in range(1, count + 1)
+    )
+
+
 def standard_plan(session: SessionFixture) -> StandardPlan | None:
     """The standard plan for `session`, from its final request (item ids don't change as it grows).
 
@@ -131,7 +146,7 @@ def standard_plan(session: SessionFixture) -> StandardPlan | None:
     starts = exchange_starts(session.request["messages"])
     if len(starts) < 3:
         return None
-    first = [summarize_operation(items, 0, starts[1] - 1, block_number=1)]
+    first = [summarize_operation(items, 0, starts[1] - 1, block_number=1, summaries=fixture_summaries(1))]
     large = tuple(
         item.id
         for item in items
@@ -141,7 +156,7 @@ def standard_plan(session: SessionFixture) -> StandardPlan | None:
     )
     if large:
         first.append(Operation(kind=OperationKind.OFFLOAD, item_ids=large, note="large tool result"))
-    second = (summarize_operation(items, starts[1], starts[2] - 1, block_number=2),)
+    second = (summarize_operation(items, starts[1], starts[2] - 1, block_number=2, summaries=fixture_summaries(1)),)
     return StandardPlan(tuple(first), second)
 
 

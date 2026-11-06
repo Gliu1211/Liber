@@ -7,19 +7,26 @@ call them directly; liber/cli.py only parses arguments.
 Items are named by their ids, as `show` lists them. Summaries are given as "through message N":
 the range starts where the live region starts and must end just before a user message that
 starts a new exchange (§5); the request path checks the same rules again (plan/apply.py).
+
+A summary's text comes from the background worker's per-exchange summaries (§9,
+cache/exchanges.py). If one of the exchanges isn't summarized yet, `create` refuses and says so
+(owner decision, Session 5): a plan never gets a placeholder in place of a summary.
 """
 
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from liber.config import DEFAULT_PRICING, ModelPrice
-from liber.model.items import Operation, OperationKind
+from liber.cache import exchanges
+from liber.config import DEFAULT_PRICING, DEFAULT_SUMMARY_MODEL, ModelPrice
+from liber.model.items import ExchangeSummary, Operation, OperationKind
 from liber.plan import cost, versions
 from liber.plan.apply import summarize_operation
 from liber.plan.versions import PlanError
 from liber.session.store import BranchRecord, ChainNode, ItemRecord, RequestRecord, Store
+from liber.worker.summarize import summarizer_id
 
 
 def latest_branch_items(db: Session, session_id: str) -> list[ItemRecord]:
@@ -44,7 +51,12 @@ def latest_branch_items(db: Session, session_id: str) -> list[ItemRecord]:
     return list(items)
 
 
-async def show(store: Store, session_id: str | None = None, pricing: dict[str, ModelPrice] | None = None) -> str:
+async def show(
+    store: Store,
+    session_id: str | None = None,
+    pricing: dict[str, ModelPrice] | None = None,
+    summary_model: str = DEFAULT_SUMMARY_MODEL,
+) -> str:
     if session_id is None:
         sessions = await store.list_sessions()
         if not sessions:
@@ -62,7 +74,20 @@ async def show(store: Store, session_id: str | None = None, pricing: dict[str, M
     if not items:
         raise PlanError(f"no session {session_id}")
     state = await versions.load_state(store, session_id)
+    model = await store.run(lambda db: latest_model(db, session_id))
+    done = exchanges.completed_exchanges(items)
+    keys = [exchange.key for exchange in done]
+
+    def read(db: Session) -> tuple[dict[str, int], dict[str, ExchangeSummary]]:
+        exact = exchanges.cached_tokens(db.connection(), keys, model) if model else {}
+        return exact, exchanges.cached_summaries(db.connection(), keys, summarizer_id(summary_model))
+
+    exact, summaries = await store.run(read)
     lines = [f"Session {session_id}", f"  applied plan version: {state.applied.number}"]
+    lines.append(
+        f"  completed exchanges: {len(done)}; summarized: {sum(key in summaries for key in keys)}; "
+        f"exact token counts: {sum(key in exact for key in keys)}"
+    )
     if state.pending is not None:
         when = "at the next clean turn" if state.apply_requested else "not requested yet (liber plan apply)"
         lines.append(f"  pending plan version: {state.pending.number}, applies {when}")
@@ -71,10 +96,10 @@ async def show(store: Store, session_id: str | None = None, pricing: dict[str, M
             lines.append(f"  version {version.number} (built on {version.parent}):")
             lines += [f"    {op.kind} {len(op.item_ids)} item(s)" for op in version.plan.operations]
     if state.pending is not None:
-        model = await store.run(lambda db: latest_model(db, session_id))
         price = cost.price_for(model, pricing if pricing is not None else DEFAULT_PRICING)
-        estimate = cost.estimate(items, state.applied.plan, state.pending.plan, price, state.activated_at)
-        lines += describe_estimate(estimate)
+        counted = cost.with_exact_counts(items, done, exact)
+        estimate = cost.estimate(counted, state.applied.plan, state.pending.plan, price, state.activated_at)
+        lines += describe_estimate(estimate, exact_exchanges=sum(key in exact for key in keys))
     lines.append("  msg block role       kind         tokens  id")
     lines += [f"  {i.msg_index:>3} {i.block_index:>5} {i.role:10} {i.kind:12} {i.tokens:>6}  {i.id}" for i in items]
     return "\n".join(lines)
@@ -86,11 +111,14 @@ def latest_model(db: Session, session_id: str) -> str | None:
     return db.scalars(query).first()
 
 
-def describe_estimate(estimate: cost.Estimate) -> list[str]:
+def describe_estimate(estimate: cost.Estimate, exact_exchanges: int = 0) -> list[str]:
     """What applying the pending version costs and saves (§6), for `show`."""
     kind = "minor (appends after the frozen blocks)" if estimate.minor else "major (rewrites earlier history)"
+    source = (
+        f"exact counts for {exact_exchanges} exchange(s), estimates elsewhere" if exact_exchanges else "token estimates"
+    )
     lines = [
-        f"  applying the pending version: {kind} (estimates, from token estimates)",
+        f"  applying the pending version: {kind} (estimates, from {source})",
         f"    tokens per request: about {estimate.tokens_now:,} now, {estimate.tokens_after:,} after",
         f"    reprocessed once: about {estimate.reprocessed_tokens:,} tokens",
         f"    reasoning dropped: {estimate.dropped_thinking_blocks} thinking blocks "
@@ -114,6 +142,8 @@ async def create(
     offload: tuple[str, ...] = (),
     delete: tuple[str, ...] = (),
     note: str | None = None,
+    summary_model: str = DEFAULT_SUMMARY_MODEL,
+    carry_forward_reasoning: bool = False,
 ) -> str:
     """Make a new pending plan version: the newest version plus these edits.
 
@@ -121,8 +151,9 @@ async def create(
     version and number their summaries alike.
     """
     now = datetime.now(UTC)
+    writer = SummaryWriter(summarizer_id(summary_model), carry_forward_reasoning)
     version = await store.run(
-        lambda db: create_now(db, session_id, summarize_through, offload, delete, note, now), immediate=True
+        lambda db: create_now(db, session_id, summarize_through, offload, delete, note, now, writer), immediate=True
     )
     return f"Created plan version {version.number} (pending). To use it: liber plan apply --session {session_id}"
 
@@ -135,6 +166,7 @@ def create_now(
     delete: tuple[str, ...],
     note: str | None,
     now: datetime,
+    writer: "SummaryWriter",
 ) -> versions.PlanVersion:
     items = latest_branch_items(db, session_id)
     if not items:
@@ -148,7 +180,7 @@ def create_now(
     state = versions.read_state(connection, session_id)
     operations: list[Operation] = []
     if summarize_through is not None:
-        operations.append(summary_through(state, items, summarize_through))
+        operations.append(summary_through(db, state, items, summarize_through, writer))
     if offload:
         operations.append(Operation(kind=OperationKind.OFFLOAD, item_ids=offload, note=note))
     if delete:
@@ -158,7 +190,17 @@ def create_now(
     return versions.create_version(connection, session_id, tuple(operations), now)
 
 
-def summary_through(state: versions.PlanState, items: list[ItemRecord], last: int) -> Operation:
+@dataclass(frozen=True)
+class SummaryWriter:
+    """Which of the worker's summaries a new plan version uses."""
+
+    summarizer: str  # summarizer_id(summary model)
+    carry_forward_reasoning: bool  # include the notes (and wait for them)
+
+
+def summary_through(
+    db: Session, state: versions.PlanState, items: list[ItemRecord], last: int, writer: SummaryWriter
+) -> Operation:
     base = state.pending or state.applied
     by_id = {item.id: item for item in items}
     summaries = [op for op in base.plan.operations if op.kind is OperationKind.SUMMARIZE]
@@ -170,7 +212,26 @@ def summary_through(state: versions.PlanState, items: list[ItemRecord], last: in
         raise PlanError(f"messages up to {first - 1} are already summarized")
     if last + 1 not in starts:
         raise PlanError(f"a summary must end just before a user message that starts an exchange; {last + 1} isn't one")
-    return summarize_operation(items, first, last, block_number=len(summaries) + 1)
+    in_range = [e for e in exchanges.completed_exchanges(items) if first <= e.first and e.last <= last]
+    if not in_range:
+        raise PlanError(f"messages {first}-{last} hold no completed exchange to summarize")
+    written = exchanges.cached_summaries(db.connection(), [e.key for e in in_range], writer.summarizer)
+    missing = [
+        e for e in in_range if e.key not in written or (writer.carry_forward_reasoning and written[e.key].notes is None)
+    ]
+    if missing:
+        ranges = ", ".join(f"{e.first}-{e.last}" for e in missing)
+        raise PlanError(
+            f"not ready: the summaries of messages {ranges} aren't written yet. The background worker writes "
+            "them while `liber serve` runs with LIBER_WORKER_API_KEY set, usually within a minute of the "
+            "session's last request. If this persists, the proxy's log says why (look for worker_off or "
+            "worker_gave_up); a summary the worker gave up on is tried again after the proxy restarts. "
+            "Meanwhile you can summarize through an earlier message, or offload or delete items instead."
+        )
+    chosen = [written[e.key] for e in in_range]
+    if not writer.carry_forward_reasoning:
+        chosen = [replace(summary, notes=None) for summary in chosen]  # notes only with the setting on
+    return summarize_operation(items, first, last, block_number=len(summaries) + 1, summaries=chosen)
 
 
 async def apply(store: Store, session_id: str) -> str:

@@ -92,6 +92,12 @@ liber plan apply --session SESSION    # takes effect at the session's next new t
 liber plan undo --session SESSION     # back to the previous version, also at the next new turn
 ```
 
+Summaries are written ahead of time by Liber's background worker, which needs its own API key
+(`LIBER_WORKER_API_KEY`, [ADR 0013](docs/decisions/0013-background-worker.md)). It summarizes each
+completed exchange once with a cheap model and counts its tokens exactly. `liber plan show` says
+how many exchanges are summarized; `create --summarize-through` refuses until the ones it covers
+are.
+
 A plan takes effect only when a request starts a new turn, never in the middle of a tool loop:
 when you ask for it (`apply`, `undo`), or on its own once the conversation was idle longer than
 the prompt cache lasts (`LIBER_IDLE_APPLY_SECONDS`, §6). `liber plan show` estimates what applying
@@ -120,6 +126,9 @@ Settings are environment variables prefixed with `LIBER_` (see `liber/config.py`
 | `LIBER_CONTEXT_THRESHOLD` | `0.7` | Share of the model's context window at which a request is flagged (`requests.context_share`). |
 | `LIBER_THRESHOLD_AUTO_APPLY` | `false` | Also apply the pending plan version when the threshold is crossed. |
 | `LIBER_PRICING` | see `liber/config.py` | Prices per model for plan cost estimates (JSON: model prefix → `input`, `cache_write`, `cache_read` in $/MTok). Replaces the whole default table. |
+| `LIBER_WORKER_API_KEY` | unset | API key for the background worker (summaries, exact token counts). Unset: the worker is off and plans can't summarize. Never stored or logged. |
+| `LIBER_SUMMARY_MODEL` | `claude-haiku-5-5` | The model that writes summaries and topic labels. |
+| `LIBER_CARRY_FORWARD_REASONING` | `false` | Experiment (ADR 0004 A5): add "earlier decisions and why" notes, from the summarized turns' thinking text, to each summary. |
 | `LIBER_WAL_CHECKPOINT_SECONDS` | `1.0` | How often a background task copies SQLite's write-ahead log into `liber.db`. Requests never do it ([ADR 0008](docs/decisions/0008-wal-checkpoints-in-the-background.md)). |
 | `LIBER_LOG_LEVEL` | `INFO` | Log level. |
 
@@ -164,7 +173,7 @@ are recorded in [docs/decisions/](docs/decisions/).
 ## Privacy
 
 - Liber binds to `127.0.0.1` by default and sends nothing anywhere except the upstream API the
-  client already uses.
+  client already uses (the background worker, when it has a key, calls the same upstream).
 - Credential headers are forwarded but never written to the database or logs (tested).
 - Request and response bodies (your conversations, which may include code and secrets) are
   stored locally in `~/.liber/liber.db` unless `LIBER_RECORD_BODIES=false`. Liber creates
@@ -172,3 +181,5 @@ are recorded in [docs/decisions/](docs/decisions/).
   `liber purge` command is planned).
 - Content you choose to edit is kept locally even with body recording off: offloaded originals
   in `~/.liber/blobs/` (files mode 600) and summary text in the plan versions.
+- With `LIBER_WORKER_API_KEY` set, each completed exchange is sent to the summary model on the
+  same upstream, and its summary is kept in `liber.db` (also with body recording off).

@@ -7,11 +7,12 @@ upstream. Later sessions add the context-window threshold and the pricing table 
 
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Also used by the Tier 1 harness, which must not depend on the developer's LIBER_* variables.
 DEFAULT_WAL_CHECKPOINT_SECONDS = 1.0
+DEFAULT_SUMMARY_MODEL = "claude-haiku-5-5"
 
 
 class Rates(BaseModel):
@@ -105,6 +106,17 @@ class Settings(BaseSettings):
 
     # Prices for plan cost estimates (plan/cost.py); see DEFAULT_PRICING.
     pricing: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_PRICING))
+
+    # §9 background worker: exact token counts, summaries and topics (liber/worker/). It runs only
+    # with its own API key (LIBER_WORKER_API_KEY): client credentials are passed through and never
+    # kept (hard rule 2). Without it, plans can't summarize (the CLI says why) and token counts
+    # stay estimates. SecretStr: the key never shows in a repr or a log line.
+    worker_api_key: SecretStr | None = None
+    # The cheap model that writes summaries and topic labels (D10), on the same upstream.
+    summary_model: str = DEFAULT_SUMMARY_MODEL
+    # ADR 0004 A5 experiment: also read the summarized turns' thinking text and add a labelled
+    # "earlier decisions and why" section to the frozen block. Off unless Tier 2 shows it helps.
+    carry_forward_reasoning: bool = False
 
     log_level: str = "INFO"
 
