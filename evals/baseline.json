@@ -1,0 +1,61 @@
+{
+  "metrics": {
+    "fallback_rate": {
+      "description": "Share of requests the pipeline forwarded untouched because something failed.",
+      "direction": "lower",
+      "tolerance": 0.0,
+      "value": 0.0
+    },
+    "p95_overhead_ms": {
+      "description": "p95 of §3 steps 2-5 on the request path, in ms; median of 3 runs (budget 20 ms).",
+      "direction": "lower",
+      "tolerance": 15.457,
+      "value": 4.543
+    },
+    "prefix_stability": {
+      "description": "Share of requests rendered after a minor compaction (plan version 2) whose bytes up to the end of version 1's frozen blocks are unchanged (D5).",
+      "direction": "higher",
+      "tolerance": 0.0,
+      "value": 1.0
+    },
+    "render_determinism": {
+      "description": "Share of requests that render to identical bytes when rendered twice (ADR 0004 A2).",
+      "direction": "higher",
+      "tolerance": 0.0,
+      "value": 1.0
+    },
+    "round_trip_identity": {
+      "description": "Share of requests an empty plan reproduces exactly, key order included.",
+      "direction": "higher",
+      "tolerance": 0.0,
+      "value": 1.0
+    },
+    "token_reduction": {
+      "description": "1 - estimated input tokens actually sent / tokens the client sent, over all requests.",
+      "direction": "higher",
+      "tolerance": 0.02,
+      "value": 0.304192
+    },
+    "validity_rate": {
+      "description": "Share of requests whose rendering on the request path passes the validator (§5).",
+      "direction": "higher",
+      "tolerance": 0.0,
+      "value": 1.0
+    }
+  },
+  "summary": {
+    "max_overhead_ms": 29.854,
+    "minor_compactions_checked": 43,
+    "overhead_budget_ms": 20.0,
+    "plans": "standard plan per fixture session with at least 3 exchanges (docs/decisions/0010)",
+    "requests": 79,
+    "sessions": [
+      "branches_and_rewrites",
+      "chat_short",
+      "coding_tool_loops",
+      "long_agentic_101",
+      "media_and_redacted",
+      "system_messages"
+    ]
+  }
+}
