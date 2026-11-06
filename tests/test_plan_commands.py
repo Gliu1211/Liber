@@ -16,7 +16,11 @@ from liber.plan.versions import PlanError
 from liber.session.store import Store
 from tests.helpers import summarize_now
 
-TURNS = ["u0", "a0", "u1", "a1", "u2", "a2", "u3"]
+# Realistic message sizes: a plan must make requests smaller (owner, 2026-11-06), and a summary
+# is only shorter than exchanges with some text in them.
+FILLER = " - a sentence of ordinary conversation that a summary can say in far fewer words." * 6
+TURNS = [name + FILLER for name in ("u0", "a0", "u1", "a1", "u2", "a2", "u3")]
+SHORT_TURNS = ["u0", "a0", "u1", "a1", "u2", "a2", "u3"]  # one word each: no summary can be shorter
 
 
 def chat(*texts: str) -> bytes:
@@ -37,9 +41,11 @@ async def store(tmp_path: Path) -> AsyncIterator[Store]:
     await store.close()
 
 
-async def a_session(store: Store, summarized: bool = True, carry_forward: bool = False) -> str:
-    """A session of TURNS; with `summarized`, the worker has already summarized its exchanges."""
-    prepared = await pipeline.prepare(store, chat(*TURNS))
+async def a_session(
+    store: Store, summarized: bool = True, carry_forward: bool = False, turns: list[str] = TURNS
+) -> str:
+    """A session of `turns`; with `summarized`, the worker has already summarized its exchanges."""
+    prepared = await pipeline.prepare(store, chat(*turns))
     assert prepared.session_id is not None and prepared.parsed is not None
     if summarized:
         await summarize_now(store, prepared.session_id, prepared.parsed, carry_forward=carry_forward)
@@ -93,6 +99,26 @@ async def test_with_carry_forward_on_create_waits_for_the_notes_too(store: Store
     created = await commands.create(store, session, summarize_through=1)  # off: summaries are enough
 
     assert "version 1" in created
+
+
+async def test_create_refuses_a_plan_that_would_not_shrink_the_conversation(store: Store) -> None:
+    # One-word exchanges: the summary block, with its labels, is longer than what it replaces.
+    session = await a_session(store, turns=SHORT_TURNS)
+
+    with pytest.raises(
+        PlanError, match=r"wouldn't make the conversation smaller \(about \d+ tokens per request now, \d+ after\)"
+    ):
+        await commands.create(store, session, summarize_through=1)
+    assert (await versions.load_state(store, session)).pending is None  # nothing was created
+
+
+async def test_create_refuses_offloading_an_item_smaller_than_its_pointer_note(store: Store) -> None:
+    session = await a_session(store, turns=SHORT_TURNS)
+    detail = await commands.show(store, session)
+    tiny = detail.splitlines()[-1].split()[-1]  # the last item listed: message 6, "u3"
+
+    with pytest.raises(PlanError, match="wouldn't make the conversation smaller"):
+        await commands.create(store, session, offload=(tiny,))
 
 
 async def test_show_says_how_many_exchanges_are_summarized(store: Store) -> None:

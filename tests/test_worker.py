@@ -294,11 +294,13 @@ async def test_a_reply_of_the_wrong_shape_is_not_stored(store: Store, reply: dic
 # --- carry_forward_reasoning (ADR 0004 A5) ----------------------------------------------------------
 
 REASONING = "SECRET-REASONING: the cache bug is not in the parser, I ruled that out by testing it"
+# Visible text long enough that a summary is shorter (plans must shrink requests, owner 2026-11-06).
+DETAIL = " Details: the cache evicts its hottest keys first, so almost every lookup misses." * 6
 WITH_THINKING = conversation(
     "Why is the cache slow?",
-    [thinking(REASONING), {"type": "text", "text": "It's the eviction policy."}],
+    [thinking(REASONING), {"type": "text", "text": "It's the eviction policy." + DETAIL}],
     "u1",
-    [thinking("second exchange reasoning"), {"type": "text", "text": "a1"}],
+    [thinking("second exchange reasoning"), {"type": "text", "text": "a1" + DETAIL}],
     "u2",
 )
 

@@ -107,3 +107,9 @@ Template:
 - Decisions (ADR 0013, ARCHITECTURE.md §11): summaries, token counts, plan versions and blobs are stored even with `LIBER_RECORD_BODIES=false`, and `liber purge` must delete them all; no worker call cap in v1. ADR 0013's status itself is still Proposed.
 - Done: `liber/evals/live.py`, an owner-run live end-to-end check (`ANTHROPIC_API_KEY=... uv run python -m liber.evals.live`). It runs a six-turn thinking + tool conversation through a throwaway proxy, summarizes turns 1-4, applies the plan, sends two more turns, and checks: no 400s, no fallbacks, compaction sent, the API dropped no thinking (ADR 0012), context got smaller, worker wrote summaries, the planted fact survived. Decision logic tested offline (tests/test_live_check.py).
 - Open: the live check hasn't been run yet (no API key). Run it before Session 6.
+
+## 2026-11-06 — First live run; refuse plans that don't shrink requests
+- Live check (owner's machine, Sonnet 5.5): 6 of 7 passed: no 400s, no fallbacks, compaction sent, the API dropped no thinking (ADR 0012), worker summaries written, the planted fact survived. "Context got smaller" failed: the check compared different requests, and the tiny test conversation's summary was bigger than what it replaced.
+- Owner decision: `liber plan create` refuses a version whose requests wouldn't be smaller (ARCHITECTURE.md §6). Tests use realistic message sizes.
+- Live check now compares the same request with and without Liber (the API's token count of the client's request vs what Liber sent, cached tokens included) and summarizes a ~2,000-token tool result.
+- Next step: owner re-runs the live check, then Session 6.

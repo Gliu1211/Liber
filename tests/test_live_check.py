@@ -38,43 +38,55 @@ def _by_name(checks: list[Any]) -> dict[str, bool]:
 
 
 def test_a_healthy_run_passes_every_check() -> None:
-    checks = evaluate(_good_rows(), applied_at=3, needle_answer="It was BLUE HERON, due March 3.", worker_rows=4)
+    checks = evaluate(
+        _good_rows(), applied_at=3, needle_answer="It was BLUE HERON, due March 3.", worker_rows=4, original_tokens=1500
+    )
     assert all(c.ok for c in checks), [c for c in checks if not c.ok]
 
 
 def test_a_rejected_request_fails() -> None:
     rows = _good_rows()
     rows[3]["status_code"] = 400
-    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4))["no request rejected"] is False
+    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4, 1500))["no request rejected"] is False
 
 
 def test_thinking_dropped_by_the_api_fails_adr_0012() -> None:
     rows = _good_rows()
     rows[3]["input_transformations"] = json.dumps([{"type": "thinking_dropped", "path": "messages.1.content.0"}])
-    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4))["API dropped no thinking (ADR 0012)"] is False
+    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4, 1500))["API dropped no thinking (ADR 0012)"] is False
 
 
 def test_other_transformation_types_are_not_counted_as_drops() -> None:
     rows = _good_rows()
     rows[3]["input_transformations"] = json.dumps([{"type": "something_new"}])
-    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4))["API dropped no thinking (ADR 0012)"] is True
+    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4, 1500))["API dropped no thinking (ADR 0012)"] is True
 
 
 def test_no_rendered_request_fails_compaction_and_the_drop_check() -> None:
     rows = [_row() for _ in range(5)]
-    results = _by_name(evaluate(rows, 3, "blue heron march 3", 4))
+    results = _by_name(evaluate(rows, 3, "blue heron march 3", 4, 1500))
     assert results["compaction sent"] is False
     assert results["API dropped no thinking (ADR 0012)"] is False  # can't pass vacuously
 
 
-def test_a_bigger_context_after_compaction_fails() -> None:
+def test_context_is_compared_with_the_same_request_without_liber() -> None:
+    rows = _good_rows()  # the first compacted request sent 600 tokens
+    smaller = next(c for c in evaluate(rows, 3, "blue heron march 3", 4, 1500) if c.name == "context got smaller")
+    bigger = _by_name(evaluate(rows, 3, "blue heron march 3", 4, 500))["context got smaller"]
+    unknown = _by_name(evaluate(rows, 3, "blue heron march 3", 4, None))["context got smaller"]
+
+    assert smaller.ok and "1500 tokens without Liber, 600 with Liber (60% smaller)" in smaller.detail
+    assert bigger is False and unknown is False
+
+
+def test_cached_input_tokens_count_toward_the_request_size() -> None:
     rows = _good_rows()
-    rows[3]["input_tokens"] = 5000
-    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4))["context got smaller"] is False
+    rows[3].update(input_tokens=100, cache_read_input_tokens=1200, cache_creation_input_tokens=300)  # 1600 in all
+    assert _by_name(evaluate(rows, 3, "blue heron march 3", 4, 1500))["context got smaller"] is False
 
 
 def test_a_forgotten_needle_and_an_idle_worker_fail() -> None:
-    results = _by_name(evaluate(_good_rows(), 3, "I don't recall.", 0))
+    results = _by_name(evaluate(_good_rows(), 3, "I don't recall.", 0, 1500))
     assert results["summary kept the planted fact"] is False
     assert results["worker wrote summaries"] is False
 

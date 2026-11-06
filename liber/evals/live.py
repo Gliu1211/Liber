@@ -10,9 +10,10 @@ What it does, with a throwaway data directory so your real ~/.liber is untouched
 1. Starts `liber serve` on a spare port, with the background worker on (same key).
 2. Holds a six-turn conversation through it with adaptive thinking: one turn uses a tool, some
    turns stream, and turn 1 plants a fact ("the needle") for later.
-3. Waits for the worker's summaries, then `liber plan create --summarize-through` (turns 1-4) and
-   `liber plan apply`.
-4. Sends two more turns. The first asks for the needle.
+3. Waits for the worker's summaries, then `liber plan create --summarize-through` (turns 1-4,
+   including a ~2,000-token tool result) and `liber plan apply`.
+4. Sends two more turns. The first asks for the needle; before sending it, the API counts that
+   same request as the client sent it, so "context got smaller" compares like with like.
 5. Reads Liber's own records and reports PASS/FAIL per check (see `evaluate`).
 
 The decision logic (`summary_end`, `evaluate`) is plain functions, tested offline in
@@ -39,9 +40,9 @@ NEEDLE_PROMPT = (
 NEEDLE_WORDS = ("blue heron", "march 3")
 PROMPTS = [
     NEEDLE_PROMPT,
-    "What's the weather in Paris? Use the get_weather tool.",  # tool turn: tests tool pairing
-    "Give me three name ideas for a coffee shop, one line each.",
-    "In two sentences, what is a hash chain?",
+    "What's the weather in Paris over the next three days? Use the get_weather tool.",  # tool turn: tool pairing
+    "Give me five name ideas for a coffee shop, each with a two-sentence pitch.",
+    "In about 150 words, explain what a hash chain is and where git uses one.",
     "Write a one-line Python function that reverses a string.",
     "Briefly: what is 17 * 23?",
 ]
@@ -58,6 +59,25 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
     }
 ]
+
+
+def forecast() -> str:
+    """A long tool result (~2,000 tokens), like the logs and file contents real sessions carry.
+
+    Compaction only pays off when there is something sizeable to summarize; a one-line tool result
+    would be shorter than its summary, and Liber now refuses such plans (owner, 2026-11-06).
+    """
+    hours = [
+        {
+            "time": f"day {day} {hour:02d}:00",
+            "temp_c": 12 + (hour % 9),
+            "rain_mm": round((hour * 7 % 5) / 4, 2),
+            "wind_kmh": 8 + hour % 13,
+        }
+        for day in (1, 2, 3)
+        for hour in range(24)
+    ]
+    return json.dumps({"city": "Paris", "hourly": hours})
 
 
 def summary_end(messages: list[dict[str, Any]], turn_starts: list[int], through_turn: int) -> int:
@@ -80,13 +100,16 @@ class Check:
     detail: str
 
 
-def evaluate(rows: list[dict[str, Any]], applied_at: int, needle_answer: str, worker_rows: int) -> list[Check]:
+def evaluate(
+    rows: list[dict[str, Any]], applied_at: int, needle_answer: str, worker_rows: int, original_tokens: int | None
+) -> list[Check]:
     """Turn Liber's request records into PASS/FAIL checks.
 
     rows: the session's /v1/messages records in order; applied_at: index of the first row sent
-    after `liber plan apply`.
+    after `liber plan apply`; original_tokens: the API's token count for that first request as
+    the client sent it, i.e. without Liber (the same request, so the comparison is fair).
     """
-    before, after = rows[:applied_at], rows[applied_at:]
+    after = rows[applied_at:]
     rendered = [r for r in after if r["liber_outcome"] == "rendered" and r["plan_version"] is not None]
     checks = [
         Check(
@@ -116,14 +139,25 @@ def evaluate(rows: list[dict[str, Any]], applied_at: int, needle_answer: str, wo
             else f"dropped on {len(dropped)} request(s): Liber's stripping missed something",
         )
     )
-    last_before = before[-1]["input_tokens"] if before else None
-    first_after = rendered[0]["input_tokens"] if rendered else None
-    smaller = last_before is not None and first_after is not None and first_after < last_before
-    checks.append(Check("context got smaller", smaller, f"input tokens {last_before} -> {first_after}"))
+    sent = total_input(rendered[0]) if rendered else None
+    detail = f"same request: {original_tokens} tokens without Liber, {sent} with Liber"
+    smaller = False
+    if original_tokens and sent is not None:
+        smaller = sent < original_tokens
+        detail += f" ({1 - sent / original_tokens:.0%} smaller)" if smaller else ""
+    checks.append(Check("context got smaller", smaller, detail))
     checks.append(Check("worker wrote summaries", worker_rows > 0, f"{worker_rows} summary row(s)"))
     kept = all(word in needle_answer.lower() for word in NEEDLE_WORDS)
     checks.append(Check("summary kept the planted fact", kept, needle_answer.strip()[:160]))
     return checks
+
+
+def total_input(row: dict[str, Any]) -> int | None:
+    """All input tokens of a request: usage's input_tokens leaves out cached ones."""
+    if row["input_tokens"] is None:
+        return None
+    cached = int(row.get("cache_read_input_tokens") or 0) + int(row.get("cache_creation_input_tokens") or 0)
+    return int(row["input_tokens"]) + cached
 
 
 def _thinking_dropped(raw: str | None) -> bool:
@@ -170,7 +204,7 @@ def _turn(client: Any, model: str, messages: list[dict[str, Any]], prompt: str, 
         if reply.stop_reason != "tool_use":
             return "".join(b.text for b in reply.content if b.type == "text")
         results = [
-            {"type": "tool_result", "tool_use_id": b.id, "content": "Sunny, 18 C"}
+            {"type": "tool_result", "tool_use_id": b.id, "content": forecast()}
             for b in reply.content
             if b.type == "tool_use"
         ]
@@ -224,6 +258,15 @@ def main() -> int:
         print(f"  {_liber(data_dir, 'plan', 'apply', '--session', session)}")
         applied_at = db.execute("SELECT COUNT(*) FROM requests WHERE session_id = ?", (session,)).fetchone()[0]
 
+        # What the first compacted request would have cost without Liber: the same request, counted
+        # by the API directly (not through the proxy).
+        direct: Any = anthropic.Anthropic(api_key=key)  # Any: the SDK's typed params, like `client` above
+        original = direct.messages.count_tokens(
+            model=args.model,
+            thinking={"type": "adaptive"},
+            tools=TOOLS,
+            messages=[*messages, {"role": "user", "content": AFTER_PROMPTS[0]}],
+        ).input_tokens
         needle_answer = _turn(client, args.model, messages, AFTER_PROMPTS[0], stream=True)
         _turn(client, args.model, messages, AFTER_PROMPTS[1], stream=False)
 
@@ -231,12 +274,13 @@ def main() -> int:
             dict(r)
             for r in db.execute(
                 "SELECT status_code, liber_outcome, liber_error, plan_version, edit_skipped, input_tokens,"
-                " input_transformations FROM requests WHERE session_id = ? ORDER BY id",
+                " cache_read_input_tokens, cache_creation_input_tokens, input_transformations"
+                " FROM requests WHERE session_id = ? ORDER BY id",
                 (session,),
             )
         ]
         worker_rows = db.execute("SELECT COUNT(*) FROM exchange_summaries").fetchone()[0]
-        checks = evaluate(rows, applied_at, needle_answer, worker_rows)
+        checks = evaluate(rows, applied_at, needle_answer, worker_rows, original)
     finally:
         proxy.terminate()
         proxy.wait(timeout=10)
