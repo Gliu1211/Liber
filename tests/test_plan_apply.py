@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from liber.evals.tier1 import fixture_summaries
 from liber.model.anthropic import ParsedRequest, parse, render
 from liber.model.items import Kind, Operation, OperationKind, Plan
 from liber.model.validate import validate
@@ -71,7 +72,7 @@ def rendered_with(request: dict[str, Any], *operations: Operation) -> dict[str, 
 
 def test_a_summary_becomes_a_frozen_block_in_the_first_live_user_message() -> None:
     parsed = parse(SIX_TURNS)
-    summary = summarize_operation(parsed.items, first=0, last=1, block_number=1)
+    summary = summarize_operation(parsed.items, first=0, last=1, block_number=1, summaries=fixture_summaries(1))
 
     result = rendered_with(SIX_TURNS, summary)
 
@@ -87,8 +88,8 @@ def test_appending_a_frozen_block_keeps_everything_before_it_byte_identical() ->
     # D5: a minor compaction appends; the system prompt, tools and earlier frozen blocks keep
     # their exact bytes, so the provider's prefix cache still hits up to there.
     parsed = parse(SIX_TURNS)
-    first = summarize_operation(parsed.items, first=0, last=1, block_number=1)
-    second = summarize_operation(parsed.items, first=2, last=3, block_number=2)
+    first = summarize_operation(parsed.items, first=0, last=1, block_number=1, summaries=fixture_summaries(1))
+    second = summarize_operation(parsed.items, first=2, last=3, block_number=2, summaries=fixture_summaries(1))
 
     before = encode_request(rendered_with(SIX_TURNS, first))
     after = encode_request(rendered_with(SIX_TURNS, first, second))
@@ -106,7 +107,9 @@ def test_an_empty_message_at_the_start_belongs_to_the_summary() -> None:
     request["messages"].insert(0, {"role": "system", "content": []})
     parsed = parse(request)
 
-    result = rendered_with(request, summarize_operation(parsed.items, first=0, last=2, block_number=1))
+    result = rendered_with(
+        request, summarize_operation(parsed.items, first=0, last=2, block_number=1, summaries=fixture_summaries(1))
+    )
 
     assert [m["role"] for m in result["messages"]] == ["user", "assistant", "user"]
     assert 'covers="msgs 0-2"' in result["messages"][0]["content"][0]["text"]
@@ -116,7 +119,14 @@ def test_a_summary_must_start_where_the_live_region_starts() -> None:
     parsed = parse(SIX_TURNS)
 
     with pytest.raises(PlanNotApplicable, match="start"):
-        render(parsed, Plan(operations=(summarize_operation(parsed.items, first=2, last=3, block_number=1),)))
+        render(
+            parsed,
+            Plan(
+                operations=(
+                    summarize_operation(parsed.items, first=2, last=3, block_number=1, summaries=fixture_summaries(1)),
+                )
+            ),
+        )
 
 
 def test_a_summary_must_end_just_before_a_new_exchange() -> None:
@@ -125,7 +135,16 @@ def test_a_summary_must_end_just_before_a_new_exchange() -> None:
     parsed = parse(SIX_TURNS)
     for last in (2, 6):
         with pytest.raises(PlanNotApplicable, match="exchange"):
-            render(parsed, Plan(operations=(summarize_operation(parsed.items, first=0, last=last, block_number=1),)))
+            render(
+                parsed,
+                Plan(
+                    operations=(
+                        summarize_operation(
+                            parsed.items, first=0, last=last, block_number=1, summaries=fixture_summaries(1)
+                        ),
+                    )
+                ),
+            )
 
 
 def test_a_summary_of_tool_loops_with_thinking_drops_that_thinking_from_the_front() -> None:
@@ -133,7 +152,10 @@ def test_a_summary_of_tool_loops_with_thinking_drops_that_thinking_from_the_fron
     parsed = parse(request)
     starts = exchange_starts(request["messages"])
 
-    result = rendered_with(request, summarize_operation(parsed.items, first=0, last=starts[1] - 1, block_number=1))
+    result = rendered_with(
+        request,
+        summarize_operation(parsed.items, first=0, last=starts[1] - 1, block_number=1, summaries=fixture_summaries(1)),
+    )
 
     assert len(result["messages"]) == len(request["messages"]) - starts[1]
     assert result["messages"][0]["content"][1]["text"].startswith("Task 1:")
@@ -277,7 +299,7 @@ def test_a_plan_about_messages_this_request_does_not_have_does_not_apply() -> No
 
 def test_operations_inside_a_summarized_range_are_superseded() -> None:
     parsed = parse(SIX_TURNS)
-    summary = summarize_operation(parsed.items, first=0, last=1, block_number=1)
+    summary = summarize_operation(parsed.items, first=0, last=1, block_number=1, summaries=fixture_summaries(1))
     offload_in_range = Operation(kind=OperationKind.OFFLOAD, item_ids=tuple(ids_in(parsed, message=1)))
 
     with_offload = rendered_with(SIX_TURNS, offload_in_range, summary)

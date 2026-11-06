@@ -14,6 +14,7 @@ from liber.model.anthropic import RecentRequests
 from liber.plan import commands, versions
 from liber.plan.versions import PlanError
 from liber.session.store import Store
+from tests.helpers import summarize_now
 
 TURNS = ["u0", "a0", "u1", "a1", "u2", "a2", "u3"]
 
@@ -36,9 +37,12 @@ async def store(tmp_path: Path) -> AsyncIterator[Store]:
     await store.close()
 
 
-async def a_session(store: Store) -> str:
+async def a_session(store: Store, summarized: bool = True, carry_forward: bool = False) -> str:
+    """A session of TURNS; with `summarized`, the worker has already summarized its exchanges."""
     prepared = await pipeline.prepare(store, chat(*TURNS))
-    assert prepared.session_id is not None
+    assert prepared.session_id is not None and prepared.parsed is not None
+    if summarized:
+        await summarize_now(store, prepared.session_id, prepared.parsed, carry_forward=carry_forward)
     return prepared.session_id
 
 
@@ -68,7 +72,36 @@ async def test_create_apply_and_undo_from_the_command_line(store: Store) -> None
     assert state.pending is not None
     [_, next_summary] = state.pending.plan.operations
     assert 'covers="msgs 2-3"' in (next_summary.summary or "") and 'block="2"' in (next_summary.summary or "")
+    assert "- topic " in (next_summary.summary or "") and "summary " in (next_summary.summary or "")  # the worker's
     assert "version 0" in await commands.undo(store, session)
+
+
+async def test_create_refuses_a_summary_the_worker_has_not_written_yet(store: Store) -> None:
+    session = await a_session(store, summarized=False)
+
+    with pytest.raises(PlanError, match=r"not ready: the summaries of messages 0-1 aren't written yet"):
+        await commands.create(store, session, summarize_through=1)
+    # Nothing was created: no placeholder text in place of a summary (owner decision, Session 5).
+    assert (await versions.load_state(store, session)).pending is None
+
+
+async def test_with_carry_forward_on_create_waits_for_the_notes_too(store: Store) -> None:
+    session = await a_session(store, carry_forward=False)  # summaries written, notes not
+
+    with pytest.raises(PlanError, match="not ready"):
+        await commands.create(store, session, summarize_through=1, carry_forward_reasoning=True)
+    created = await commands.create(store, session, summarize_through=1)  # off: summaries are enough
+
+    assert "version 1" in created
+
+
+async def test_show_says_how_many_exchanges_are_summarized(store: Store) -> None:
+    unsummarized = await commands.show(store, await a_session(store, summarized=False))
+    summarized = await commands.show(store, await a_session(store))
+
+    # Exact counts need the session's recorded model, which only requests through the app have.
+    assert "completed exchanges: 3; summarized: 0; exact token counts: 0" in unsummarized
+    assert "completed exchanges: 3; summarized: 3" in summarized
 
 
 async def test_create_refuses_what_the_request_path_would_refuse(store: Store) -> None:

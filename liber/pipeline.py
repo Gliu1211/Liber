@@ -72,6 +72,7 @@ class Prepared:
     offloaded: list[Item] = field(default_factory=list)  # items whose originals go to the blob store
     betas: tuple[str, ...] = ()  # beta values to merge into the anthropic-beta header (edited requests)
     context_share: float | None = None  # estimated share of the model's context window (§6)
+    parsed: ParsedRequest | None = None  # the client's request as items, for the background worker (§9)
 
 
 async def prepare(
@@ -99,6 +100,7 @@ async def prepare(
         # interleave here.
         previous = recent.find(request) if recent is not None else None
         parsed = parse(request, previous)
+        prepared.parsed = parsed
         if recent is not None:
             recent.remember(parsed, replacing=previous)
         identity = await identify(store, parsed)

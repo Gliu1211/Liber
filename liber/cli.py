@@ -90,10 +90,17 @@ def run_plan_command(args: argparse.Namespace, settings: Settings) -> int:
         try:
             await store.create_tables()  # a database from before plans existed lacks their tables
             if args.plan_command == "show":
-                return await commands.show(store, args.session, settings.pricing)
+                return await commands.show(store, args.session, settings.pricing, settings.summary_model)
             if args.plan_command == "create":
                 return await commands.create(
-                    store, args.session, args.summarize_through, tuple(args.offload), tuple(args.delete), args.note
+                    store,
+                    args.session,
+                    args.summarize_through,
+                    tuple(args.offload),
+                    tuple(args.delete),
+                    args.note,
+                    summary_model=settings.summary_model,
+                    carry_forward_reasoning=settings.carry_forward_reasoning,
                 )
             if args.plan_command == "apply":
                 return await commands.apply(store, args.session)

@@ -20,13 +20,15 @@ catch (§5); the pipeline then forwards the client's request.
 
 Two promises (ADR 0007, ADR 0004 A2): the client's objects are never edited (changed messages
 and blocks are new dicts), and the same history with the same plan renders to the same bytes.
-Summary texts are fixed in the plan itself, so rendering never computes them.
+Summary texts are fixed in the plan itself, so rendering never computes them; they are built
+from the worker's per-exchange summaries when the version is created (`frozen_text`).
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from html import escape
 from typing import TYPE_CHECKING, Any, Protocol
 
-from liber.model.items import Item, Kind, Operation, OperationKind, Plan
+from liber.model.items import ExchangeSummary, Item, Kind, Operation, OperationKind, Plan
 from liber.model.validate import tool_results_in
 
 if TYPE_CHECKING:  # only for type hints; anthropic.py imports this module
@@ -51,9 +53,6 @@ class ItemFacts(Protocol):
     @property
     def msg_index(self) -> int: ...
 
-    @property
-    def tokens(self) -> int: ...
-
 
 def exchange_starts(messages: list[Any]) -> list[int]:
     """Indexes of the user messages that start an exchange (§5): the ones without tool results."""
@@ -64,20 +63,41 @@ def exchange_starts(messages: list[Any]) -> list[int]:
     ]
 
 
-def summarize_operation(items: Iterable[ItemFacts], first: int, last: int, block_number: int) -> Operation:
+def summarize_operation(
+    items: Iterable[ItemFacts], first: int, last: int, block_number: int, summaries: Sequence[ExchangeSummary]
+) -> Operation:
     """An operation summarizing messages first..last, with its frozen block's text.
 
-    The text is a stub until summaries are written by the worker (Session 5). It is decided here,
-    once, and stored with the plan version, so every request renders the same bytes for it.
+    `summaries`: the worker's summary of each exchange in the range, oldest first. The text is
+    decided here, once, and stored with the plan version, so every request renders the same
+    bytes for it (ADR 0004 A2).
     """
     covered = [item for item in items if first <= item.msg_index <= last]
-    tokens = sum(item.tokens for item in covered)
-    text = (
-        f'<liber:summary block="{block_number}" covers="msgs {first}-{last}">'
-        f"[{last - first + 1} earlier messages (about {tokens:,} tokens) were compacted by Liber. "
-        "No written summary is available yet.]</liber:summary>"
-    )
+    text = frozen_text(block_number, first, last, summaries)
     return Operation(kind=OperationKind.SUMMARIZE, item_ids=tuple(item.id for item in covered), summary=text)
+
+
+NOTES_HEADING = "Earlier decisions and why (from the assistant's reasoning at the time):"
+
+
+def frozen_text(block_number: int, first: int, last: int, summaries: Sequence[ExchangeSummary]) -> str:
+    """A frozen block's text: one line per exchange, then the carry-forward notes if there are any.
+
+    The notes section is the only part that depends on carry_forward_reasoning (ADR 0004 A5): with
+    no notes the text is exactly what it is with the setting off. The worker's text is escaped,
+    so nothing in a summary can close the block's tag.
+    """
+    lines = [f'<liber:summary block="{block_number}" covers="msgs {first}-{last}">']
+    lines.append("Earlier messages of this conversation were replaced by this summary:")
+    lines += [
+        f"- {escape(summary.topic, quote=False)}: {escape(summary.summary, quote=False)}" for summary in summaries
+    ]
+    notes = [note for summary in summaries for note in (summary.notes or "").splitlines() if note.strip()]
+    if notes:
+        lines.append(NOTES_HEADING)
+        lines += [f"- {escape(note, quote=False)}" for note in notes]
+    lines.append("</liber:summary>")
+    return "\n".join(lines)
 
 
 def pointer_note(item: Item, label: str) -> str:

@@ -5,6 +5,7 @@ proxy's httpx client through `httpx.MockTransport`, so no request ever leaves th
 """
 
 import asyncio
+import hashlib
 import json
 import socket
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -17,7 +18,10 @@ import uvicorn
 from fastapi import FastAPI
 
 from liber.app import wait_for_pending_writes
-from liber.session.store import RequestRecord
+from liber.config import DEFAULT_SUMMARY_MODEL
+from liber.model.anthropic import ParsedRequest
+from liber.session.store import RequestRecord, Store
+from liber.worker.run import Worker
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -137,3 +141,56 @@ async def running_server(app: FastAPI) -> AsyncIterator[str]:
         server.should_exit = True
         await task
         sock.close()
+
+
+class FakeModel:
+    """Stands in for the worker's model (worker/client.ModelClient); nothing leaves the process.
+
+    Token counts are a quarter of the JSON length. Summaries are made from a hash of the prompt,
+    so the same exchange always gets the same one. `failures` are raised, in order, before any
+    answer; `reply` replaces the structured answer. Every call is kept for the test to inspect.
+    """
+
+    def __init__(self) -> None:
+        self.counts: list[tuple[str, list[dict[str, Any]]]] = []
+        self.calls: list[dict[str, Any]] = []
+        self.failures: list[Exception] = []
+        self.reply: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        self.slept: list[float] = []  # retry delays, when a test's worker records them here
+
+    def summary_calls(self) -> list[dict[str, Any]]:
+        return [call for call in self.calls if "summary" in call["schema"]["properties"]]
+
+    def notes_calls(self) -> list[dict[str, Any]]:
+        return [call for call in self.calls if "notes" in call["schema"]["properties"]]
+
+    async def count_tokens(self, model: str, messages: list[dict[str, Any]]) -> int:
+        self.counts.append((model, messages))
+        if self.failures:
+            raise self.failures.pop(0)
+        return len(json.dumps(messages)) // 4
+
+    async def structured(
+        self, model: str, system: str, prompt: str, schema: dict[str, Any], max_tokens: int
+    ) -> dict[str, Any]:
+        call = {"model": model, "system": system, "prompt": prompt, "schema": schema, "max_tokens": max_tokens}
+        self.calls.append(call)
+        if self.failures:
+            raise self.failures.pop(0)
+        if self.reply is not None:
+            return self.reply(call)
+        digest = hashlib.sha256(prompt.encode()).hexdigest()[:8]
+        if "notes" in schema["properties"]:
+            return {"notes": [f"decided {digest} because of the reasoning"]}
+        return {"topic": f"topic {digest}", "summary": f"summary {digest}"}
+
+
+async def summarize_now(
+    store: Store, session_id: str, parsed: ParsedRequest, carry_forward: bool = False, model: FakeModel | None = None
+) -> FakeModel:
+    """Run the worker over one request's history right away, as it would in the background."""
+    model = model or FakeModel()
+    worker = Worker(store, model, DEFAULT_SUMMARY_MODEL, carry_forward_reasoning=carry_forward)
+    worker.submit(session_id, parsed)
+    await worker.process(worker.waiting.pop(session_id))
+    return model

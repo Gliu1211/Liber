@@ -11,15 +11,16 @@ Before a compaction is applied, the user sees (`liber plan show`, later the dash
   stale from then on and left out (ADR 0012). That loss isn't priced; it's shown.
 
 Everything is an estimate from the items' token estimates (D9), not from the content, so it
-works from the database alone. Prices come from Settings.pricing (config.py), never from here;
+works from the database alone. Where the worker has an exchange's exact count, its items' estimates
+are scaled to match it (`with_exact_counts`). Prices come from Settings.pricing (config.py), never from here;
 a model with a long-prompt tier is priced per request by its estimated message tokens (system
 and tools aren't counted, so a request just over the threshold may be priced at the lower rates).
 """
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from liber.config import ModelPrice
 from liber.model.items import OperationKind, Plan
@@ -53,6 +54,37 @@ class Estimate:
     one_time_cost: float | None  # dollars; None without a price for the model
     saving_per_turn: float | None
     payback_turns: int | None  # None: no price, or it never pays back
+
+
+@dataclass(frozen=True)
+class CountedItem:
+    """An item's facts with its token count corrected by its exchange's exact count."""
+
+    id: str
+    kind: str
+    msg_index: int
+    tokens: int
+
+
+def with_exact_counts(items: Sequence[ItemFacts], exchanges: Sequence[Any], exact: dict[str, int]) -> list[ItemFacts]:
+    """`items`, with each exactly counted exchange's estimates scaled to its exact count.
+
+    `exchanges`: cache/exchanges.Exchange values; `exact`: their counts by key. Counts leave out
+    thinking (worker/tokens.py), so thinking items keep their estimates.
+    """
+    corrected: dict[str, int] = {}
+    for exchange in exchanges:
+        if exchange.key not in exact:
+            continue
+        counted = [item for item in exchange.items if item.kind != "thinking"]
+        estimated = sum(item.tokens for item in counted)
+        for item in counted:
+            share = item.tokens / estimated if estimated else 1 / len(counted)
+            corrected[item.id] = round(exact[exchange.key] * share)
+    return [
+        CountedItem(item.id, item.kind, item.msg_index, corrected[item.id]) if item.id in corrected else item
+        for item in items
+    ]
 
 
 def price_for(model: str | None, pricing: dict[str, ModelPrice]) -> ModelPrice | None:
