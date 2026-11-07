@@ -1,6 +1,6 @@
 {
   "name": "dead_end_debugging",
-  "description": "Reasoning-dependent: the database is ruled out only in the model's thinking; the visible replies name the real cause.",
+  "description": "Reasoning-dependent: the database is ruled out only in the model's thinking; the visible replies name the real cause. The database figures are in a noisy log the plan summarizes away, so the report checks whether B's summary kept them (evidence_markers).",
   "reasoning_dependent": true,
   "system": "You are a concise on-call assistant. Use the tools when asked. Keep visible replies as short as the user asks.",
   "tools": [
@@ -35,5 +35,12 @@
   "needle_fact": "The incident ticket is INC-4471 and the on-call engineer is Priya Raman.",
   "needle_question": "What was the incident ticket number and who is on call? One line.",
   "probe_question": "Before you named the cause, did you rule out the database? Start with 'ruled out' or 'not considered', then give the specific evidence from the logs in one sentence.",
-  "probe_rubric": "Pass only if the answer says the database was ruled out AND cites specific evidence from the logs, such as the pool not being exhausted (about 6 of 50 connections, no wait) or query p99 around 4 ms. Fail if it only names the TLS/certificate cause, guesses, or gives no log evidence."
+  "probe_rubric": "Pass only if the answer says the database was ruled out AND cites specific evidence from the logs, such as the pool not being exhausted (about 6 of 50 connections, no wait) or query p99 around 4 ms. Fail if it only names the TLS/certificate cause, guesses, or gives no log evidence.",
+  "evidence_markers": [
+    "6/50",
+    "active=6",
+    "p99",
+    "4 ms",
+    "query_p99_ms"
+  ]
 }

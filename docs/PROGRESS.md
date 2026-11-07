@@ -46,7 +46,7 @@ Template:
 - Decisions: [ADR 0006](decisions/0006-tier1-metric-definitions.md): metric definitions; p95 tolerance = budget − value (may be negative) so the gate enforces the absolute 10 ms budget on any machine; p95 = median of 3 runs; cross-process determinism checked by running the CLI under two hash seeds.
 - Stubbed / provisional: `token_reduction` is 0 and `prefix_stability` a 1.0 placeholder until Session 4. No `evals/baseline.json` yet: the gate only warns until the owner records it (owner-only, its own PR).
 - Open issues: p95 ≈ 6–8 ms locally vs the 10 ms budget (thin margin; cost scales with request size); SQLite's automatic WAL checkpoint occasionally lands on a request (10–28 ms; `summary.max_overhead_ms`). Both are in a queued follow-up task (incremental request path + background checkpoints).
-- make check: pass (379 tests; Tier 1 unchanged, eval gate passed)
+- make check: pass
 - Next step: owner records the Tier 1 baseline in its own PR. Then Session 4 (plans, frozen blocks, break points), which must extend the harness with standard plans so `token_reduction` and `prefix_stability` become real, and keep every Tier 1 metric green.
 
 ## 2026-11-02 — Request path: hash only new messages; WAL checkpoints in the background
@@ -61,7 +61,7 @@ Template:
 ## 2026-11-04 — Owner decision: request-path ADRs 0007 and 0008
 - Done: [ADR 0007](decisions/0007-reuse-previous-request-in-parse.md) and [ADR 0008](decisions/0008-wal-checkpoints-in-the-background.md) accepted as written. PR #4 had been merged into `feat/session-3-tier1-evals` after PR #3 was merged into `main`, so its commits never reached `main`; this branch merges `main` back in and carries them there.
 - Decisions: Session 4's `plan/apply.py` must build new blocks and never edit the client's blocks in place (ADR 0007 requirement).
-- make check: pass (379 tests; Tier 1 unchanged, eval gate passed)
+- make check: pass
 - Next step: merge this PR into `main`. Then the follow-ups (full-GC pauses on the request path; identify()'s fixed cost) or Session 4.
 
 ## 2026-11-04 — Session 4a: edit plans, frozen blocks, blob store, CLI (Session 4 split: 4a/4b)
@@ -154,12 +154,20 @@ Template:
   - The report: mean and spread, the comparisons A vs B, C vs B, B/C vs D, and trends; files in `evals/history/<date>.json` and `.md`.
   - Tasks in `evals/tier2_tasks/`: `dead_end_debugging` (reasoning-dependent: the database is ruled out only in the thinking) and `migration_facts`.
 - Decisions: [ADR 0015](decisions/0015-tier2-quality-evals.md) (Proposed). Shared history per repeat; Liber in-process because the proxy sends a client's `"error"` request unedited (ADR 0012); a B or C request Liber didn't compact is recorded as an error, not passed off as A.
-- Tests (offline): the fake API enforces binding like the real one (signature = hash of the prior history; `"error"` → 400 by path). End to end on the real `dead_end_debugging` fixture gives A pass, B fail, C pass, D fail, and needle kept in A/B/C only. Breaking Liber's stale-thinking removal on purpose makes B report the failing path. The report's comparisons, spread, history files and trends are checked on a fixed dataset.
+- Tests (offline; they check plumbing, not quality):
+  - The fake API enforces binding (its signature = hash of the prior history; `"error"` → 400 by path) and returns thinking text only with `display: "summarized"`.
+  - End to end on both fixtures. On `dead_end_debugging`, the rigged answers come out A pass, B fail, C pass, D fail, with the needle kept in A/B/C only.
+  - Breaking Liber's stale-thinking removal on purpose makes B report the failing path, counted as a fail.
+  - The real HTTP client is tested on a mock transport (exact bytes, beta header, retries, non-JSON, network errors), as are the judge's failure paths, the turn errors, and the `--live`/CI/key/repeats refusals.
+  - The report's comparisons, spread, verdict counts, errored runs, history files and trends are checked on a fixed dataset.
+- Review: independent reviewer run; no hard-rule violations. All findings fixed:
+  - must-fix: the reasoning task's evidence was also visible (now `evidence_markers`, with the report showing when B's summary kept it); thinking text omitted by default (now `display: "summarized"`, with an error when none comes back); binding breaks left out of success rates (now fails); one transient error lost the whole run (now retries, per-repeat errors, saving after each repeat); judge thinking could truncate the verdict (now thinking off, and cut-offs are `None`); my PROGRESS edit had rewritten two older entries (reverted).
+  - should-fix: D's compaction call now in input tokens, averaged over complete runs only; reasoning-dependent averages split from the rest; cut-off replies and endless tool loops are errors; CI guard; tests for the HTTP client and judge; `tier2_api.py` split out; trends per task.
 - Open issues:
   - Not yet run live.
   - Cost is input side only (no output prices in the table); B/C's worker calls aren't metered.
   - The reasoning task assumes the model reasons about the database in its thinking and returns thinking text.
   - `input_transformations` and the binding error format are as assumed in live.py; check on the first live run.
-- make check: pass (379 tests; Tier 1 unchanged, eval gate passed)
-- Proposed follow-ups (owner decides): first live run (a few dollars); output prices in the pricing table; usage from worker calls; more tasks, including replayed real sessions.
+- make check: pass (394 tests; Tier 1 unchanged, eval gate passed)
+- Proposed follow-ups (owner decides): first live run (a few dollars); paired per-repeat differences in the report; output prices in the pricing table; usage from worker calls; more tasks, including replayed real sessions.
 - Next step: owner reviews Session 7, decides ADR 0015, and runs Tier 2 live. v1's roadmap (§14) is then complete.
