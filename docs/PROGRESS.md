@@ -113,3 +113,7 @@ Template:
 - Owner decision: `liber plan create` refuses a version whose requests wouldn't be smaller (ARCHITECTURE.md §6). Tests use realistic message sizes.
 - Live check now compares the same request with and without Liber (the API's token count of the client's request vs what Liber sent, cached tokens included) and summarizes a ~2,000-token tool result.
 - Next step: owner re-runs the live check, then Session 6.
+
+## 2026-11-07 — Owner decision: ADR 0013 accepted
+- Done: [ADR 0013](decisions/0013-background-worker.md) (background worker: per-exchange counts and summaries, quoted data, carry-forward notes) accepted, with the owner's 2026-11-06 decisions already recorded in it (summaries stored regardless of `LIBER_RECORD_BODIES`; no call cap in v1).
+- Next step: owner re-runs the live check (`liber/evals/live.py`), then Session 6 (dashboard).
