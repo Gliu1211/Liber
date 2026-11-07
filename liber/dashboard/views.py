@@ -72,7 +72,8 @@ def item_rows(view: SessionView) -> list[ItemRow]:
                 role=item.role,
                 kind=item.kind,
                 tokens=tokens[item.id],
-                exact=item.id in exact_items and item.kind != "thinking",
+                # Exact counts leave out thinking and system messages: those stay estimates.
+                exact=item.id in exact_items and item.kind != "thinking" and item.role != "system",
                 topic=topics.get(item.id, CURRENT_TURN),
                 status=status,
                 pending=change if change != status else None,
@@ -120,11 +121,12 @@ def topic_map(view: SessionView) -> list[TopicGroup]:
 
 
 def summary_ends(view: SessionView) -> list[tuple[int, str]]:
-    """(last message, label) for each exchange a new summary could end with (§5)."""
+    """(last message, label) for each place a new summary could end (the checks `create` makes, §5)."""
     first = commands.live_start(view.state, view.items)
+    allowed = commands.exchange_ends(view.items)
     ends = []
     for exchange in view.exchanges:
-        if exchange.last >= first:
+        if exchange.last >= first and exchange.last in allowed:
             summary = view.summaries.get(exchange.key)
             label = summary.topic if summary is not None else NOT_SUMMARIZED
             ends.append((exchange.last, f"through message {exchange.last}: {label}"))
@@ -149,18 +151,22 @@ CHART_SERIES = (
 )
 
 
-def usage_chart(requests: list[RequestRecord], width: int = 640, height: int = 160) -> Chart:
+def usage_chart(requests: list[RequestRecord], width: int = 640, height: int = 160, top: int = 8) -> Chart:
     """Per request, oldest to newest: the three kinds of input tokens the API reported (D9, §7)."""
-    with_usage = [r for r in requests if r.input_tokens is not None]
+    with_usage = [r for r in requests if r.input_tokens is not None]  # e.g. not failed requests
     values = {name: [getattr(r, field) or 0 for r in with_usage] for name, field in CHART_SERIES}
+    # The largest value of any series sits `top` pixels below the top edge (never 0: no division by 0).
     largest = max([max(points, default=0) for points in values.values()] + [1])
+    # Requests are spread evenly from the left edge to the right one.
     step = width / max(len(with_usage) - 1, 1)
     series = []
     for name, _ in CHART_SERIES:
-        points = " ".join(
-            f"{index * step:.1f},{height - value / largest * height:.1f}" for index, value in enumerate(values[name])
-        )
-        series.append((name, points))
+        coordinates = [
+            (index * step, height - value / largest * (height - top)) for index, value in enumerate(values[name])
+        ]
+        if len(coordinates) == 1:  # one request: a flat line across, since one point draws nothing
+            coordinates.append((width, coordinates[0][1]))
+        series.append((name, " ".join(f"{x:.1f},{y:.1f}" for x, y in coordinates)))
     return Chart(
         width,
         height,
@@ -184,9 +190,6 @@ def plan_lines(view: SessionView) -> list[tuple[int, int, list[str]]]:
     versions = []
     for version in (view.state.applied, view.state.pending):
         if version is not None and version.number:
-            described = [
-                f"{op.kind} {len(op.item_ids)} item(s)" + (f' — "{op.note}"' if op.note else "")
-                for op in version.plan.operations
-            ]
+            described = [commands.describe_operation(op) for op in version.plan.operations]
             versions.append((version.number, version.parent, described))
     return versions

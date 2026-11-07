@@ -82,7 +82,7 @@
 </svg>
 <p class="legend muted">
   <span style="color:#d1495b">■ uncached input</span><span style="color:#2457c5">■ cache reads</span><span style="color:#e0a800">■ cache writes</span>
-  {{ chart.requests }} requests · top of chart {{ "{:,}".format(chart.largest) }} tokens
+  {{ chart.requests }} request{{ '' if chart.requests == 1 else 's' }} · top of chart {{ "{:,}".format(chart.largest) }} tokens
 </p>
 {% else %}
 <p class="muted">No recorded usage yet.</p>

@@ -31,8 +31,10 @@ Three things weren't settled by D11:
 
 ## Decision
 1. **Routes under `/liber/`** (`dashboard/routes.py`), registered before the proxy's catch-all.
-   Anthropic's API has no `/liber` path, and every other path is still forwarded. `liber serve`
-   logs the dashboard's URL.
+   Anthropic's API has no `/liber` path, and every other path is still forwarded. The router has
+   its own catch-all for every other `/liber/` path and method (404). Without it, a wrong method,
+   a CORS preflight or a typo would fall through to the proxy and be forwarded upstream. `liber
+   serve` logs the dashboard's URL.
 2. **No duplicate logic.**
    - Every action calls `plan/commands.create|apply|undo`, so the dashboard gets the same checks
      as `liber plan`: summaries must be ready, the plan must make requests smaller, and
@@ -47,7 +49,14 @@ Three things weren't settled by D11:
    - **Every action requires the `HX-Request` header,** which HTMX adds. Another site's form can't
      set a header, and its script can only set one after a CORS check that Liber never grants. If
      the browser sends `Origin`, it must be this page.
+   - **No other site may frame the pages** (`X-Frame-Options: DENY`, CSP `frame-ancestors
+     'none'`). An invisible frame would otherwise let a site trick a click on Apply or Undo, with
+     every header above in place. The CSP (`default-src 'self'`) also limits the page to Liber's
+     own script.
    - Actions don't work without JavaScript; that's accepted.
+   - **Thinking blocks are refused when a plan is created** (`commands.create_now`), not only
+     greyed out in the page. A crafted request, or the CLI, would otherwise create a version the
+     request path can never use (§5, hard rule 6).
 4. **HTMX 2.0.4 is shipped in the repo** (`dashboard/static/htmx.min.js`, BSD Zero Clause
    licence, taken from the npm registry tarball, sha512 integrity checked) and served by Liber.
    The pages load nothing else. Their CSS is inline, and the chart is an SVG drawn on the server

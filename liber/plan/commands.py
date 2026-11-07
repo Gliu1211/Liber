@@ -132,7 +132,7 @@ async def show(
     for version in (state.applied, state.pending):
         if version is not None and version.number:
             lines.append(f"  version {version.number} (built on {version.parent}):")
-            lines += [f"    {op.kind} {len(op.item_ids)} item(s)" for op in version.plan.operations]
+            lines += [f"    {describe_operation(op)}" for op in version.plan.operations]
     if view.estimate is not None:
         lines += describe_estimate(view.estimate, exact_exchanges=view.exact_exchanges)
     lines.append("  msg block role       kind         tokens  id")
@@ -140,6 +140,18 @@ async def show(
         f"  {i.msg_index:>3} {i.block_index:>5} {i.role:10} {i.kind:12} {i.tokens:>6}  {i.id}" for i in view.items
     ]
     return "\n".join(lines)
+
+
+def describe_operation(operation: Operation) -> str:
+    """One line per operation, for `show` and the dashboard."""
+    note = f' — "{operation.note}"' if operation.note else ""
+    return f"{operation.kind} {len(operation.item_ids)} item(s){note}"
+
+
+def exchange_ends(items: list[ItemRecord]) -> set[int]:
+    """Messages a summary may end at: each one just before a user message that starts an exchange (§5)."""
+    starts = {i.msg_index for i in items if i.role == "user"} - {i.msg_index for i in items if i.kind == "tool_result"}
+    return {start - 1 for start in starts if start > 0}
 
 
 def latest_model(db: Session, session_id: str) -> str | None:
@@ -212,6 +224,9 @@ def create_now(
     unknown = [item_id for item_id in offload + delete if item_id not in by_id]
     if unknown:
         raise PlanError(f"no such item in the session's latest branch: {', '.join(unknown)}")
+    thinking = [item_id for item_id in offload + delete if by_id[item_id].kind == "thinking"]
+    if thinking:  # §5, hard rule 6: the request path would refuse the version, so refuse it now
+        raise PlanError(f"thinking blocks are never offloaded or deleted: {', '.join(thinking)}")
 
     connection = db.connection()
     state = versions.read_state(connection, session_id)
@@ -278,10 +293,9 @@ def summary_through(
     first = live_start(state, items)
     base = state.pending or state.applied
     summaries = [op for op in base.plan.operations if op.kind is OperationKind.SUMMARIZE]
-    starts = {i.msg_index for i in items if i.role == "user"} - {i.msg_index for i in items if i.kind == "tool_result"}
     if last < first:
         raise PlanError(f"messages up to {first - 1} are already summarized")
-    if last + 1 not in starts:
+    if last not in exchange_ends(items):
         raise PlanError(f"a summary must end just before a user message that starts an exchange; {last + 1} isn't one")
     in_range = [e for e in exchanges.completed_exchanges(items) if first <= e.first and e.last <= last]
     if not in_range:

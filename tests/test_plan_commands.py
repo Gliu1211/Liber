@@ -179,3 +179,17 @@ def test_a_database_error_is_one_line_not_a_traceback(
     assert failed.value.code == 1
     output = capsys.readouterr().out
     assert output.startswith("liber plan: failed (") and "Traceback" not in output
+
+
+async def test_create_refuses_to_offload_or_delete_thinking(store: Store) -> None:
+    request = json.loads(chat(*TURNS))
+    request["messages"][1]["content"] = [
+        {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+        {"type": "text", "text": "a0"},
+    ]
+    prepared = await pipeline.prepare(store, json.dumps(request).encode())
+    assert prepared.session_id is not None and prepared.parsed is not None
+    thinking = next(item.id for item in prepared.parsed.items if item.kind == "thinking")
+
+    with pytest.raises(PlanError, match="thinking blocks are never offloaded or deleted"):
+        await commands.create(store, prepared.session_id, offload=(thinking,))

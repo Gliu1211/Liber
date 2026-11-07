@@ -257,24 +257,55 @@ async def test_other_host_names_are_refused(app: FastAPI, upstream: FakeUpstream
     assert page.status_code == 403
 
 
+@pytest.mark.parametrize("action", ["plan", "apply", "undo"])
 async def test_actions_need_htmx_and_the_same_origin(
+    app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream, action: str
+) -> None:
+    session = await a_session(app, client, upstream)
+    url = f"/liber/sessions/{session}/{action}"
+    form = {"action": "summarize", "through": "1"}
+
+    # A form on another site can post here but can't add headers without CORS, which Liber never grants.
+    plain_form = await client.post(url, data=form)
+    other_origin = await client.post(url, data=form, headers={**HX, "Origin": "https://evil.example"})
+    sandboxed = await client.post(url, data=form, headers={**HX, "Origin": "null"})
+    same_origin = await client.post(url, data=form, headers={**HX, "Origin": "http://127.0.0.1:8484"})
+
+    assert plain_form.status_code == other_origin.status_code == sandboxed.status_code == 403
+    assert same_origin.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("host", "allowed"),
+    [
+        ("127.0.0.1:8484", True),
+        ("localhost:8484", True),
+        ("[::1]:8484", True),
+        ("127.0.0.1", True),
+        ("127.0.0.1.evil.example:8484", False),
+        ("localhost.evil.example", False),
+        ("evil.example", False),
+    ],
+)
+async def test_only_loopback_host_names_are_answered(client: httpx.AsyncClient, host: str, allowed: bool) -> None:
+    page = await client.get("/liber/", headers={"host": host})
+
+    assert (page.status_code == 200) is allowed
+
+
+async def test_no_other_site_can_frame_the_pages(
     app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream
 ) -> None:
     session = await a_session(app, client, upstream)
-    await client.post(f"/liber/sessions/{session}/plan", data={"action": "summarize", "through": "1"}, headers=HX)
 
-    # A form on another site can post here but can't add headers without CORS, which Liber never grants.
-    plain_form = await client.post(f"/liber/sessions/{session}/apply")
-    other_origin = await client.post(
-        f"/liber/sessions/{session}/apply", headers={**HX, "Origin": "https://evil.example"}
-    )
-    same_origin = await client.post(
-        f"/liber/sessions/{session}/apply", headers={**HX, "Origin": "http://127.0.0.1:8484"}
-    )
-
-    assert plain_form.status_code == other_origin.status_code == 403
-    assert same_origin.status_code == 200
-    assert (await versions.load_state(app.state.store, session)).apply_requested
+    for response in (
+        await client.get("/liber/"),
+        await client.get(f"/liber/sessions/{session}"),
+        await client.post(f"/liber/sessions/{session}/apply", headers=HX),
+    ):
+        assert response.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+        assert "default-src 'self'" in response.headers["content-security-policy"]
 
 
 async def test_the_page_loads_nothing_from_the_internet(
@@ -304,9 +335,61 @@ async def test_text_from_the_worker_is_escaped(app: FastAPI, client: httpx.Async
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
 
 
-async def test_dashboard_paths_are_never_forwarded_upstream(client: httpx.AsyncClient, upstream: FakeUpstream) -> None:
-    await client.get("/liber/")
-    await client.get("/liber/sessions/nope")
-    await client.get("/liber/static/htmx.min.js")
+async def test_dashboard_paths_are_never_forwarded_upstream(
+    app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream
+) -> None:
+    session = await a_session(app, client, upstream)
+    sent_before = len(upstream.requests)
 
-    assert upstream.requests == []
+    answers = [
+        await client.get("/liber/"),
+        await client.get("/liber/sessions/nope"),
+        await client.get("/liber/static/htmx.min.js"),
+        await client.get("/liber/no-such-page"),
+        await client.get(f"/liber/sessions/{session}/apply"),  # a POST route, asked with GET
+        await client.options(f"/liber/sessions/{session}/apply"),  # a CORS preflight
+        await client.delete(f"/liber/sessions/{session}"),
+    ]
+
+    assert [r.status_code for r in answers] == [200, 404, 200, 404, 404, 404, 404]
+    assert len(upstream.requests) == sent_before  # nothing under /liber/ went upstream
+
+
+async def test_an_action_on_an_unknown_session_is_404(client: httpx.AsyncClient) -> None:
+    response = await client.post("/liber/sessions/nope/plan", data={"action": "summarize", "through": "1"}, headers=HX)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("through", ["²", "①", "1" * 5000, "-1", " "])
+async def test_a_message_number_that_isnt_one_is_a_message(
+    app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream, through: str
+) -> None:
+    session = await a_session(app, client, upstream)
+
+    response = await client.post(
+        f"/liber/sessions/{session}/plan", data={"action": "summarize", "through": through}, headers=HX
+    )
+
+    assert response.status_code == 200 and 'class="error"' in response.text
+
+
+async def test_thinking_items_are_refused_even_when_posted_directly(
+    app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream
+) -> None:
+    turns: list[Any] = list(TURNS)
+    turns[1] = [{"type": "thinking", "thinking": "hmm", "signature": "sig"}, {"type": "text", "text": TURNS[1]}]
+    await client.post("/v1/messages", content=json.dumps(conversation(turns)).encode())
+    [*_, last] = await recorded(app)
+    assert last.session_id is not None
+    view = await commands.session_view(app.state.store, last.session_id)
+    thinking = next(item.id for item in view.items if item.kind == "thinking")
+
+    page = await client.get(f"/liber/sessions/{last.session_id}")
+    response = await client.post(
+        f"/liber/sessions/{last.session_id}/plan", data={"action": "delete", "items": [thinking]}, headers=HX
+    )
+
+    assert re.search(rf'value="{thinking}"[^>]*disabled', page.text)  # can't be ticked in the page
+    assert "thinking blocks are never offloaded or deleted" in response.text
+    assert (await versions.load_state(app.state.store, last.session_id)).pending is None

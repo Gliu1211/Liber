@@ -17,9 +17,15 @@ user's browser can still send requests there:
 - **Actions need the `HX-Request` header**, which HTMX adds. A form on another site can post
   here but can't add a header; a script can only add one after a CORS check, which Liber never
   grants. And if the browser says where the request came from (`Origin`), it must be this page.
+- **No other site may frame the pages** (`X-Frame-Options`, CSP `frame-ancestors`), so it can't
+  trick a click on Apply or Undo through an invisible frame. The CSP also lets the page load
+  scripts only from Liber itself.
+- **Every /liber/ path is answered here** (`not_found` catches the rest), so none of them is ever
+  forwarded upstream.
 """
 
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -34,8 +40,13 @@ from liber.plan.versions import PlanError
 from liber.session.store import BranchRecord, RequestRecord, Store
 
 HERE = Path(__file__).parent
-LOOPBACK_NAMES = {"127.0.0.1", "localhost", "[::1]", "::1"}
-HTMX = (HERE / "static" / "htmx.min.js").read_bytes()
+LOOPBACK_NAMES = {"127.0.0.1", "localhost", "[::1]"}
+HTMX_PATH = HERE / "static" / "htmx.min.js"
+SECURITY_HEADERS = {
+    "x-frame-options": "DENY",
+    "content-security-policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+    "x-content-type-options": "nosniff",
+}
 
 templates = Jinja2Templates(directory=HERE / "templates")  # autoescapes .html: worker text is data
 
@@ -79,7 +90,7 @@ async def index(request: Request) -> Response:
     for branch in branches:
         by_session.setdefault(branch.session_id, []).append(branch)
     states = {session.id: await versions.load_state(store, session.id) for session in sessions}
-    return templates.TemplateResponse(
+    return page(
         request,
         "index.html",
         {
@@ -108,13 +119,10 @@ async def change_plan(request: Request, session_id: str) -> Response:
     message = error = None
     try:
         if action == "summarize":
-            through = form.get("through", [""])[0]
-            if not through.strip().isdigit():
-                raise PlanError("choose the message to summarize through")
             message = await commands.create(
                 store,
                 session_id,
-                int(through),
+                message_number(form.get("through", [""])[0]),
                 summary_model=settings.summary_model,
                 carry_forward_reasoning=settings.carry_forward_reasoning,
             )
@@ -139,6 +147,14 @@ async def change_plan(request: Request, session_id: str) -> Response:
     return await render_session(request, session_id, "_session.html", message, error)
 
 
+def message_number(text: str) -> int:
+    """A message index from the form; PlanError (shown in the page) if it isn't one."""
+    text = text.strip()
+    if not (text.isascii() and text.isdecimal() and len(text) <= 9):
+        raise PlanError("choose the message to summarize through")
+    return int(text)
+
+
 @router.post("/sessions/{session_id}/apply", response_class=HTMLResponse, dependencies=[Depends(from_this_page)])
 async def apply(request: Request, session_id: str) -> Response:
     message = error = None
@@ -161,7 +177,20 @@ async def undo(request: Request, session_id: str) -> Response:
 
 @router.get("/static/htmx.min.js")
 async def htmx() -> Response:
-    return Response(HTMX, media_type="text/javascript", headers={"cache-control": "max-age=86400"})
+    # Read when asked, not at import: a missing file breaks this page, never the proxy (hard rule 1).
+    try:
+        script = HTMX_PATH.read_bytes()
+    except OSError as exc:
+        raise HTTPException(404, "htmx.min.js is missing from this install") from exc
+    return Response(
+        script, media_type="text/javascript", headers={"cache-control": "max-age=86400", **SECURITY_HEADERS}
+    )
+
+
+@router.api_route("/{rest:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def not_found(rest: str) -> Response:
+    """Any other /liber/ path or method: answered here, never forwarded upstream. Registered last."""
+    raise HTTPException(404, "no such dashboard page")
 
 
 async def render_session(
@@ -189,4 +218,10 @@ async def render_session(
         "error": error,
         "worker_on": request.app.state.worker is not None,
     }
-    return templates.TemplateResponse(request, template, context)
+    return page(request, template, context)
+
+
+def page(request: Request, template: str, context: dict[str, Any]) -> Response:
+    response = templates.TemplateResponse(request, template, context)
+    response.headers.update(SECURITY_HEADERS)
+    return response

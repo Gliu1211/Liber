@@ -117,3 +117,26 @@ Template:
 ## 2026-11-07 — Owner decision: ADR 0013 accepted
 - Done: [ADR 0013](decisions/0013-background-worker.md) (background worker: per-exchange counts and summaries, quoted data, carry-forward notes) accepted, with the owner's 2026-11-06 decisions already recorded in it (summaries stored regardless of `LIBER_RECORD_BODIES`; no call cap in v1).
 - Next step: owner re-runs the live check (`liber/evals/live.py`), then Session 6 (dashboard).
+
+## 2026-11-07 — Session 6: dashboard
+- Done: `liber/dashboard/` (FastAPI + Jinja + HTMX, D11), served by the proxy's own app at `/liber/`:
+  - session list with branches;
+  - per session: plan panel (applied/pending version, version history, the §6 cost/payback preview, Apply/Undo), summarize "through message N" (only the §5 ends `create` accepts), topic map (one row per exchange with exact token totals where the worker counted, plus the turn in progress), item table (role, kind, tokens with `~` for estimates, topic, status and pending change; tick to offload/delete), and an SVG chart of uncached input, cache reads and cache writes per request.
+  - Every action calls `plan/commands.create|apply|undo`; `show` and the dashboard share `commands.SessionView`, `describe_estimate`, `describe_operation`, `live_start` and `exchange_ends`.
+  - Refusals (not ready, doesn't shrink requests, bad input) show in the page.
+  - HTMX 2.0.4 ships in the repo (`dashboard/static/`, 0BSD, npm tarball integrity-checked). Jinja2 is a new dependency.
+  - `liber serve` logs the dashboard URL.
+  - Driven in Chromium (offload, summarize, apply): works, no console errors.
+- Decisions: [ADR 0014](decisions/0014-dashboard.md) (Proposed):
+  - one app, `/liber/` prefix with its own 404 catch-all, so nothing under it is forwarded;
+  - loopback Host only (DNS rebinding), `HX-Request` plus same-`Origin` on actions (cross-site requests), no framing plus CSP `default-src 'self'` (clickjacking);
+  - HTMX served locally, so the page loads nothing from the internet;
+  - topics shown per exchange (ADR 0013).
+- Also: `liber plan create` (CLI and dashboard) now refuses to offload or delete thinking blocks, which the request path would refuse anyway (§5).
+- Review: independent reviewer run; no hard-rule violations. All findings fixed with tests:
+  - must-fix: framing (clickjacking); `/liber/` paths that missed a route were forwarded upstream;
+  - should-fix: Unicode digits gave a 500; thinking only blocked in the UI; guard tests now cover all three actions and Host/Origin variants; 404 on actions for unknown sessions; a one-request chart drew nothing; the exact-count marker was wrong for system messages; summarize options now match `create`'s exchange-end rule; HTMX read lazily so a missing file can't break the proxy.
+- Open issues: action messages are the CLI's wording ("To use it: liber plan apply…"). The session page loads every recorded request for the chart (fine now; large histories may want a limit). No restore of offloaded originals in the page yet.
+- make check: pass (369 tests; Tier 1 unchanged, eval gate passed)
+- Proposed follow-ups (owner decides): restore/view offloaded originals from the dashboard; dashboard-specific action messages; a per-request detail view (outcome, edit_skipped, input_transformations).
+- Next step: owner reviews Session 6 and decides ADR 0014; re-run the live check; then Session 7 (Tier 2 quality evals).
