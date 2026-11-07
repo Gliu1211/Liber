@@ -33,6 +33,7 @@ from fastapi import FastAPI, Request, Response
 from liber.cache.blobs import BlobStore
 from liber.cache.content import keep_originals
 from liber.config import Settings
+from liber.dashboard.routes import router as dashboard_router
 from liber.log import configure_logging
 from liber.model.anthropic import RecentRequests
 from liber.pipeline import Prepared, prepare
@@ -87,8 +88,9 @@ def create_app(
         finally:
             await store.close()  # the last connection to close checkpoints what's left
 
-    # docs/redoc/openapi are switched off: those paths belong to the upstream API, and the proxy
-    # must not answer anything itself.
+    # docs/redoc/openapi are switched off: those paths belong to the upstream API. The proxy answers
+    # only its own dashboard, under /liber/ (a path the API doesn't use); everything else is forwarded.
+
     app = FastAPI(title="Liber", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.pending_writes = set()
@@ -100,7 +102,8 @@ def create_app(
         context_threshold=settings.context_threshold,
         threshold_auto_apply=settings.threshold_auto_apply,
     )
-    # Order matters: the specific route first, then the catch-all for everything else.
+    # Order matters: the specific routes first, then the catch-all for everything else.
+    app.include_router(dashboard_router)  # /liber/..., §10: never forwarded upstream
     app.add_api_route("/v1/messages", proxy_messages, methods=["POST"])
     app.add_api_route("/{path:path}", proxy_other, methods=ALL_METHODS)
     return app

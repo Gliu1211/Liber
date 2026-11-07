@@ -47,6 +47,7 @@ def main(argv: list[str] | None = None) -> None:
         settings = settings.model_copy(update={"port": args.port})
 
     app = create_app(settings)
+    log.info("dashboard", url=f"http://127.0.0.1:{settings.port}/liber/")
     if not is_loopback(settings.host):
         # Hard rule 3 / §11: anyone who can reach this port can spend the user's API key.
         log.warning("binding_to_non_loopback_address", host=settings.host)

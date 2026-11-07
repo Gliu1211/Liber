@@ -1,6 +1,6 @@
 # 0013 — Background worker: per-exchange counts and summaries, quoted data, carry-forward notes
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-07)
 - Date: 2026-11-06
 
 ## Context
