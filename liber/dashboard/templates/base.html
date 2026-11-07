@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Liber{% endblock %}</title>
+<script src="/liber/static/htmx.min.js"></script>
+<style>
+  :root { --fg: #1d1d1f; --muted: #6b6b70; --line: #ddd; --bg: #fff; --accent: #2457c5; --bad: #b3261e; --ok: #1e7a3a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e8e8ea; --muted: #a0a0a8; --line: #3a3a40; --bg: #18181b; --accent: #7aa2ff; --bad: #ff8a80; --ok: #7bd88f; }
+  }
+  body { font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0 auto; max-width: 1100px; padding: 16px; }
+  a { color: var(--accent); }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  code, .id { font-family: ui-monospace, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .message { color: var(--ok); } .error { color: var(--bad); }
+  .panel { border: 1px solid var(--line); border-radius: 6px; padding: 12px 16px; margin: 12px 0; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  button { font: inherit; padding: 4px 10px; cursor: pointer; }
+  svg { width: 100%; height: auto; border-bottom: 1px solid var(--line); }
+  .legend span { margin-right: 16px; }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<p><a href="/liber/">Liber</a> <span class="muted">— what stays in your model's context</span></p>
+{% block body %}{% endblock %}
+</body>
+</html>

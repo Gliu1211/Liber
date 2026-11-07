@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}Liber · {{ view.session_id[:12] }}{% endblock %}
+{% block body %}
+<h1>Session <span class="id">{{ view.session_id[:16] }}</span></h1>
+{% include "_session.html" %}
+{% endblock %}

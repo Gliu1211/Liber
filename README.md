@@ -69,8 +69,19 @@ sqlite3 ~/.liber/liber.db \
 
 ### Editing a session's context
 
-Until the dashboard exists, plans are made from the command line, against the same database
-the proxy uses ([ADR 0009](docs/decisions/0009-edit-plans-session-4a.md)):
+While `liber serve` runs, the dashboard is at <http://127.0.0.1:8484/liber/>
+([ADR 0014](docs/decisions/0014-dashboard.md)). It lists sessions and their branches. For each
+session it shows:
+- a topic map with token totals;
+- every item, with its tokens, topic and status;
+- a chart of input tokens, cache reads and cache writes per request.
+
+From there you can offload, delete or summarize into a pending plan version, see what applying
+it costs and saves, and apply or undo it. The dashboard answers only on `127.0.0.1` or
+`localhost`, and loads nothing from the internet.
+
+The same plans can be made from the command line, against the database the proxy uses
+([ADR 0009](docs/decisions/0009-edit-plans-session-4a.md)):
 
 ```bash
 liber plan show                       # sessions, newest first

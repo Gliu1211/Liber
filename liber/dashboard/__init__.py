@@ -1,4 +1,6 @@
-"""The local dashboard: sessions, items, topic map, edit plan, apply/undo (ARCHITECTURE.md §10, D11).
+"""Dashboard: FastAPI + Jinja + HTMX, served by the proxy's own app at /liber/ (ARCHITECTURE.md §10, D11).
 
-Arrives in Session 6 (FastAPI + Jinja + HTMX, served by the same app on 127.0.0.1).
+routes.py serves the pages and actions (every action calls plan/commands.py, the code behind
+`liber plan`); views.py works out what they show; templates/ lays it out; static/ holds HTMX,
+shipped with Liber so the page loads nothing from the internet (docs/decisions/0014).
 """

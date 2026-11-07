@@ -1,0 +1,90 @@
+{# The part of the session page that actions re-render; HTMX swaps it in place. #}
+{% set base = "/liber/sessions/" ~ view.session_id %}
+<div id="session">
+{% if message %}<p class="message">{{ message }}</p>{% endif %}
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<div class="panel">
+  <p>applied plan version: {{ view.state.applied.number }}
+  {% if view.state.pending %}
+  · pending plan version: {{ view.state.pending.number }}{% if view.state.apply_requested %}, applies at the next clean turn{% else %}, not requested yet{% endif %}
+  {% endif %}
+  · model: <code>{{ view.model or "unknown" }}</code></p>
+  {% for number, parent, operations in versions %}
+  <p class="muted">version {{ number }} (built on {{ parent }}): {{ operations | join("; ") }}</p>
+  {% endfor %}
+  {% if estimate %}
+  <ul>{% for line in estimate %}<li>{{ line }}</li>{% endfor %}</ul>
+  {% endif %}
+  <div class="actions">
+    <button hx-post="{{ base }}/apply" hx-target="#session" hx-swap="outerHTML" {% if not view.state.pending %}disabled{% endif %}>Apply pending version</button>
+    <button hx-post="{{ base }}/undo" hx-target="#session" hx-swap="outerHTML" {% if not view.state.applied.number %}disabled{% endif %}>Undo</button>
+  </div>
+  <form class="actions" hx-post="{{ base }}/plan" hx-target="#session" hx-swap="outerHTML">
+    <input type="hidden" name="action" value="summarize">
+    <label>Summarize
+      <select name="through">
+        {% for last, label in ends %}<option value="{{ last }}">{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <button {% if not ends %}disabled{% endif %}>Summarize</button>
+    {% if not worker_on %}<span class="muted">(the worker is off: summaries can't be written)</span>{% endif %}
+  </form>
+</div>
+
+<h2>Topics</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Topic</th><th class="num">Tokens</th><th class="num">Items</th><th>Messages</th></tr></thead>
+<tbody>
+{% for group in topics %}
+<tr><td>{{ group.topic }}</td><td class="num">{{ "{:,}".format(group.tokens) }}</td><td class="num">{{ group.items }}</td><td>{{ group.first }}–{{ group.last }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<h2>Items</h2>
+<form hx-post="{{ base }}/plan" hx-target="#session" hx-swap="outerHTML">
+<div class="actions">
+  <button name="action" value="offload">Offload selected</button>
+  <button name="action" value="delete">Delete selected</button>
+  <label>Note for offloaded items <input name="note" placeholder="e.g. build log"></label>
+</div>
+<div class="scroll">
+<table>
+<thead><tr><th></th><th class="num">Msg</th><th class="num">Block</th><th>Role</th><th>Kind</th><th class="num">Tokens</th><th>Topic</th><th>Status</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr class="item">
+  <td><input type="checkbox" name="items" value="{{ row.id }}" aria-label="select item {{ row.msg_index }}.{{ row.block_index }}" {% if not row.selectable %}disabled{% endif %}></td>
+  <td class="num">{{ row.msg_index }}</td>
+  <td class="num">{{ row.block_index }}</td>
+  <td>{{ row.role }}</td>
+  <td>{{ row.kind }}</td>
+  <td class="num">{{ "{:,}".format(row.tokens) }}{% if not row.exact %}<span class="muted" title="estimate">~</span>{% endif %}</td>
+  <td>{{ row.topic }}</td>
+  <td>{{ row.status }}{% if row.pending %} <span class="muted">→ {{ row.pending }}</span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+</form>
+
+<h2>Input tokens per request</h2>
+{% if chart.requests %}
+<svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img" aria-label="input tokens, cache reads and cache writes per request">
+  {% set colors = {"uncached input": "#d1495b", "cache reads": "#2457c5", "cache writes": "#e0a800"} %}
+  {% for name, points in chart.series %}
+  <polyline data-series="{{ name }}" points="{{ points }}" fill="none" stroke="{{ colors[name] }}" stroke-width="2"/>
+  {% endfor %}
+</svg>
+<p class="legend muted">
+  <span style="color:#d1495b">■ uncached input</span><span style="color:#2457c5">■ cache reads</span><span style="color:#e0a800">■ cache writes</span>
+  {{ chart.requests }} requests · top of chart {{ "{:,}".format(chart.largest) }} tokens
+</p>
+{% else %}
+<p class="muted">No recorded usage yet.</p>
+{% endif %}
+</div>

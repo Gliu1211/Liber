@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Sessions</h1>
+{% if not worker_on %}
+<p class="muted">The background worker is off (<code>LIBER_WORKER_API_KEY</code> isn't set), so summaries can't be written; offload and delete still work.</p>
+{% endif %}
+{% if not sessions %}
+<p>No sessions yet. Point your client at Liber and send a request.</p>
+{% else %}
+<div class="scroll">
+<table>
+<thead><tr><th>Session</th><th>Started</th><th class="num">Applied</th><th class="num">Pending</th><th>Branches</th></tr></thead>
+<tbody>
+{% for session in sessions %}
+{% set state = states[session.id] %}
+<tr>
+  <td><a class="id" href="/liber/sessions/{{ session.id }}">{{ session.id[:16] }}</a></td>
+  <td>{{ session.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+  <td class="num">{{ state.applied.number }}</td>
+  <td class="num">{% if state.pending %}{{ state.pending.number }}{% if state.apply_requested %} (requested){% endif %}{% else %}–{% endif %}</td>
+  <td>
+    {% for branch in branches.get(session.id, []) %}
+    <div class="branch"><span class="id">{{ branch.id[:8] }}</span> · {{ branch.head_depth }} messages{% if branch.parent_branch_id %} · forked after message {{ branch.fork_depth }}{% endif %} · last used {{ branch.last_seen_at.strftime("%Y-%m-%d %H:%M") }}</div>
+    {% endfor %}
+  </td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

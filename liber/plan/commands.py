@@ -1,4 +1,7 @@
-"""`liber plan create|apply|undo|show`: the user's side of edit plans until the dashboard (§10).
+"""`liber plan create|apply|undo|show`: the user's side of edit plans (§4, §10).
+
+The dashboard (liber/dashboard/) calls these same functions, so a plan made in the browser goes
+through exactly the checks a plan made on the command line does.
 
 Each command works on the same database as the running proxy (SQLite allows that; the proxy's
 busy timeouts cover the moment a command writes). Each returns the text to print, so tests can
@@ -15,6 +18,7 @@ cache/exchanges.py). If one of the exchanges isn't summarized yet, `create` refu
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -51,6 +55,51 @@ def latest_branch_items(db: Session, session_id: str) -> list[ItemRecord]:
     return list(items)
 
 
+@dataclass(frozen=True)
+class SessionView:
+    """Everything `show` and the dashboard (§10) know about one session, read in one place."""
+
+    session_id: str
+    items: list[ItemRecord]  # the latest branch's, in conversation order
+    state: versions.PlanState
+    model: str | None  # of the session's latest recorded request
+    exchanges: list[Any]  # cache/exchanges.Exchange of ItemRecord: the completed ones, oldest first
+    summaries: dict[str, ExchangeSummary]  # the worker's, by exchange key
+    exact: dict[str, int]  # the worker's exact token counts, by exchange key
+    estimate: cost.Estimate | None  # what applying the pending version costs and saves
+
+    @property
+    def exact_exchanges(self) -> int:
+        return sum(exchange.key in self.exact for exchange in self.exchanges)
+
+
+async def session_view(
+    store: Store,
+    session_id: str,
+    pricing: dict[str, ModelPrice] | None = None,
+    summary_model: str = DEFAULT_SUMMARY_MODEL,
+) -> SessionView:
+    items = await store.run(lambda db: latest_branch_items(db, session_id))
+    if not items:
+        raise PlanError(f"no session {session_id}")
+    state = await versions.load_state(store, session_id)
+    model = await store.run(lambda db: latest_model(db, session_id))
+    done = exchanges.completed_exchanges(items)
+    keys = [exchange.key for exchange in done]
+
+    def read(db: Session) -> tuple[dict[str, int], dict[str, ExchangeSummary]]:
+        exact = exchanges.cached_tokens(db.connection(), keys, model) if model else {}
+        return exact, exchanges.cached_summaries(db.connection(), keys, summarizer_id(summary_model))
+
+    exact, summaries = await store.run(read)
+    estimate = None
+    if state.pending is not None:
+        price = cost.price_for(model, pricing if pricing is not None else DEFAULT_PRICING)
+        counted = cost.with_exact_counts(items, done, exact)
+        estimate = cost.estimate(counted, state.applied.plan, state.pending.plan, price, state.activated_at)
+    return SessionView(session_id, items, state, model, done, summaries, exact, estimate)
+
+
 async def show(
     store: Store,
     session_id: str | None = None,
@@ -70,23 +119,12 @@ async def show(
             lines.append(f"{session.id}  {session.created_at:%Y-%m-%d %H:%M}  {state.applied.number:>7}  {pending}")
         return "\n".join(lines)
 
-    items = await store.run(lambda db: latest_branch_items(db, session_id))
-    if not items:
-        raise PlanError(f"no session {session_id}")
-    state = await versions.load_state(store, session_id)
-    model = await store.run(lambda db: latest_model(db, session_id))
-    done = exchanges.completed_exchanges(items)
-    keys = [exchange.key for exchange in done]
-
-    def read(db: Session) -> tuple[dict[str, int], dict[str, ExchangeSummary]]:
-        exact = exchanges.cached_tokens(db.connection(), keys, model) if model else {}
-        return exact, exchanges.cached_summaries(db.connection(), keys, summarizer_id(summary_model))
-
-    exact, summaries = await store.run(read)
+    view = await session_view(store, session_id, pricing, summary_model)
+    state, keys = view.state, [exchange.key for exchange in view.exchanges]
     lines = [f"Session {session_id}", f"  applied plan version: {state.applied.number}"]
     lines.append(
-        f"  completed exchanges: {len(done)}; summarized: {sum(key in summaries for key in keys)}; "
-        f"exact token counts: {sum(key in exact for key in keys)}"
+        f"  completed exchanges: {len(keys)}; summarized: {sum(key in view.summaries for key in keys)}; "
+        f"exact token counts: {view.exact_exchanges}"
     )
     if state.pending is not None:
         when = "at the next clean turn" if state.apply_requested else "not requested yet (liber plan apply)"
@@ -95,13 +133,12 @@ async def show(
         if version is not None and version.number:
             lines.append(f"  version {version.number} (built on {version.parent}):")
             lines += [f"    {op.kind} {len(op.item_ids)} item(s)" for op in version.plan.operations]
-    if state.pending is not None:
-        price = cost.price_for(model, pricing if pricing is not None else DEFAULT_PRICING)
-        counted = cost.with_exact_counts(items, done, exact)
-        estimate = cost.estimate(counted, state.applied.plan, state.pending.plan, price, state.activated_at)
-        lines += describe_estimate(estimate, exact_exchanges=sum(key in exact for key in keys))
+    if view.estimate is not None:
+        lines += describe_estimate(view.estimate, exact_exchanges=view.exact_exchanges)
     lines.append("  msg block role       kind         tokens  id")
-    lines += [f"  {i.msg_index:>3} {i.block_index:>5} {i.role:10} {i.kind:12} {i.tokens:>6}  {i.id}" for i in items]
+    lines += [
+        f"  {i.msg_index:>3} {i.block_index:>5} {i.role:10} {i.kind:12} {i.tokens:>6}  {i.id}" for i in view.items
+    ]
     return "\n".join(lines)
 
 
@@ -218,6 +255,15 @@ def refuse_unless_smaller(
         )
 
 
+def live_start(state: versions.PlanState, items: list[ItemRecord]) -> int:
+    """Where a new summary would start: after the last message the newest version summarizes."""
+    base = state.pending or state.applied
+    by_id = {item.id: item for item in items}
+    summaries = [op for op in base.plan.operations if op.kind is OperationKind.SUMMARIZE]
+    covered = [by_id[item_id].msg_index for op in summaries for item_id in op.item_ids if item_id in by_id]
+    return max(covered, default=-1) + 1
+
+
 @dataclass(frozen=True)
 class SummaryWriter:
     """Which of the worker's summaries a new plan version uses."""
@@ -229,12 +275,9 @@ class SummaryWriter:
 def summary_through(
     db: Session, state: versions.PlanState, items: list[ItemRecord], last: int, writer: SummaryWriter
 ) -> Operation:
+    first = live_start(state, items)
     base = state.pending or state.applied
-    by_id = {item.id: item for item in items}
     summaries = [op for op in base.plan.operations if op.kind is OperationKind.SUMMARIZE]
-    # The live region starts after the last message the newest version already summarizes.
-    covered = [by_id[item_id].msg_index for op in summaries for item_id in op.item_ids if item_id in by_id]
-    first = max(covered, default=-1) + 1
     starts = {i.msg_index for i in items if i.role == "user"} - {i.msg_index for i in items if i.kind == "tool_result"}
     if last < first:
         raise PlanError(f"messages up to {first - 1} are already summarized")
