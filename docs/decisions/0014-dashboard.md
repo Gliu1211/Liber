@@ -1,6 +1,6 @@
 # 0014 — Dashboard: served at /liber/, actions through the CLI's plan code, local-only guards
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-07)
 - Date: 2026-11-07
 
 ## Context
