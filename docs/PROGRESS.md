@@ -207,3 +207,7 @@ Template:
 - Open issues: the history file's "date" now carries a time (`2026-11-08-012656`) when a same-day file exists; trends sort it fine.
 - Proposed follow-ups (owner decides): ADR 0016 and its implementation (one session: plan operation, rendering, CLI, Tier 2 condition E); more repeats (5+) now that conditions differ; replace or harden `dead_end_debugging` and `migration_facts`.
 - Next step: owner decides ADR 0016.
+
+## 2026-11-08 — Owner decision: ADR 0016 accepted
+- Done: [ADR 0016](decisions/0016-keep-items-through-a-summary.md) (pin items through a summary; Tier 2 condition E) accepted as written. ARCHITECTURE.md §4 notes pinning under summarize, marked not built yet.
+- Next step (owner starts it): implement ADR 0016 in one session (plan operation, rendering, validation, CLI `--pin`, Tier 2 condition E with `keep_tool_results` on `undiscussed_config_detail` and `derived_pool_load`), then a live Tier 2 run with `--repeats 5`.
