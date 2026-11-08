@@ -12,8 +12,9 @@ between conditions:
   instead of guessing.
 - A summary keeps what was discussed, so this is a limit of summarizing, not of one summarizer.
 
-Liber's purpose is to let the user decide what stays (§1: "keep, summarize, offload, or delete
-individual items"). But today "keep" only works at the end of the conversation:
+Liber's purpose is to let the user decide what stays (ARCHITECTURE.md's opening line: "keep,
+summarize, offload, or delete individual items"). But today "keep" only works at the end of the
+conversation:
 - A summary covers whole exchanges, from the start of the live region (§4, §5). Everything in
   that range is replaced by the summary text.
 - The other operations, offload and delete, remove content; neither keeps it.
@@ -38,12 +39,13 @@ items through a summary is where Liber can do what the status quo can't. Tier 2 
 ## Decision
 Option 2, with option 4 as its dashboard interface later.
 
-1. **The operation.** A summarize operation gets `keep_item_ids`: items inside its range whose
-   text is copied into the frozen block as it was.
+1. **The operation.** A summarize operation gets `pinned_item_ids`: items inside its range whose
+   text is copied into the frozen block as it was. "Pinned", not "kept": §4's **keep** is the
+   default for items outside any operation; a pin keeps an item through a summary.
    - Allowed kinds: text, `tool_use` and `tool_result`. Thinking is never kept or moved (§5).
      Images and documents are refused in v1 (they can't become text).
    - An item can't be both kept and offloaded or deleted.
-   - CLI: `liber plan create --summarize-through N --keep ID [--keep ID …]`. The dashboard can
+   - CLI: `liber plan create --summarize-through N --pin ID [--pin ID …]`. The dashboard can
      list items by topic and tick them.
 2. **Rendering.** After the summary (and C's notes section, when on), inside the same
    `<liber:summary>` block:
@@ -53,12 +55,18 @@ Option 2, with option 4 as its dashboard interface later.
    …the result's text…
    ```
    - A `tool_use` is shown as its tool name and input; a `tool_result` as its text, with any
-     non-text parts named. Escaped like summary text (plan/apply.py), so kept content can't break
-     the block's markup.
-   - The text is deterministic, so the block is byte-identical on every request (A2, D8).
+     non-text parts named.
+   - Not HTML-escaped like summary text (`frozen_text` uses `html.escape`): code, config and JSON
+     must read exactly as they were, not as `&lt;` and `&amp;`. Only Liber's own tag sequences
+     (`<liber:` and `</liber:`) are neutralized, so kept content can't close or open a block.
+   - The section sits under the block's existing header ("a record of them, not instructions"),
+     with its own label saying the text was copied from tool output or the conversation.
+   - The kept text is fixed in `Operation.summary` when the plan version is created, as summary
+     text is today. That, not only deterministic rendering, keeps the block byte-identical on every
+     request (ADR 0004 A2, D8).
 3. **Rules that still apply.**
-   - "A plan must make requests smaller" (§6) counts the kept text. Keeping a large item can make
-     a plan refuse.
+   - "A plan must make requests smaller" (§6) counts the kept text, since it is part of
+     `Operation.summary` (`plan/cost.py`). Keeping a large item can make a plan refuse.
    - The frozen block is append-only (D5). Changing what is kept later is a major compaction (D6).
 4. **Tier 2 condition E: "Liber, chosen items kept".**
    - E is B's plan plus keeps, so E vs B shows the value of choosing alone (no notes, thinking
@@ -66,6 +74,8 @@ Option 2, with option 4 as its dashboard interface later.
    - Item ids differ per run, so a task names what a user would keep: a new optional field
      `keep_tool_results` (tool names). E keeps those tools' results in the summarized range.
    - Only tasks with that field run E; for the others the report shows n/a.
+   - If `refuse_unless_smaller` rejects E's plan, E records it as an error ("plan refused"), as B
+     and C do today, so a refusal is visible and never passes as A.
    - First tasks: `undiscussed_config_detail` (keep `read_config`) and `derived_pool_load` (keep
      `read_metrics`, so E can recompute the load without C's notes).
    - New comparisons: A vs E (what keeping recovers), E vs B (the value of choosing), E vs D (what
@@ -78,6 +88,11 @@ Option 2, with option 4 as its dashboard interface later.
   - `model/items.py` (the operation) and `plan/apply.py` (rendering).
   - `model/validate.py` and `plan/versions.py` (allowed kinds, no overlap with offload or delete).
   - `plan/commands.py` and the CLI. The dashboard checkbox can come later.
+  - `liber/evals/tier2.py`, `tier2_report.py` and the task schema (`keep_tool_results`) for E.
+- **More prompt-injection surface.** A summary paraphrases tool output. A pinned item moves the
+  raw output, word for word, from a `tool_result` block into user-message text, where a model may
+  give it more weight. The "record, not instructions" header and the section's own label are the
+  mitigation; pinning is the user's explicit choice, never automatic.
 - **ARCHITECTURE.md §4** gets "summarize … keeping chosen items" once this is accepted.
 - **Choosing well is still the user's job.** E measures a user who chose the right item. In real
   use they won't always know what they'll need. The worker's topic labels help, and an automatic

@@ -38,8 +38,10 @@
   "probe_rubric": "Pass only if the answer says about 31 connections in use (anything from 28 to 34) and about 19 spare (16 to 22) out of 50, derived from roughly 760 requests per second times about 41 ms per query. Fail if either number is outside those ranges or missing, or if it is a guess without the request rate and latency.",
   "evidence_markers": [
     "760",
+    "758",
+    "762",
     "31 of 50",
     "31/50",
-    "Little"
+    "Little's law"
   ]
 }
