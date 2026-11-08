@@ -75,6 +75,9 @@ class Operation(BaseModel):
     # summarize only: the frozen block's text, fixed when the plan version is created, so every
     # request renders exactly the same bytes for it (ADR 0004 A2).
     summary: str | None = None
+    # summarize only: items in the range whose text is copied into the frozen block as it was
+    # ("pinned": kept through the summary, docs/decisions/0016). Their text is part of `summary`.
+    pinned_item_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
