@@ -188,3 +188,20 @@ Template:
 - Open issues: the worker still sends `thinking: disabled` to its summary model; fine on Haiku 5.5, but it would 400 on a Sonnet/Opus 5.5 worker. The new tasks' difficulty is a guess until a live run.
 - Proposed follow-ups (owner decides): make the worker's thinking setting depend on its model; decide ADR 0015.
 - Next step: owner merges, runs `--rejudge` on the 2026-11-08 history (judge calls only), then a fresh `--live --repeats 3` with all five tasks.
+
+## 2026-11-07 — Tier 2 second live run: findings, two fixes, ADR 0016 proposed
+- Results (`evals/history/2026-11-08-012656.*`, owner's machine; 3 repeats, Sonnet 5.5, Opus 5.5 judge, Haiku 5.5 summaries):
+  - `derived_pool_load`: B 1/3, C 3/3, D 3/3, A 3/3. When B failed, its summary had the pool size and latency but not the request rate, and the model said so instead of guessing. C's notes kept the derivation. First evidence that carry-forward notes matter.
+  - `undiscussed_config_detail`: A 3/3; B, C and D all 0/3, every answer "I don't know" (no guesses).
+  - `code_reconstruction`: C 2/3 (one rebuilt `parse()` split the unstripped line), the rest 3/3: one answer, within noise.
+  - `dead_end_debugging`, `migration_facts`: everything passed; still too easy.
+  - Input tokens: Liber 44–77% below D on every task. 0 binding errors, 0 other errors, 0 tool calls during the questions. `--rejudge` worked on the first run (2026-11-08 now graded).
+- Done:
+  - Summarizer cuts are now marked as Liber's (`worker/summarize.py`, `CUT_MARK`, said in both system prompts), and `BLOCK_MAX_CHARS` is 16,000 (was 4,000; the exchange limit of 60,000 still bounds a call). `PROMPT_VERSION` 2, so summaries written with the old prompt aren't reused. Why: the 7,700-character metrics dump was cut at 4,000, the summary said "Metrics were truncated mid-output", and B then believed the tool had cut its data.
+  - `derived_pool_load` evidence markers narrowed to the request rate (`760`) and the derived answer. "41 ms" matched "40-41 ms" in every summary, so the column said 3/3 even when the summary lacked the one figure that matters.
+- Decisions: [ADR 0016](decisions/0016-keep-items-through-a-summary.md) (Proposed): keep chosen items through a summary (copied as they were into the frozen block), and Tier 2 condition E to measure it. Today a summary replaces everything in its range, so a user can't keep the config output without leaving the whole rest of the conversation unsummarized.
+- Tests: a cut block ends with Liber's mark and both prompts explain it; a re-cut is marked once; a 7,700-character block is sent whole.
+- make check: pass (404 tests; Tier 1 unchanged, eval gate passed)
+- Open issues: the history file's "date" now carries a time (`2026-11-08-012656`) when a same-day file exists; trends sort it fine.
+- Proposed follow-ups (owner decides): ADR 0016 and its implementation (one session: plan operation, rendering, CLI, Tier 2 condition E); more repeats (5+) now that conditions differ; replace or harden `dead_end_debugging` and `migration_facts`.
+- Next step: owner decides ADR 0016.

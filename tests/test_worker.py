@@ -474,3 +474,40 @@ async def test_without_a_key_no_worker_starts(settings: Settings, upstream: Fake
     app = create_app(settings, upstream_transport=upstream.transport)
     async with app.router.lifespan_context(app):
         assert app.state.worker is None
+
+
+# --- Long blocks: Liber's own cuts are marked as Liber's -------------------------------------------
+
+
+def sent_texts(call: dict[str, Any]) -> list[str]:
+    data = json.loads(call["prompt"].removeprefix("<exchange>\n").removesuffix("\n</exchange>"))
+    return [entry["text"] for entry in data]
+
+
+async def test_a_block_cut_for_the_summarizer_says_liber_cut_it(store: Store) -> None:
+    """The first Tier 2 run: a cut metrics dump became "metrics were truncated" in the summary."""
+    model = FakeModel()
+    metrics = "".join(f"15:{i:02d} checkout.requests_per_second 760\n" for i in range(600))  # ~23,000 chars
+    assert len(metrics) > summarize.BLOCK_MAX_CHARS
+
+    await worker_for(store, model).process(job(conversation("Read the metrics: " + metrics, "No.", "next")))
+
+    [call] = model.summary_calls()
+    [text, _] = sent_texts(call)
+    assert len(text) == summarize.BLOCK_MAX_CHARS
+    assert text.endswith(summarize.CUT_MARK) and text.startswith("Read the metrics: 15:00")
+    assert "shortened by Liber for this summary only" in summarize.SUMMARY_SYSTEM  # and what it means
+    assert "shortened by Liber for this summary only" in summarize.NOTES_SYSTEM
+
+
+def test_a_short_block_is_sent_whole_and_a_recut_is_marked_once() -> None:
+    assert summarize.excerpt("short", 100) == "short"
+    once = summarize.excerpt("x" * 500, 200)
+    twice = summarize.excerpt(once, 150)  # shortened() cuts an already cut block again
+    assert len(once) == 200 and len(twice) == 150
+    assert twice.count(summarize.CUT_MARK) == 1 and twice.endswith(summarize.CUT_MARK)
+
+
+def test_a_block_under_the_new_limit_is_no_longer_cut() -> None:
+    """The 7,700-character metrics dump from Tier 2's derived_pool_load fits whole now."""
+    assert summarize.excerpt("m" * 7_700, summarize.BLOCK_MAX_CHARS) == "m" * 7_700
