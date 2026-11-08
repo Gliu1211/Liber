@@ -28,6 +28,7 @@ from tests.helpers import FakeModel
 
 REASONING = "the database is ruled out: pool 6/50, p99 4 ms"
 NEEDLE = "INC-4471"
+CONFIG_NEEDLE = "CHG-2291"
 TASKS = Path(__file__).parent.parent / "evals" / "tier2_tasks"
 SETTINGS = Settings(model="claude-sonnet-5-5", judge_model="claude-opus-5-5", repeats=2)
 
@@ -85,6 +86,10 @@ class FakeApi:
             answer = f"ruled out: {REASONING}" if REASONING in seen else "not considered; it was the TLS certificate"
         elif "incident ticket" in last and "on call" in last:
             answer = f"{NEEDLE}, Priya Raman" if NEEDLE in seen else "I don't know"
+        elif "retry.backoff_multiplier" in last:  # undiscussed_config_detail's probe
+            answer = "1.7" if "backoff_multiplier = 1.7" in seen else "I don't know"
+        elif "change ticket" in last:  # its needle
+            answer = f"{CONFIG_NEEDLE}, Tomasz Wierzbicki" if CONFIG_NEEDLE in seen else "I don't know"
         else:
             answer = "Done." + " Details follow." * 40
         content.append({"type": "text", "text": answer})
@@ -94,7 +99,9 @@ class FakeApi:
         text = request["messages"][0]["content"].removeprefix("<grading>\n").removesuffix("\n</grading>")
         grading = json.loads(text)
         if "states this fact" in grading["rubric"]:
-            verdict = NEEDLE in grading["answer"]
+            verdict = any(tag in grading["answer"] for tag in (NEEDLE, CONFIG_NEEDLE) if tag in grading["rubric"])
+        elif "the value 1.7" in grading["rubric"]:
+            verdict = "1.7" in grading["answer"]
         else:
             verdict = grading["answer"].startswith("ruled out")
         reply = json.dumps({"pass": verdict, "reason": "fake judge"})
@@ -108,7 +115,7 @@ def worker_model() -> FakeModel:
     def reply(call: dict[str, Any]) -> dict[str, Any]:
         if "notes" in call["schema"]["properties"]:
             return {"notes": [REASONING] if REASONING in call["prompt"] else []}
-        kept = f" Ticket {NEEDLE}, on call Priya Raman." if NEEDLE in call["prompt"] else ""
+        kept = "".join(f" Ticket {tag}." for tag in (NEEDLE, CONFIG_NEEDLE) if tag in call["prompt"])
         return {"topic": "checkout 500s", "summary": "Checkout 500s traced to an expired payments certificate." + kept}
 
     model.reply = reply
@@ -690,3 +697,59 @@ async def test_a_tool_call_during_the_questions_gets_nothing_and_is_reported() -
     report = tier2_report.report([asdict(run)], {"model": "m", "judge_model": "j", "repeats": 1})
     assert "## Tool calls refused during the questions" in report
     assert "B #1: read_config, read_config" in report
+
+
+# --- Condition E: chosen items kept through the summary (docs/decisions/0016) -------------------------
+
+
+async def test_e_keeps_the_chosen_tool_result_and_recovers_what_every_summary_lost() -> None:
+    task = task_named("undiscussed_config_detail")
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    by = {r.condition: r for r in runs}
+    assert set(by) == {"A", "B", "C", "D", "E"}
+    # Only A (everything) and E (the config kept as it was) can still read the undiscussed value.
+    assert {c: by[c].success for c in by} == {"A": True, "B": False, "C": False, "D": False, "E": True}
+    assert all(r.errors == [] and r.binding_errors == [] for r in runs)
+    e = by["E"]
+    [block] = e.frozen_blocks
+    assert "Kept as is" in block and "[tool_result of read_config, message 2]" in block
+    assert "backoff_multiplier = 1.7" in block and "backoff_multiplier = 1.7" not in by["B"].frozen_blocks[0]
+    assert e.liber_outcomes == ["rendered", "rendered"]
+    # The kept item costs tokens: E sends more than B, still less than A.
+    assert by["B"].usage.input_tokens < e.usage.input_tokens < by["A"].usage.input_tokens
+
+
+async def test_tasks_without_kept_tools_dont_run_e(dead_end: tier2.Task) -> None:
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [dead_end], Settings(SETTINGS.model, "j", repeats=1), quiet)
+    text = tier2_report.report([asdict(r) for r in runs], {"date": "d", "repeats": 1})
+
+    assert {r.condition for r in runs} == {"A", "B", "C", "D"}
+    assert "| E: Liber, chosen items kept | n/a [0/0]" in text
+
+
+async def test_e_with_nothing_to_keep_is_an_error_not_a_silent_b(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = task_named("undiscussed_config_detail")
+    monkeypatch.setattr(tier2, "kept_results", lambda *args: ())
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    e = next(r for r in runs if r.condition == "E")
+    assert e.errors and e.errors[0].startswith("nothing to keep")
+
+
+def test_the_report_has_the_three_e_comparisons() -> None:
+    runs = [
+        run("t", c, 1, ok, tokens)
+        for c, ok, tokens in (("A", True, 1000), ("B", False, 400), ("D", False, 300), ("E", True, 500))
+    ]
+    runs.append(run("t", "C", 1, False, 450))
+
+    comparisons = {c.name: c for c in tier2_report.compare(tier2_report.summarize(runs)["t"])}
+
+    assert comparisons["A vs E"].success_delta == 0.0 and comparisons["A vs E"].input_change == pytest.approx(1.0)
+    assert comparisons["E vs B"].success_delta == 1.0 and comparisons["E vs B"].input_change == pytest.approx(0.25)
+    assert comparisons["E vs D"].success_delta == 1.0 and comparisons["E vs D"].input_change == pytest.approx(
+        500 / 300 - 1
+    )

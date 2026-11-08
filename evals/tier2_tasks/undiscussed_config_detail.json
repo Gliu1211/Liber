@@ -30,5 +30,8 @@
   "evidence_markers": [
     "1.7",
     "backoff_multiplier"
+  ],
+  "keep_tool_results": [
+    "read_config"
   ]
 }

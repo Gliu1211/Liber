@@ -34,6 +34,7 @@ CONDITION_NAMES = {
     "B": "Liber, thinking dropped",
     "C": "Liber + carry_forward_reasoning",
     "D": "client auto-compaction (simulated)",
+    "E": "Liber, chosen items kept",  # docs/decisions/0016; only tasks with keep_tool_results
 }
 CONDITIONS = tuple(CONDITION_NAMES)
 COMPARISONS = (
@@ -41,6 +42,9 @@ COMPARISONS = (
     ("C vs B", "C", "B", "how much carry-forward recovers"),
     ("B vs D", "B", "D", "Liber (thinking dropped) vs client compaction"),
     ("C vs D", "C", "D", "Liber + carry-forward vs client compaction"),
+    ("A vs E", "A", "E", "what keeping chosen items leaves unrecovered"),
+    ("E vs B", "E", "B", "the value of choosing what to keep"),
+    ("E vs D", "E", "D", "what client compaction can't do"),
 )
 
 

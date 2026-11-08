@@ -66,17 +66,17 @@ from liber.evals.tier2_api import (
     with_strict_binding,
 )
 from liber.model.anthropic import RecentRequests, parse
-from liber.model.items import ExchangeSummary
+from liber.model.items import ExchangeSummary, Kind
 from liber.plan import commands, cost, versions
 from liber.plan.versions import PlanError
-from liber.session.store import Store
+from liber.session.store import RequestRecord, Store
 from liber.worker.client import ModelClient
 from liber.worker.run import Job, Worker
 from liber.worker.summarize import summarizer_id
 
 TASKS_DIR = Path("evals/tier2_tasks")
 HISTORY_DIR = Path("evals/history")
-CONDITIONS = tier2_report.CONDITIONS  # ("A", "B", "C", "D")
+CONDITIONS = tier2_report.CONDITIONS  # ("A", "B", "C", "D", "E")
 MAX_TOOL_ROUNDS = 5  # per turn: a model still calling tools after this many rounds is an error
 MAX_TOKENS = 4000
 
@@ -106,6 +106,13 @@ class Task:
     # Strings that would let a summary answer the probe without the thinking. If B's summary has one,
     # B's result says how lossy the summary was, not what dropping thinking cost (the report shows it).
     evidence_markers: list[str] = field(default_factory=list)
+    # Condition E (docs/decisions/0016): the tools whose results a user would keep through the
+    # summary. Item ids differ per run, so the task names tools; E pins their results in the
+    # summarized range. Tasks without it don't run E.
+    keep_tool_results: list[str] = field(default_factory=list)
+
+    def conditions(self) -> tuple[str, ...]:
+        return CONDITIONS if self.keep_tool_results else tuple(c for c in CONDITIONS if c != "E")
 
 
 def load_tasks(directory: Path = TASKS_DIR) -> list[Task]:
@@ -316,7 +323,10 @@ async def run_liber(
     run: ConditionRun,
     directory: Path,
 ) -> tuple[str | None, str | None]:
-    """B or C: plan from the shared summaries, applied at the probe (a clean turn), then both questions."""
+    """B, C or E: plan from the shared summaries, applied at the probe (a clean turn), then both questions.
+
+    E is B's plan plus pins: the results of the task's `keep_tool_results` tools in the range.
+    """
     base = base_request(task, settings.model)
     store = Store(directory / f"{run.condition}.db")
     await store.create_tables()
@@ -328,6 +338,13 @@ async def run_liber(
         session = first.session_id
         summarizer = summarizer_id(settings.summary_model)
         await store.run(lambda db: copy_summaries(db, summaries, summarizer))
+        pins: tuple[str, ...] = ()
+        if run.condition == "E":
+            pins = kept_results(task, history, base, through)
+            if not pins:
+                run.errors.append(f"nothing to keep: no {task.keep_tool_results} result in messages 0-{through}")
+            # Pinned text is read from recorded requests, as the proxy records them.
+            await store.add_request(recorded_request(session, {**base, "messages": history}))
         try:
             await commands.create(
                 store,
@@ -335,6 +352,7 @@ async def run_liber(
                 through,
                 summary_model=settings.summary_model,
                 carry_forward_reasoning=run.condition == "C",
+                pin=pins,
             )
             await commands.apply(store, session)
         except PlanError as exc:
@@ -353,6 +371,31 @@ async def run_liber(
         return answers
     finally:
         await store.close()
+
+
+def kept_results(task: Task, history: list[dict[str, Any]], base: dict[str, Any], through: int) -> tuple[str, ...]:
+    """E's pins: the ids of the task's chosen tools' results in messages 0..through."""
+    items = parse({**base, "messages": history}).items
+    calls = {item.id: item.block.get("name") for item in items if item.kind is Kind.TOOL_USE}
+    return tuple(
+        item.id
+        for item in items
+        if item.kind is Kind.TOOL_RESULT
+        and item.msg_index <= through
+        and calls.get(item.depends_on or "") in task.keep_tool_results
+    )
+
+
+def recorded_request(session_id: str, request: dict[str, Any]) -> RequestRecord:
+    """The record the proxy would keep for this request (body included, LIBER_RECORD_BODIES's default)."""
+    return RequestRecord(
+        created_at=datetime.now(UTC),
+        method="POST",
+        path="/v1/messages",
+        model=request.get("model"),
+        session_id=session_id,
+        request_body=pipeline.encode_request(request).decode("utf-8"),
+    )
 
 
 async def run_client_compaction(
@@ -536,14 +579,14 @@ async def run_task_repeat(
     with tempfile.TemporaryDirectory(prefix="liber-tier2-") as temp:
         directory = Path(temp)
         summaries = await worker_summaries(task, settings, history, worker_client, directory)
-        for condition in CONDITIONS:
+        for condition in task.conditions():
             run = ConditionRun(task.name, condition, repeat, task.reasoning_dependent, thinking_with_text=with_text)
             if task.reasoning_dependent and with_text == 0:
                 run.errors.append("no thinking text came back in setup: C can't differ from B on this repeat")
             if condition == "A":
                 send = direct_sender(api, base_request(task, settings.model))
                 probe, needle = await questions(send, list(history), task, run)
-            elif condition in ("B", "C"):
+            elif condition in ("B", "C", "E"):
                 probe, needle = await run_liber(api, task, settings, history, through, summaries, run, directory)
             else:
                 probe, needle = await run_client_compaction(api, task, settings, history, run)
@@ -573,7 +616,8 @@ async def run_eval(
                 problem = f"repeat failed: {type(exc).__name__}: {str(exc)[:200]}"
                 progress(f"  {problem}")
                 failed = [
-                    ConditionRun(task.name, c, repeat, task.reasoning_dependent, errors=[problem]) for c in CONDITIONS
+                    ConditionRun(task.name, c, repeat, task.reasoning_dependent, errors=[problem])
+                    for c in task.conditions()
                 ]
                 runs += failed
             if save is not None:

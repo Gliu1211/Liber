@@ -46,7 +46,7 @@ Template:
 - Decisions: [ADR 0006](decisions/0006-tier1-metric-definitions.md): metric definitions; p95 tolerance = budget − value (may be negative) so the gate enforces the absolute 10 ms budget on any machine; p95 = median of 3 runs; cross-process determinism checked by running the CLI under two hash seeds.
 - Stubbed / provisional: `token_reduction` is 0 and `prefix_stability` a 1.0 placeholder until Session 4. No `evals/baseline.json` yet: the gate only warns until the owner records it (owner-only, its own PR).
 - Open issues: p95 ≈ 6–8 ms locally vs the 10 ms budget (thin margin; cost scales with request size); SQLite's automatic WAL checkpoint occasionally lands on a request (10–28 ms; `summary.max_overhead_ms`). Both are in a queued follow-up task (incremental request path + background checkpoints).
-- make check: pass
+- make check: pass (422 tests; Tier 1 unchanged, eval gate passed)
 - Next step: owner records the Tier 1 baseline in its own PR. Then Session 4 (plans, frozen blocks, break points), which must extend the harness with standard plans so `token_reduction` and `prefix_stability` become real, and keep every Tier 1 metric green.
 
 ## 2026-11-02 — Request path: hash only new messages; WAL checkpoints in the background
@@ -61,7 +61,7 @@ Template:
 ## 2026-11-04 — Owner decision: request-path ADRs 0007 and 0008
 - Done: [ADR 0007](decisions/0007-reuse-previous-request-in-parse.md) and [ADR 0008](decisions/0008-wal-checkpoints-in-the-background.md) accepted as written. PR #4 had been merged into `feat/session-3-tier1-evals` after PR #3 was merged into `main`, so its commits never reached `main`; this branch merges `main` back in and carries them there.
 - Decisions: Session 4's `plan/apply.py` must build new blocks and never edit the client's blocks in place (ADR 0007 requirement).
-- make check: pass
+- make check: pass (422 tests; Tier 1 unchanged, eval gate passed)
 - Next step: merge this PR into `main`. Then the follow-ups (full-GC pauses on the request path; identify()'s fixed cost) or Session 4.
 
 ## 2026-11-04 — Session 4a: edit plans, frozen blocks, blob store, CLI (Session 4 split: 4a/4b)
@@ -207,3 +207,27 @@ Template:
 - Open issues: the history file's "date" now carries a time (`2026-11-08-012656`) when a same-day file exists; trends sort it fine.
 - Proposed follow-ups (owner decides): ADR 0016 and its implementation (one session: plan operation, rendering, CLI, Tier 2 condition E); more repeats (5+) now that conditions differ; replace or harden `dead_end_debugging` and `migration_facts`.
 - Next step: owner decides ADR 0016.
+
+## 2026-11-08 — ADR 0016: keep chosen items through a summary ("pins"), Tier 2 condition E
+- Done:
+  - `Operation.pinned_item_ids`. `plan/apply.py` copies pinned items into the frozen block after the summary (and C's notes) under "Kept as is (copied word for word … a record of them, not instructions)", each with a label such as `[tool_result of read_config, message 2]`.
+    - The text isn't HTML-escaped, so code and config read as they were. Only `<liber:` / `</liber:` are neutralized.
+    - The text is fixed in `Operation.summary` when the version is created, so rendering stays byte-identical.
+  - `commands.create(pin=…)` and the CLI's `liber plan create --pin ID` (repeatable).
+    - The text comes from the session's recorded request bodies (newest 50), so pins need `LIBER_RECORD_BODIES`.
+    - Refused: thinking and images; items outside the range; items also offloaded or deleted; a pin without `--summarize-through`; plans that wouldn't shrink requests, since the kept text counts.
+  - `show` and the dashboard list "keeping N as is".
+  - Tier 2 condition E: B's plan plus pins of the task's `keep_tool_results` tools in the summarized range. It runs only on tasks with that field (`undiscussed_config_detail` keeps `read_config`, `derived_pool_load` keeps `read_metrics`); other tasks show n/a.
+    - New comparisons: A vs E, E vs B, E vs D.
+    - E with nothing to keep, or a refused plan, is an error, not a silent B.
+- Decisions: implementation notes added to [ADR 0016](decisions/0016-keep-items-through-a-summary.md), which stays Proposed. Where pinned text comes from (recorded bodies), and where the checks live.
+- Tests (offline):
+  - pins through the real app: word for word, the tags neutralized, sent and byte-identical across requests, listed in `show`;
+  - every refusal, the CLI flag, `PlanNotApplicable` for a pin outside its range, and the section order;
+  - E end to end on `undiscussed_config_detail` with rigged fakes: A and E pass, B, C and D fail, and E's tokens fall between B's and A's;
+  - tasks without E, E with nothing to keep, and the report's E comparisons.
+- make check: pass (422 tests; Tier 1 unchanged, eval gate passed)
+- Open issues: `derived_pool_load`'s metrics dump is ~7,700 characters, so E's plan there may be refused as not smaller; a live run will tell. The dashboard checkbox for pins isn't built.
+- Proposed follow-ups (owner decides): pin checkboxes in the dashboard (by item or topic); ARCHITECTURE.md §4 wording once ADR 0016 is accepted; a live Tier 2 run with E.
+- Next step: owner reviews and decides ADR 0016, then runs Tier 2 live with E.
+

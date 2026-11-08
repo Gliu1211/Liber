@@ -99,3 +99,26 @@ Option 2, with option 4 as its dashboard interface later.
   suggestion ("this tool result was never discussed") is a later option.
 - **Revisit when** a model can recall offloaded items on demand (D3's v2 `recall(id)` tool):
   keeping would then matter less for items that can be fetched again.
+
+## Implementation notes (2026-11-08)
+Built as decided. Two details the decision left open:
+- **Where pinned text comes from.**
+  - The database holds no conversation content, and `liber plan create` runs in its own process.
+    So `commands.create` reads the item's block from the session's recorded request bodies, newest
+    first, looking at up to 50 of them.
+  - The item id covers the block's content and everything before it, so a block found under that
+    id is the right one.
+  - With `LIBER_RECORD_BODIES=false` there is nothing to read, and a pin is refused with that
+    reason.
+  - Tier 2's condition E records its history the way the proxy would, so it goes through the same
+    path.
+- **Where the checks live.**
+  - `commands.create` refuses a pin outside the summarized range, a kind other than text, tool
+    call or tool result, an item also offloaded or deleted in the same command, and a pin without
+    `--summarize-through`.
+  - `plan/apply.py` refuses to render a summary whose pins aren't in its own range
+    (`PlanNotApplicable`, so the request goes through without the plan).
+  - The validator needs no new rule: pins change only the frozen block's text.
+- **Not built yet:** the dashboard checkbox (the ADR says later), and §4's wording in
+  ARCHITECTURE.md (once the ADR is accepted).
+
