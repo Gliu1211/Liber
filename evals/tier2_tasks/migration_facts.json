@@ -1,0 +1,30 @@
+{
+  "name": "migration_facts",
+  "description": "Summary faithfulness: a detail buried in a long tool result must survive compaction.",
+  "reasoning_dependent": false,
+  "system": "You are a concise database assistant. Use the tools when asked.",
+  "tools": [
+    {
+      "name": "migration_report",
+      "description": "Results of last night's migrations.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ],
+  "tool_outputs": {
+    "migration_report": "migration 001: table=orders rows=2000 duration_s=2 status=ok\nmigration 002: table=payments rows=3000 duration_s=3 status=ok\nmigration 003: table=events rows=4000 duration_s=4 status=ok\nmigration 004: table=users rows=5000 duration_s=5 status=ok\nmigration 005: table=orders rows=6000 duration_s=6 status=ok\nmigration 006: table=payments rows=7000 duration_s=7 status=ok\nmigration 007: table=events rows=8000 duration_s=8 status=ok\nmigration 008: table=users rows=9000 duration_s=9 status=ok\nmigration 009: table=orders rows=10000 duration_s=1 status=ok\nmigration 010: table=payments rows=11000 duration_s=2 status=ok\nmigration 011: table=events rows=12000 duration_s=3 status=ok\nmigration 012: table=users rows=13000 duration_s=4 status=ok\nmigration 013: table=orders rows=1000 duration_s=5 status=ok\nmigration 014: table=payments rows=2000 duration_s=6 status=ok\nmigration 015: table=events rows=3000 duration_s=7 status=ok\nmigration 016: table=users rows=4000 duration_s=8 status=ok\nmigration 017: table=orders rows=5000 duration_s=9 status=ok\nmigration 018: table=payments rows=6000 duration_s=1 status=ok\nmigration 019: table=events rows=7000 duration_s=2 status=ok\nmigration 020: table=users rows=8000 duration_s=3 status=ok\nmigration 021: table=orders rows=9000 duration_s=4 status=ok\nmigration 022: table=payments rows=10000 duration_s=5 status=ok\nmigration 023: table=events rows=11000 duration_s=6 status=ok\nmigration 024: table=users rows=12000 duration_s=7 status=ok\nmigration 025: table=orders rows=13000 duration_s=8 status=ok\nmigration 026: table=payments rows=1000 duration_s=9 status=ok\nmigration 027: table=events rows=2000 duration_s=1 status=ok\nmigration 028: table=users rows=3000 duration_s=2 status=ok\nmigration 029: table=orders rows=4000 duration_s=3 status=ok\nmigration 030: table=payments rows=5000 duration_s=4 status=ok\nmigration 031: table=events rows=6000 duration_s=5 status=ok\nmigration 032: table=users rows=7000 duration_s=6 status=ok\nmigration 033: table=orders rows=8000 duration_s=7 status=ok\nmigration 034: table=payments rows=9000 duration_s=8 status=ok\nmigration 035: table=events rows=10000 duration_s=9 status=ok\nmigration 036: table=users rows=11000 duration_s=1 status=ok\nmigration 037: table=orders rows=12000 duration_s=2 status=FAILED (lock timeout on orders_idx)\nmigration 038: table=payments rows=13000 duration_s=3 status=ok\nmigration 039: table=events rows=1000 duration_s=4 status=ok\nmigration 040: table=users rows=2000 duration_s=5 status=ok\nmigration 041: table=orders rows=3000 duration_s=6 status=ok\nmigration 042: table=payments rows=4000 duration_s=7 status=ok\nmigration 043: table=events rows=5000 duration_s=8 status=ok\nmigration 044: table=users rows=6000 duration_s=9 status=ok\nmigration 045: table=orders rows=7000 duration_s=1 status=ok\nmigration 046: table=payments rows=8000 duration_s=2 status=ok\nmigration 047: table=events rows=9000 duration_s=3 status=ok\nmigration 048: table=users rows=10000 duration_s=4 status=ok\nmigration 049: table=orders rows=11000 duration_s=5 status=ok\nmigration 050: table=payments rows=12000 duration_s=6 status=ok\nmigration 051: table=events rows=13000 duration_s=7 status=ok\nmigration 052: table=users rows=1000 duration_s=8 status=ok\nmigration 053: table=orders rows=2000 duration_s=9 status=ok\nmigration 054: table=payments rows=3000 duration_s=1 status=ok\nmigration 055: table=events rows=4000 duration_s=2 status=ok\nmigration 056: table=users rows=5000 duration_s=3 status=ok\nmigration 057: table=orders rows=6000 duration_s=4 status=ok\nmigration 058: table=payments rows=7000 duration_s=5 status=ok\nmigration 059: table=events rows=8000 duration_s=6 status=ok\nmigration 060: table=users rows=9000 duration_s=7 status=ok"
+  },
+  "turns": [
+    "Remember for later: the maintenance window is Saturday 02:00-04:00 UTC, approved by Dana. Now call migration_report and tell me in one sentence whether last night's run succeeded.",
+    "Which tables did the run touch? One line.",
+    "Draft a two-sentence status update for the team.",
+    "Thanks, that's all for the report."
+  ],
+  "compact_through_turn": 2,
+  "needle_fact": "The maintenance window is Saturday 02:00-04:00 UTC, approved by Dana.",
+  "needle_question": "When is the maintenance window and who approved it? One line.",
+  "probe_question": "Which migration number failed, on which table, and why? One sentence.",
+  "probe_rubric": "Pass only if the answer names migration 037 (or 37), the orders table, and a lock timeout on orders_idx. Fail if any of the three is missing or wrong."
+}

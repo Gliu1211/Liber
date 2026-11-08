@@ -174,6 +174,26 @@ new numbers (§12). Until it exists, the gate only warns. To add a session, see
 checks: p95 and max of each Tier 1 replay run, and a synthetic ~1 MB, 401-message conversation.
 It reports and doesn't gate.
 
+### Tier 2 evals (quality, real models, costs money)
+
+```bash
+ANTHROPIC_API_KEY=... uv run python -m liber.evals.tier2 --live
+```
+
+Runs each task in `evals/tier2_tasks/` under four conditions (§12, [ADR 0015](docs/decisions/0015-tier2-quality-evals.md)):
+- **A:** full context;
+- **B:** Liber with thinking dropped;
+- **C:** Liber with `carry_forward_reasoning`;
+- **D:** simulated client auto-compaction.
+
+Each condition runs 3 times by default (`--repeats`). An LLM judge grades task success and
+whether the planted "needle" fact survived. Every request asks the API to fail, not drop, on
+thinking bound to other history, so a Liber mistake shows up as a 400 naming the block.
+
+Results go to `evals/history/<date>.json`, with a markdown report beside it: per-condition mean
+and spread, the comparisons (A vs B, C vs B, B and C vs D), and trends over earlier runs. It
+refuses to run without `--live` and never runs in CI.
+
 Tests run fully offline. A fake upstream is plugged into the proxy's httpx client, plus a real
 uvicorn server on localhost for the streaming-timing tests. No API key is needed.
 
