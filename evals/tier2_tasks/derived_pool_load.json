@@ -1,6 +1,6 @@
 {
   "name": "derived_pool_load",
-  "description": "Reasoning-dependent: the metrics give ~760 requests/s and ~41 ms per DB query against a pool of 50, but never the connections in use. The model works out ~31 in use (Little's law) in its thinking and replies only 'no'. The probe asks for that derived number, so C's carry-forward notes are the only compacted condition likely to keep it. evidence_markers show when B's summary kept the raw figures instead.",
+  "description": "Reasoning-dependent: the metrics give ~760 requests/s and ~41 ms per DB query against a pool of 50, but never the connections in use. The model works out ~31 in use (Little's law) in its thinking and replies only 'no'. The probe asks for that derived number, so of the compacted conditions, C (its notes) and D (whose summarizer still sees the thinking) can keep it; B can't. evidence_markers show when B's summary kept the request rate (760), the one figure the summaries tend to drop; with it, the number can be worked out again. (Latency and pool size are in almost every summary, so they don't count as evidence.)",
   "reasoning_dependent": true,
   "system": "You are a concise on-call assistant. Use the tools when asked. Keep visible replies as short as the user asks.",
   "tools": [
@@ -38,14 +38,10 @@
   "probe_rubric": "Pass only if the answer says about 31 connections in use (anything from 28 to 34) and about 19 spare (16 to 22) out of 50, derived from roughly 760 requests per second times about 41 ms per query. Fail if either number is outside those ranges or missing, or if it is a guess without the request rate and latency.",
   "evidence_markers": [
     "760",
-    "41 ms",
-    "41ms",
-    "41.1",
-    "40.8",
-    "db_query_latency",
-    "pool_size",
+    "758",
+    "762",
     "31 of 50",
     "31/50",
-    "Little"
+    "Little's law"
   ]
 }
