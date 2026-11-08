@@ -364,6 +364,79 @@ def input_cost(usage: Usage, model: str, pricing: dict[str, ModelPrice]) -> floa
     return dollars / 1_000_000
 
 
+def needle_rubric(task: Task) -> str:
+    return f"Pass only if the answer states this fact correctly: {task.needle_fact}"
+
+
+async def rejudge(
+    api: MessagesApi, tasks: dict[str, Task], judge_model: str, runs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Grade an earlier run's saved answers again; no conversation is re-run, only the judge is paid.
+
+    Why: the first live run's judge calls all failed (HTTP 400), but every answer was saved. Uses the
+    task files as they are now, so an edited rubric applies too. Runs with no answers (a failed
+    repeat) are left as they were. A binding break still counts as a failed answer, as in grade().
+    """
+    graded = []
+    for saved in runs:
+        run = {**saved, "judge_reasons": dict(saved.get("judge_reasons") or {})}
+        task = tasks.get(run["task"])
+        answers = run.get("answers") or {}
+        probe, needle = answers.get("probe"), answers.get("needle")
+        if task is None:
+            if probe is not None or needle is not None:
+                run["judge_reasons"]["rejudge"] = f"no task file named {run['task']}: left as it was"
+            graded.append(run)
+            continue
+        if probe is not None:
+            run["success"], run["judge_reasons"]["probe"] = await judge(
+                api, judge_model, task.probe_question, task.probe_rubric, probe
+            )
+        if needle is not None:
+            run["needle_kept"], run["judge_reasons"]["needle"] = await judge(
+                api, judge_model, task.needle_question, needle_rubric(task), needle
+            )
+        if run.get("binding_errors"):
+            run["success"] = False if probe is None else run["success"]
+            run["needle_kept"] = False if needle is None else run["needle_kept"]
+        graded.append(run)
+    return graded
+
+
+async def rejudge_file(api: MessagesApi, path: Path, tasks_dir: Path, judge_model: str, now: datetime) -> str:
+    """Rejudge a history file in place, keeping the original beside it as <name>.json.bak.
+
+    In place, not as a new file: it is the same run, and a second file would show up as a second
+    point in the report's trends. The .bak suffix keeps the copy out of those trends.
+    """
+    data = read_history(path)
+    tasks = {task.name: task for task in load_tasks(tasks_dir)}
+    runs = await rejudge(api, tasks, judge_model, data["runs"])
+    return write_rejudged(path, data, runs, judge_model, now)
+
+
+def read_history(path: Path) -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return data
+
+
+def write_rejudged(
+    path: Path, data: dict[str, Any], runs: list[dict[str, Any]], judge_model: str, now: datetime
+) -> str:
+    """Back up the original, write the regraded run and its report, and say how the verdicts came out."""
+    path.with_name(path.name + ".bak").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    meta = {key: value for key, value in data.items() if key not in ("runs", "date")}
+    meta["judge_model"] = judge_model
+    meta["rejudged"] = [
+        *meta.get("rejudged", []),
+        {"at": now.isoformat(timespec="seconds"), "judge_model": judge_model},
+    ]
+    tier2_report.save_history(path, path.with_suffix(".md"), runs, meta)
+    verdicts = [run.get(key) for run in runs for key in ("success", "needle_kept") if run.get("answers")]
+    passed, failed = verdicts.count(True), verdicts.count(False)
+    return f"rejudged {path.resolve()}: {passed} pass, {failed} fail, {len(verdicts) - passed - failed} missing"
+
+
 async def grade(
     api: MessagesApi, task: Task, settings: Settings, run: ConditionRun, probe: str | None, needle: str | None
 ) -> None:
@@ -375,9 +448,8 @@ async def grade(
         )
     if needle is not None:
         run.answers["needle"] = needle
-        rubric = f"Pass only if the answer states this fact correctly: {task.needle_fact}"
         run.needle_kept, run.judge_reasons["needle"] = await judge(
-            api, settings.judge_model, task.needle_question, rubric, needle
+            api, settings.judge_model, task.needle_question, needle_rubric(task), needle
         )
     if run.binding_errors:
         run.success = False if probe is None else run.success
@@ -448,6 +520,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--tasks", type=Path, default=TASKS_DIR)
     parser.add_argument("--out", type=Path, default=HISTORY_DIR)
+    parser.add_argument(
+        "--rejudge",
+        type=Path,
+        metavar="HISTORY_JSON",
+        help="only grade that run's saved answers again (judge calls only)",
+    )
     args = parser.parse_args(argv)
     if not args.live:
         print("Tier 2 calls real models and costs money. Run it with --live (never in CI).")
@@ -462,6 +540,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.repeats < 1:
         print("--repeats must be at least 1")
         return 2
+    if args.rejudge is not None:
+        if not args.rejudge.exists():
+            print(f"No such file: {args.rejudge}")
+            return 2
+
+        async def regrade() -> str:
+            api = HttpMessagesApi(key)
+            try:
+                return await rejudge_file(api, args.rejudge, args.tasks, args.judge_model, datetime.now(UTC))
+            finally:
+                await api.aclose()
+
+        print(asyncio.run(regrade()))
+        return 0
     from liber.worker.client import AnthropicModelClient  # the real worker model, only when live
 
     settings = Settings(args.model, args.judge_model, args.summary_model, args.repeats)
@@ -487,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
             await worker_client.aclose()
 
     asyncio.run(go())
-    print(f"results: {json_path}\nreport:  {report_path}")
+    print(f"results: {json_path.resolve()}\nreport:  {report_path.resolve()}")
     return 0
 
 

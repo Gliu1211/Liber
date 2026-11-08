@@ -171,3 +171,17 @@ Template:
 - make check: pass (394 tests; Tier 1 unchanged, eval gate passed)
 - Proposed follow-ups (owner decides): first live run (a few dollars); paired per-repeat differences in the report; output prices in the pricing table; usage from worker calls; more tasks, including replayed real sessions.
 - Next step: owner reviews Session 7, decides ADR 0015, and runs Tier 2 live. v1's roadmap (§14) is then complete.
+
+## 2026-11-07 — Tier 2: judge fix, `--rejudge`, harder tasks
+- Context: the first live run (`evals/history/2026-11-08.*`) graded nothing. All 48 judge calls returned 400: Opus 5.5 rejects `thinking: {"type": "disabled"}`. Everything else in the run was valid (0 binding errors across 48 compacted requests; B used 59–78% fewer input tokens than A). By manual reading, every condition answered both tasks correctly, so the two tasks are too easy to separate conditions.
+- Done:
+  - Judge (`tier2_api.py`): no `thinking` field (adaptive thinking stays on), `output_config.effort: "low"`, `max_tokens` 8,000 so thinking can't crowd out the verdict. A failed judge call now keeps the API's own error message. The fake API rejects disabled thinking like the real one.
+  - `--rejudge HISTORY_JSON` (`tier2.py`): grades the saved answers again with the current judge and task rubrics, without re-running any conversation. Writes the same `.json`/`.md`, keeps the original as `<name>.json.bak` (not `*.json`, so trends ignore it), and records the re-grade in `meta.rejudged`. Same guards as a live run (`--live`, a key, not CI).
+  - Three harder tasks in `evals/tier2_tasks/`:
+    - `undiscussed_config_detail`: a ~90-line config read once; the probe asks for a setting nobody discussed (`retry.backoff_multiplier = 1.7`), among similar-looking numbers.
+    - `derived_pool_load` (reasoning-dependent): connections in use (~31 of 50) are only ever worked out in the thinking (760 req/s × 41 ms); the visible reply is just "no".
+    - `code_reconstruction`: parse() is edited twice, then the probe asks for the current function exactly.
+- Tests: judge request shape (no thinking, low effort); the API's error message kept; rejudge grades saved answers without re-running, leaves runs without answers alone, notes missing tasks, rewrites the file in place with a backup; CLI guards. New tasks are covered by the existing fixture check.
+- Open issues: the worker still sends `thinking: disabled` to its summary model; fine on Haiku 5.5, but it would 400 on a Sonnet/Opus 5.5 worker. The new tasks' difficulty is a guess until a live run.
+- Proposed follow-ups (owner decides): make the worker's thinking setting depend on its model; decide ADR 0015.
+- Next step: owner merges, runs `--rejudge` on the 2026-11-08 history (judge calls only), then a fresh `--live --repeats 3` with all five tasks.

@@ -111,6 +111,13 @@ def binding_error(result: ApiResult) -> str | None:
     return f"{path.group(0) if path else 'unknown path'}: {message[:200]}"
 
 
+def error_message(result: ApiResult) -> str:
+    """The API's own explanation of a failed request, so a report says why, not just the status."""
+    error = result.body.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    return str(message)[:300] if message else "no error message"
+
+
 def reply_text(body: dict[str, Any]) -> str:
     content = body.get("content") or []
     return "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
@@ -151,6 +158,8 @@ JUDGE_SYSTEM = (
     'JSON object the schema describes: "pass" true only if the answer meets the rubric, and a '
     'one-sentence "reason".'
 )
+JUDGE_MAX_TOKENS = 8000
+
 JUDGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {"pass": {"type": "boolean"}, "reason": {"type": "string"}},
@@ -165,16 +174,18 @@ async def judge(api: MessagesApi, model: str, question: str, rubric: str, answer
     grading = grading.replace("<", "\\u003c").replace(">", "\\u003e")  # the answer can't close the tag
     request = {
         "model": model,
-        "max_tokens": 1000,
+        # Thinking stays on (below), so leave room for it before the verdict's JSON.
+        "max_tokens": JUDGE_MAX_TOKENS,
         "system": JUDGE_SYSTEM,
         "messages": [{"role": "user", "content": f"<grading>\n{grading}\n</grading>"}],
-        # A verdict needs no deliberation, and thinking could use up max_tokens before the JSON.
-        "thinking": {"type": "disabled"},
-        "output_config": {"format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
+        # No `thinking` field: current models (Opus 5.5, Sonnet 5.5, Fable 5.1) reject
+        # {"type": "disabled"} with a 400, and that rejected every verdict of the first live run.
+        # Low effort keeps the judge's thinking short instead.
+        "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
     }
     result = await api.send(request, ())
     if result.status != 200:
-        return None, f"judge failed: HTTP {result.status}"
+        return None, f"judge failed: HTTP {result.status}: {error_message(result)}"
     if result.body.get("stop_reason") in ("max_tokens", "refusal"):
         return None, f"judge stopped: {result.body.get('stop_reason')}"
     try:

@@ -1,0 +1,43 @@
+{
+  "name": "code_reconstruction",
+  "description": "Factual, hard, and the core of real coding sessions: a file is read, parse() is edited twice (an empty-input check, then a docstring), and two unrelated turns follow. The probe asks for the current parse() exactly. Summaries tend to describe edits instead of keeping code, so this tests code fidelity after compaction.",
+  "reasoning_dependent": false,
+  "system": "You are a concise coding assistant. Use the tools when asked. Reply with code only when the user asks for code.",
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read a file from the repository.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  ],
+  "tool_outputs": {
+    "read_file": "\"\"\"Parse the nightly orders export (pipe-separated) into records.\"\"\"\n\nimport csv\nimport logging\nfrom pathlib import Path\n\nlog = logging.getLogger(__name__)\n\nFIELDS = (\"id\", \"region\", \"amount_cents\", \"tags\")\n\n\ndef parse(line):\n    parts = line.strip().split(\"|\")\n    record_id = parts[0]\n    region = parts[1].lower()\n    amount_cents = int(parts[2])\n    tags = [tag for tag in parts[3].split(\",\") if tag]\n    return {\"id\": record_id, \"region\": region, \"amount_cents\": amount_cents, \"tags\": tags}\n\n\ndef load(path):\n    records = []\n    with Path(path).open(encoding=\"utf-8\") as handle:\n        for number, line in enumerate(handle, start=1):\n            try:\n                record = parse(line)\n            except (IndexError, ValueError) as error:\n                log.warning(\"skipping line %d: %s\", number, error)\n                continue\n            if record is not None:\n                records.append(record)\n    return records\n\n\ndef totals_by_region(records):\n    totals = {}\n    for record in records:\n        totals[record[\"region\"]] = totals.get(record[\"region\"], 0) + record[\"amount_cents\"]\n    return totals\n\n\ndef write_summary(records, out_path):\n    totals = totals_by_region(records)\n    with Path(out_path).open(\"w\", newline=\"\", encoding=\"utf-8\") as handle:\n        writer = csv.writer(handle)\n        writer.writerow([\"region\", \"amount_cents\"])\n        for region in sorted(totals):\n            writer.writerow([region, totals[region]])\n\n\nif __name__ == \"__main__\":\n    import sys\n\n    write_summary(load(sys.argv[1]), sys.argv[2])\n"
+  },
+  "turns": [
+    "Ticket DEV-318; the reviewer is Ines Duarte. Remember both. Call read_file on etl/parser.py. Then change parse() so it returns None for empty or whitespace-only input, with that check at the top. Reply with the full updated parse() only.",
+    "Rename load() to load_records(). Reply with only its new def line.",
+    "Add this docstring to parse(): Parse one line of the export format. Reply with the full updated parse() only.",
+    "Unrelated question: in one sentence, when should I prefer a tuple over a list in Python?",
+    "Another one: in one sentence, what does functools.lru_cache do?"
+  ],
+  "compact_through_turn": 2,
+  "needle_fact": "The ticket is DEV-318 and the reviewer is Ines Duarte.",
+  "needle_question": "What was the ticket and who is the reviewer? One line.",
+  "probe_question": "Answer from memory without calling any tools: write out the current parse() function exactly as it stands after all our edits. Code only.",
+  "probe_rubric": "Pass only if the code has all of: (1) the docstring 'Parse one line of the export format.'; (2) an early check that returns None for empty or whitespace-only input; (3) the stripped line split on '|'; (4) region from parts[1], lower-cased; (5) amount_cents = int(parts[2]); (6) tags from parts[3] split on ',' with empty tags dropped; (7) a returned dict with the keys id, region, amount_cents and tags. Fail if any of these is missing or different.",
+  "evidence_markers": [
+    "split(\"|\")",
+    "int(parts[2])",
+    "parts[1].lower()"
+  ]
+}
