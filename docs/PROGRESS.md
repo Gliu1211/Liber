@@ -188,3 +188,22 @@ Template:
 - Open issues: the worker still sends `thinking: disabled` to its summary model; fine on Haiku 5.5, but it would 400 on a Sonnet/Opus 5.5 worker. The new tasks' difficulty is a guess until a live run.
 - Proposed follow-ups (owner decides): make the worker's thinking setting depend on its model; decide ADR 0015.
 - Next step: owner merges, runs `--rejudge` on the 2026-11-08 history (judge calls only), then a fresh `--live --repeats 3` with all five tasks.
+
+## 2026-11-07 — Tier 2 second live run: findings, two fixes, ADR 0016 proposed
+- Results (`evals/history/2026-11-08-012656.*`, owner's machine; 3 repeats, Sonnet 5.5, Opus 5.5 judge, Haiku 5.5 summaries):
+  - `derived_pool_load`: B 1/3, C 3/3, D 3/3, A 3/3. When B failed, its summary had the pool size and latency but not the request rate, and the model said so instead of guessing. C's notes kept the derivation. First evidence that carry-forward notes matter.
+  - `undiscussed_config_detail`: A 3/3; B, C and D all 0/3, every answer "I don't know" (no guesses).
+  - `code_reconstruction`: C 2/3 (one rebuilt `parse()` split the unstripped line), the rest 3/3: one answer, within noise.
+  - `dead_end_debugging`, `migration_facts`: everything passed; still too easy.
+  - Input tokens: Liber 44–77% below D on every task. 0 binding errors, 0 other errors, 0 tool calls during the questions. `--rejudge` worked on the first run (2026-11-08 now graded).
+- Done:
+  - Summarizer cuts are now marked as Liber's (`worker/summarize.py`): a cut entry carries `"cut_by_liber": true`, and both system prompts say what it means. A JSON field, not words in the text, so the conversation can't fake one (ADR 0013's rule). `BLOCK_MAX_CHARS` is 16,000 (was 4,000). Why: the 7,700-character metrics dump was cut at 4,000, the summary said "Metrics were truncated mid-output", and B then believed the tool had cut its data.
+  - `PROMPT_VERSION` 2, so summaries written with the old prompt aren't reused. Side effects: on the next request in each active session the worker re-summarizes every past exchange once (a one-time worker cost), and until it catches up `liber plan create --summarize-through` says "not ready". Applied plans are unaffected (their text is fixed in the plan). No Tier 1 fixture or baseline refers to `prompt-v1`. Tool-heavy exchanges now send up to 4x more text per summary call, still bounded by the 60,000-character exchange limit.
+  - `derived_pool_load` evidence markers narrowed to the request rate (`760`, `758`, `762`) and the derived answer (`31 of 50`, `31/50`, `Little's law`). "41 ms" matched "40-41 ms" in every summary, so the column said 3/3 even when the summary lacked the one figure that matters; plain "Little" would match "a little".
+- Decisions: [ADR 0016](decisions/0016-keep-items-through-a-summary.md) (Proposed): keep chosen items through a summary (copied as they were into the frozen block), and Tier 2 condition E to measure it. Today a summary replaces everything in its range, so a user can't keep the config output without leaving the whole rest of the conversation unsummarized.
+- Tests: a cut block carries the flag and both prompts explain it; text imitating the flag stays text; an exchange over the limit is cut evenly, flagged and fits; a tiny share still keeps text; a 7,700-character block is sent whole.
+- Review: independent reviewer run; no must-fix. Fixed: the text mark left no room for content in big exchanges and could be faked (now the JSON flag); the `shortened()` path untested; `"Little"` matched "a little"; ADR 0016 said kept text is escaped like summaries (now: only Liber's tag sequences are neutralized, so code reads as it was), and now lists the prompt-injection cost, why bytes stay identical, what E records on a refused plan, and the Tier 2 files; `pinned_item_ids`/`--pin` instead of "keep" (§4's default); the PROMPT_VERSION side effects (above).
+- make check: pass (405 tests; Tier 1 unchanged, eval gate passed)
+- Open issues: the history file's "date" now carries a time (`2026-11-08-012656`) when a same-day file exists; trends sort it fine.
+- Proposed follow-ups (owner decides): ADR 0016 and its implementation (one session: plan operation, rendering, CLI, Tier 2 condition E); more repeats (5+) now that conditions differ; replace or harden `dead_end_debugging` and `migration_facts`.
+- Next step: owner decides ADR 0016.
