@@ -75,6 +75,13 @@ def add_plan_commands(commands: "argparse._SubParsersAction[argparse.ArgumentPar
     create.add_argument("--offload", nargs="+", default=[], metavar="ITEM", help="item ids to offload")
     create.add_argument("--delete", nargs="+", default=[], metavar="ITEM", help="item ids to delete")
     create.add_argument("--note", help="label shown in the offload pointer note")
+    create.add_argument(
+        "--pin",
+        action="append",
+        default=[],
+        metavar="ITEM",
+        help="keep this item as it was inside the summary (repeatable)",
+    )
     for name, text in (("apply", "apply the pending version at the next clean turn"), ("undo", "go back one version")):
         action = actions.add_parser(name, help=text)
         action.add_argument("--session", required=True)
@@ -102,6 +109,7 @@ def run_plan_command(args: argparse.Namespace, settings: Settings) -> int:
                     args.note,
                     summary_model=settings.summary_model,
                     carry_forward_reasoning=settings.carry_forward_reasoning,
+                    pin=tuple(args.pin),
                 )
             if args.plan_command == "apply":
                 return await commands.apply(store, args.session)

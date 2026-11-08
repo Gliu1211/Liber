@@ -99,6 +99,17 @@ liber plan create --session SESSION --summarize-through 9 --offload ITEM_ID --no
 liber plan apply --session SESSION    # takes effect at the session's next new turn
 ```
 
+A summary normally replaces everything in its range. To keep chosen items as they were, pin
+them; their text is copied into the summary block
+([ADR 0016](docs/decisions/0016-keep-items-through-a-summary.md)):
+
+```bash
+liber plan create --session SESSION --summarize-through 9 --pin ITEM_ID --pin ITEM_ID
+```
+
+Text, tool calls and tool results can be pinned, not thinking or images. The text is read from
+the session's recorded requests, so pinning needs `LIBER_RECORD_BODIES` on (the default).
+
 ```bash
 liber plan undo --session SESSION     # back to the previous version, also at the next new turn
 ```
@@ -180,11 +191,13 @@ It reports and doesn't gate.
 ANTHROPIC_API_KEY=... uv run python -m liber.evals.tier2 --live
 ```
 
-Runs each task in `evals/tier2_tasks/` under four conditions (§12, [ADR 0015](docs/decisions/0015-tier2-quality-evals.md)):
+Runs each task in `evals/tier2_tasks/` under these conditions (§12, [ADR 0015](docs/decisions/0015-tier2-quality-evals.md)):
 - **A:** full context;
 - **B:** Liber with thinking dropped;
 - **C:** Liber with `carry_forward_reasoning`;
-- **D:** simulated client auto-compaction.
+- **D:** simulated client auto-compaction;
+- **E:** B plus the task's chosen tool results kept as they were (only tasks with
+  `keep_tool_results`, [ADR 0016](docs/decisions/0016-keep-items-through-a-summary.md)).
 
 Each condition runs 3 times by default (`--repeats`). An LLM judge grades task success and
 whether the planted "needle" fact survived. Every request asks the API to fail, not drop, on
