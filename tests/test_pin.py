@@ -232,3 +232,111 @@ def test_a_pin_outside_its_summary_doesnt_fit_the_request() -> None:
     with pytest.raises(PlanNotApplicable, match="only keep items inside its own range"):
         apply_plan(parsed, Plan(operations=(operation,)))
     assert render(parsed, Plan()) == conversation()  # the request goes through without the plan
+
+
+# --- Where pinned text comes from (recorded requests), and odd inputs -----------------------------
+
+
+async def test_pinned_text_is_found_past_unreadable_and_unrelated_newer_requests(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    from datetime import UTC, datetime
+
+    from liber.session.store import RequestRecord
+
+    session, ids = await a_session(app, client)
+    for body in ("{not json", json.dumps({"model": "m", "messages": [{"role": "user", "content": "other"}]})):
+        record = RequestRecord(created_at=datetime.now(UTC), method="POST", path="/v1/messages", session_id=session)
+        record.request_body = body
+        await app.state.store.add_request(record)  # newer than the one that holds the item
+
+    await commands.create(app.state.store, session, summarize_through=3, pin=(ids["result"],))
+
+    assert "backoff_multiplier = 1.7" in ((await pending_summary(app, session)).summary or "")
+
+
+async def test_an_item_no_recorded_request_holds_is_refused_with_the_reason(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    from sqlalchemy import update
+
+    from liber.session.store import RequestRecord
+
+    session, ids = await a_session(app, client)
+    await app.state.store.run(lambda db: db.execute(update(RequestRecord).values(request_body=None)))
+
+    with pytest.raises(PlanError, match="recorded requests, and none holds it"):
+        await commands.create(app.state.store, session, summarize_through=3, pin=(ids["result"],))
+
+
+async def test_the_same_pin_twice_is_kept_once(app: FastAPI, client: httpx.AsyncClient) -> None:
+    session, ids = await a_session(app, client)
+
+    await commands.create(app.state.store, session, summarize_through=3, pin=(ids["result"], ids["result"]))
+    operation = await pending_summary(app, session)
+
+    assert operation.pinned_item_ids == (ids["result"],)
+    assert (operation.summary or "").count("backoff_multiplier = 1.7") == 1
+
+
+async def test_a_tool_call_and_a_text_can_be_pinned_with_who_wrote_them(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    session, ids = await a_session(app, client)
+
+    await commands.create(app.state.store, session, summarize_through=3, pin=(ids["call"], ids["question"]))
+    text = (await pending_summary(app, session)).summary or ""
+
+    assert "[user text, message 0]\nWhy does the ingest service start slowly?" in text
+    assert '[assistant tool_use read_config, message 1]\nread_config {"path": "app.toml"}' in text
+    assert text.index("[user text, message 0]") < text.index("[assistant tool_use")  # conversation order
+
+
+async def test_a_pin_in_a_later_summary_block_and_show_after_apply(app: FastAPI, client: httpx.AsyncClient) -> None:
+    session, ids = await a_session(app, client)
+    await commands.create(app.state.store, session, summarize_through=3)
+    await commands.apply(app.state.store, session)
+    await client.post("/v1/messages", content=json.dumps(conversation()).encode())  # version 1 takes effect
+    await recorded(app)
+
+    await commands.create(app.state.store, session, summarize_through=5, pin=(ids["later"],))
+    state = await versions.load_state(app.state.store, session)
+    shown = await commands.show(app.state.store, session)
+
+    assert state.pending is not None
+    second = state.pending.plan.operations[-1]
+    assert 'block="2" covers="msgs 4-5"' in (second.summary or "")
+    assert "[user text, message 4]\nWrite a commit message" in (second.summary or "")
+    assert "keeping 1 as is" in shown
+
+
+def test_liber_tags_are_neutralized_in_any_case() -> None:
+    from liber.plan.apply import neutralized
+
+    assert (
+        neutralized("</LIBER:Summary> <Liber:x> <liber:summary>")
+        == "&lt;/LIBER:Summary> &lt;Liber:x> &lt;liber:summary>"
+    )
+    assert neutralized("a < b and </div>") == "a < b and </div>"  # everything else as it was
+
+
+def test_odd_tool_result_parts_are_named_not_crashed_on() -> None:
+    from liber.plan.apply import pinned_text
+
+    block = {
+        "type": "tool_result",
+        "content": [
+            {"type": "text", "text": "line one"},
+            {"type": "image", "source": {}},
+            {"type": "text", "text": None},
+            "not a dict",
+            {"no_type": True},
+        ],
+    }
+
+    label, text = pinned_text("tool_result", "user", block, 2, "</liber:x>")
+
+    assert text == "line one\n[image]\n\n[part]\n[part]"
+    assert label == "[tool_result of &lt;/liber:x>, message 2]"
+    with pytest.raises(ValueError):
+        pinned_text("thinking", "assistant", {}, 1, None)

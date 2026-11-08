@@ -17,10 +17,11 @@ cache/exchanges.py). If one of the exchanges isn't summarized yet, `create` refu
 """
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -33,6 +34,8 @@ from liber.plan.apply import PINNABLE, Pinned, pinned_text, summarize_operation
 from liber.plan.versions import PlanError
 from liber.session.store import BranchRecord, ChainNode, ItemRecord, RequestRecord, Store
 from liber.worker.summarize import summarizer_id
+
+log = structlog.get_logger(__name__)
 
 
 def latest_branch_items(db: Session, session_id: str) -> list[ItemRecord]:
@@ -206,7 +209,11 @@ async def create(
     version and number their summaries alike.
     """
     now = datetime.now(UTC)
-    writer = SummaryWriter(summarizer_id(summary_model), carry_forward_reasoning, pin)
+    pin = tuple(dict.fromkeys(pin))  # the same item twice is kept once
+    # Pinned text is read before the write transaction: parsing recorded bodies can take a while,
+    # and the proxy must not wait on the write lock meanwhile (hard rule 1).
+    blocks = await store.run(lambda db: blocks_to_pin(db, session_id, pin)) if pin else {}
+    writer = SummaryWriter(summarizer_id(summary_model), carry_forward_reasoning, pin, blocks)
     version = await store.run(
         lambda db: create_now(db, session_id, summarize_through, offload, delete, note, now, writer), immediate=True
     )
@@ -297,6 +304,7 @@ class SummaryWriter:
     summarizer: str  # summarizer_id(summary model)
     carry_forward_reasoning: bool  # include the notes (and wait for them)
     pin: tuple[str, ...] = ()  # items to keep through the summary
+    pin_blocks: dict[str, dict[str, Any]] = field(default_factory=dict)  # their blocks (and their tool calls')
 
 
 def summary_through(
@@ -328,16 +336,16 @@ def summary_through(
     chosen = [written[e.key] for e in in_range]
     if not writer.carry_forward_reasoning:
         chosen = [replace(summary, notes=None) for summary in chosen]  # notes only with the setting on
-    pinned = pinned_items(db, items, first, last, writer.pin)
+    pinned = pinned_items(items, first, last, writer.pin, writer.pin_blocks)
     return summarize_operation(items, first, last, len(summaries) + 1, summaries=chosen, pinned=pinned)
 
 
-def pinned_items(db: Session, items: list[ItemRecord], first: int, last: int, ids: tuple[str, ...]) -> list[Pinned]:
+def pinned_items(
+    items: list[ItemRecord], first: int, last: int, ids: tuple[str, ...], blocks: dict[str, dict[str, Any]]
+) -> list[Pinned]:
     """The items to keep through the summary, with their text as it was (docs/decisions/0016).
 
-    The database holds no conversation content, so the text comes from the session's recorded
-    request bodies (LIBER_RECORD_BODIES, on by default), newest first. The item id covers the
-    block's content and everything before it, so a block found under that id is the right one.
+    `blocks`: the items' blocks, read from recorded requests beforehand (`blocks_to_pin`).
     """
     if not ids:
         return []
@@ -348,21 +356,20 @@ def pinned_items(db: Session, items: list[ItemRecord], first: int, last: int, id
             raise PlanError(f"{item_id} is in message {item.msg_index}, outside the summary (messages {first}-{last})")
         if item.kind not in PINNABLE:
             raise PlanError(f"a {item.kind} item can't be kept as text (only text, tool calls and tool results)")
-    # A tool result is labelled with its tool's name, which is in the matching tool call's block.
-    calls = {by_id[item_id].depends_on for item_id in ids if by_id[item_id].depends_on in by_id}
-    blocks = recorded_blocks(db, items[0].session_id, set(ids) | {c for c in calls if c is not None})
     missing = [item_id for item_id in ids if item_id not in blocks]
     if missing:
         raise PlanError(
-            f"can't keep {', '.join(missing)}: Liber finds an item's text only in the session's recorded "
-            "requests, and none holds it (is LIBER_RECORD_BODIES off?)"
+            f"can't keep {', '.join(missing)}: Liber finds an item's text only in the session's last "
+            f"{RECORDED_REQUESTS_SEARCHED} recorded requests, and none holds it (is LIBER_RECORD_BODIES off?)"
         )
     pinned = []
     for item_id in sorted(ids, key=lambda i: (by_id[i].msg_index, by_id[i].block_index)):  # conversation order
         item = by_id[item_id]
         call = blocks.get(item.depends_on or "")
-        tool_name = str(call.get("name")) if call is not None and call.get("name") else None
-        label, text = pinned_text(item.kind, blocks[item_id], item.msg_index, tool_name)
+        name = call.get("name") if call is not None else None
+        label, text = pinned_text(
+            item.kind, item.role, blocks[item_id], item.msg_index, name if isinstance(name, str) else None
+        )
         pinned.append(Pinned(item_id, label, text))
     return pinned
 
@@ -370,21 +377,38 @@ def pinned_items(db: Session, items: list[ItemRecord], first: int, last: int, id
 RECORDED_REQUESTS_SEARCHED = 50  # the session's newest requests; the newest normally holds everything
 
 
+def blocks_to_pin(db: Session, session_id: str, ids: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """The blocks of the items to pin, and of their tool calls (a tool result's label names its tool).
+
+    The text of a conversation is kept only in the recorded request bodies (LIBER_RECORD_BODIES, on
+    by default), so that's where it's read from. An item id covers the block's content and everything
+    before it, so a block found under that id in any recorded request is the right one.
+    """
+    items = {item.id: item for item in latest_branch_items(db, session_id)}
+    calls = {items[i].depends_on for i in ids if i in items and items[i].depends_on}
+    return recorded_blocks(db, session_id, set(ids) | {c for c in calls if c is not None})
+
+
 def recorded_blocks(db: Session, session_id: str, wanted: set[str]) -> dict[str, dict[str, Any]]:
-    """item id -> the client's block, from the session's recorded request bodies, newest first."""
+    """item id -> the client's block, from the session's recorded request bodies, newest first.
+
+    One body in memory at a time: the ids are listed first, then each body is loaded on its own.
+    """
     query = (
-        select(RequestRecord.request_body)
+        select(RequestRecord.id)
         .where(RequestRecord.session_id == session_id, RequestRecord.request_body.is_not(None))
         .order_by(RequestRecord.id.desc())
         .limit(RECORDED_REQUESTS_SEARCHED)
     )
     found: dict[str, dict[str, Any]] = {}
-    for body in db.scalars(query):
+    for request_id in list(db.scalars(query)):
+        body = db.scalar(select(RequestRecord.request_body).where(RequestRecord.id == request_id))
         if body is None:
             continue
         try:
             parsed = parse(json.loads(body))
-        except Exception:  # a body Liber couldn't parse is no source of blocks
+        except Exception as exc:  # a body Liber couldn't parse is no source of blocks
+            log.debug("pin_body_unreadable", request_id=request_id, error=type(exc).__name__)
             continue
         found.update({item.id: item.block for item in parsed.items if item.id in wanted and item.id not in found})
         if len(found) == len(wanted):

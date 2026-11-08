@@ -142,26 +142,37 @@ LIBER_TAG = re.compile(r"<(/?)(liber:)", re.IGNORECASE)
 
 
 def neutralized(text: str) -> str:
-    """`text` with Liber's own tag openings written as `&lt;liber:`, so it can't open or close a block."""
+    """`text` with Liber's own tag openings (`<liber:`, `</liber:`, any case) written as `&lt;...`,
+    so it can't open or close a block. Lookalikes such as `< /liber:` aren't tags, and nothing
+    reads frozen text as markup but the model, so they're left as they are."""
     return LIBER_TAG.sub(r"&lt;\1\2", text)
 
 
-def pinned_text(kind: str, block: dict[str, Any], msg_index: int, tool_name: str | None) -> tuple[str, str]:
+def pinned_text(kind: str, role: str, block: dict[str, Any], msg_index: int, tool_name: str | None) -> tuple[str, str]:
     """(label, text) for a pinned item: a text block's text, a tool call's name and input, a tool
-    result's text with any non-text parts named."""
+    result's text with any non-text parts named. Labels say who wrote it and where it was."""
     if kind == Kind.TEXT:
-        return f"[text, message {msg_index}]", str(block.get("text", ""))
+        return f"[{role} text, message {msg_index}]", str(block.get("text") or "")
     if kind == Kind.TOOL_USE:
-        text = f"{block.get('name', '?')} {json.dumps(block.get('input'), ensure_ascii=False)}"
-        return f"[tool_use {block.get('name', '?')}, message {msg_index}]", text
+        name = str(block.get("name") or "?")
+        return neutralized(
+            f"[{role} tool_use {name}, message {msg_index}]"
+        ), f"{name} {json.dumps(block.get('input'), ensure_ascii=False)}"
+    if kind != Kind.TOOL_RESULT:
+        raise ValueError(f"a {kind} block can't be kept as text")
     content = block.get("content")
     if isinstance(content, list):
-        parts = [str(p.get("text", "")) if p.get("type") == "text" else f"[{p.get('type')}]" for p in content]
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+            else:
+                parts.append(f"[{part.get('type') or 'part'}]" if isinstance(part, dict) else "[part]")
         text = "\n".join(parts)
     else:
         text = str(content or "")
     label = f"[tool_result of {tool_name}, message {msg_index}]" if tool_name else f"[tool_result, message {msg_index}]"
-    return label, text
+    return neutralized(label), text
 
 
 def pointer_note(item: Item, label: str) -> str:

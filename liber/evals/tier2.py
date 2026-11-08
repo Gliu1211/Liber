@@ -387,7 +387,11 @@ def kept_results(task: Task, history: list[dict[str, Any]], base: dict[str, Any]
 
 
 def recorded_request(session_id: str, request: dict[str, Any]) -> RequestRecord:
-    """The record the proxy would keep for this request (body included, LIBER_RECORD_BODIES's default)."""
+    """The record the proxy would keep for this request (body included, LIBER_RECORD_BODIES's default).
+
+    Only E records one (its pins are read from it). Its `model` also gives the session a recorded
+    model, which only matters to estimates if exact token counts are cached; in Tier 2 they aren't.
+    """
     return RequestRecord(
         created_at=datetime.now(UTC),
         method="POST",
