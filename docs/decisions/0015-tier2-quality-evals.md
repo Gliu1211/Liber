@@ -61,8 +61,12 @@ Three things weren't settled:
 5. **Judge.**
    - The judge model (default `claude-opus-5-5`) grades the probe answer against the task's rubric
      (task success), and the needle answer against the planted fact.
-   - It uses structured output, with thinking off so nothing uses up the verdict's tokens. The
-     graded material is sent as escaped JSON between tags, so an answer can't instruct the judge.
+   - It uses structured output. The graded material is sent as escaped JSON between tags, so an
+     answer can't instruct the judge.
+   - The request has no `thinking` field and asks for `effort: "low"`, with `max_tokens` 8,000.
+     Current models (Opus 5.5, Sonnet 5.5, Fable 5.1) reject `thinking: {"type": "disabled"}` with a
+     400; the first live run lost every verdict to it. So the model's default applies, low effort
+     keeps any thinking short, and the token budget leaves room for the verdict after it.
    - A missing verdict (an API failure, a cut-off or malformed reply) is `None`. It is left out of
      rates, and every rate shows how many verdicts it rests on (`[k/n]`).
 6. **Metrics.**
@@ -85,12 +89,27 @@ Three things weren't settled:
        keep them, so the task lists `evidence_markers`, and the report shows how often B's summary
        kept them. On those repeats B measures the summary, not dropped thinking.
    - `migration_facts` tests whether a detail buried in a long tool result survives.
+   - Three harder tasks, added after the first live run, where every condition answered both old
+     tasks correctly:
+     - `undiscussed_config_detail`: a config read once; the probe asks for a setting nobody
+       discussed (`retry.backoff_multiplier`), among similar-looking numbers.
+     - `derived_pool_load` (reasoning-dependent): connections in use (~31 of 50) are worked out
+       only in the thinking, from the request rate and query latency; the visible reply is "no".
+     - `code_reconstruction`: a function is edited twice; the probe asks for its current code.
+   - During the probe and needle questions, a tool call gets an error result ("answer from
+     memory") instead of the scripted output, and is listed in the report. Otherwise a condition
+     could pass by reading the file again, and the judge would never know.
 
 9. **A paid run doesn't lose its results.**
    - `HttpMessagesApi` retries 408/409/429/5xx and network errors after 2, 4, 8 and 16 s.
    - A repeat that fails anyway is recorded as errors on its four runs, and the eval goes on.
    - Results and the report are rewritten after every repeat.
    - `main` refuses under CI (`CI` set), as well as without `--live` or a key.
+   - `--rejudge <history.json>` grades a saved run's answers again (judge calls only), with the
+     current rubrics. An answer whose question has changed since is left as it was. The file is
+     rewritten in place, so it stays one trend point. The first original is kept as
+     `<name>.json.bak` (never overwritten), and `rejudged` in the file records each re-grade with
+     the previous judge model.
 
 ## Consequences
 - **Not a full replay.** It doesn't replay real sessions: a scripted task and two questions per

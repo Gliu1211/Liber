@@ -1,0 +1,34 @@
+{
+  "name": "undiscussed_config_detail",
+  "description": "Factual, hard: a ~90-line config (about 600 tokens) is read once and only one setting is discussed. The probe asks for a different setting nobody mentioned (retry.backoff_multiplier = 1.7), with similar-looking distractors (growth_factor 1.5, jitter_ratio 0.3, backoff_cap_ms 8000). Summaries drop details nobody talked about, so this should separate full context (A) from compaction (B, C, D).",
+  "reasoning_dependent": false,
+  "system": "You are a concise platform engineering assistant. Use the tools when asked. Keep replies as short as the user asks.",
+  "tools": [
+    {
+      "name": "read_config",
+      "description": "The ingest service's rendered configuration.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ],
+  "tool_outputs": {
+    "read_config": "# ingest service configuration (rendered 2026-11-06T08:12:44Z)\n\n[service]\nname = ingest\nlisten_port = 8443\nworker_threads = 24\nmax_request_body_kb = 2048\ngraceful_shutdown_s = 20\nlog_level = info\nlog_format = json\n\n[health]\nstartup_timeout_s = 45\nliveness_interval_s = 10\nreadiness_path = /ready\nliveness_path = /live\nfailure_threshold = 3\n\n[retry]\nmax_attempts = 6\ninitial_delay_ms = 250\nbackoff_multiplier = 1.7\nmax_delay_ms = 12000\nretry_on = 502,503,504,connect_error\n\n[http_client]\nconnect_timeout_ms = 800\nread_timeout_ms = 5000\npool_max_idle = 64\nbackoff_cap_ms = 8000\nkeepalive_s = 75\n\n[kafka]\nbrokers = kafka-1.internal:9092,kafka-2.internal:9092,kafka-3.internal:9092\ntopic = ingest.events.v3\nconsumer_group = ingest-workers\nretry_backoff_ms = 400\nmax_poll_records = 500\nsession_timeout_ms = 30000\nauto_offset_reset = earliest\n\n[cache]\nbackend = redis\nhost = redis-ingest.internal\nttl_s = 900\ninitial_capacity = 4096\ngrowth_factor = 1.5\neviction = lru\n\n[scheduler]\ncompaction_cron = 17 3 * * *\njitter_ratio = 0.3\nmax_concurrent_jobs = 4\nlease_s = 120\n\n[storage]\nbucket = acme-ingest-raw-prod\nregion = eu-central-1\nmultipart_threshold_mb = 64\nmultipart_chunk_mb = 16\nserver_side_encryption = aws:kms\nlifecycle_days = 30\n\n[rate_limits]\nper_tenant_rps = 350\nburst = 700\nglobal_rps = 12000\npenalty_box_s = 60\n\n[metrics]\nexporter = otlp\nendpoint = http://otel-collector.internal:4317\ninterval_s = 15\nhistogram_buckets_ms = 5,10,25,50,100,250,500,1000,2500\n\n[feature_flags]\nprovider = flagd\nrefresh_s = 30\ndefault_on = schema_v3,dedupe_window\ndefault_off = async_flush,zstd_payloads\n\n[dedupe]\nwindow_s = 300\nkey_fields = tenant_id,event_id\nbloom_bits_per_key = 10\nbloom_hashes = 7\n\n[jvm]\nheap_min_mb = 1024\nheap_max_mb = 3072\ngc = G1\nmax_gc_pause_ms = 200\nclass_data_sharing = off"
+  },
+  "turns": [
+    "We're debugging slow startup of the ingest service. For the record: the change ticket is CHG-2291 and it was approved by Tomasz Wierzbicki. Call read_config, then tell me in one line which setting controls the startup health-check timeout and its current value.",
+    "In two sentences: what usually makes JVM services start slowly inside containers?",
+    "Write a one-line commit message for raising that startup timeout to 90 seconds.",
+    "Suggest one name for a feature flag that gates the new timeout. One name only."
+  ],
+  "compact_through_turn": 2,
+  "needle_fact": "The change ticket is CHG-2291 and it was approved by Tomasz Wierzbicki.",
+  "needle_question": "What was the change ticket and who approved it? One line.",
+  "probe_question": "Answer from memory without calling any tools: what is retry.backoff_multiplier set to in the config you read earlier? Give the exact value, or say you don't know.",
+  "probe_rubric": "Pass only if the answer gives the value 1.7. Fail if it gives any other number, hedges between values, says it doesn't know, or says it would need to read the config again.",
+  "evidence_markers": [
+    "1.7",
+    "backoff_multiplier"
+  ]
+}

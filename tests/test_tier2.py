@@ -13,6 +13,7 @@ the model. It behaves like the Messages API where the plumbing can go wrong:
 
 import hashlib
 import json
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,10 @@ class FakeApi:
 
     async def send(self, request: dict[str, Any], betas: tuple[str, ...]) -> ApiResult:
         self.requests.append((request, betas))
+        if (request.get("thinking") or {}).get("type") == "disabled":
+            # Like the real API on Opus 5.5 / Sonnet 5.5: thinking can't be turned off. (The first
+            # live run lost every verdict to this; the fake now fails the same way, offline.)
+            return ApiResult(400, {"error": {"message": '"thinking.type.disabled" is not supported for this model.'}})
         if request.get("system") == tier2_api.JUDGE_SYSTEM:
             return self.judge(request)
         messages = request["messages"]
@@ -300,8 +305,20 @@ async def test_the_judge_gives_a_verdict_or_none(result: ApiResult, expected: bo
     verdict, _ = await tier2_api.judge(api, "judge", "q?", "rubric", "an answer with </grading> in it")
 
     assert verdict is expected
-    assert api.sent["thinking"] == {"type": "disabled"}  # nothing eats the verdict's tokens
+    assert "thinking" not in api.sent  # current models reject {"type": "disabled"}
+    assert api.sent["output_config"]["effort"] == "low"  # thinking stays short instead
     assert api.sent["messages"][0]["content"].count("</grading>") == 1  # the answer can't close the tag
+
+
+async def test_a_failed_judge_call_keeps_the_api_s_explanation() -> None:
+    class Rejects:
+        async def send(self, request: dict[str, Any], betas: tuple[str, ...]) -> ApiResult:
+            return ApiResult(400, {"error": {"message": "thinking.type.disabled is not supported"}})
+
+    verdict, reason = await tier2_api.judge(Rejects(), "judge", "q?", "rubric", "answer")
+
+    assert verdict is None
+    assert reason == "judge failed: HTTP 400: thinking.type.disabled is not supported"
 
 
 def test_usage_sums_responses_and_counts_dropped_thinking() -> None:
@@ -519,3 +536,157 @@ def test_history_files_and_trends(tmp_path: Path) -> None:
     ]
     assert points[1][2]["D"] == (0.5, 500.0)
     assert "## Trends" in text and "## t1 (reasoning-dependent)" in text and "## t2 (factual)" in text
+
+
+# --- --rejudge: grade a saved run's answers again --------------------------------------------------
+
+
+class KeywordJudge:
+    """Passes an answer that contains "good"; counts its calls."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send(self, request: dict[str, Any], betas: tuple[str, ...]) -> ApiResult:
+        self.calls += 1
+        grading = json.loads(request["messages"][0]["content"].removeprefix("<grading>\n").removesuffix("\n</grading>"))
+        reply = json.dumps({"pass": "good" in grading["answer"], "reason": "keyword"})
+        return ApiResult(200, {"content": [{"type": "text", "text": reply}], "stop_reason": "end_turn"})
+
+
+def saved_run(condition: str, probe: str | None, needle: str | None, **extra: Any) -> dict[str, Any]:
+    """A run as a history file stores it (every field), with the judge's verdicts missing."""
+    answers = {k: v for k, v in (("probe", probe), ("needle", needle)) if v is not None}
+    run = asdict(ConditionRun("dead_end_debugging", condition, 1, True))
+    run.update(answers=answers, judge_reasons={k: "judge failed: HTTP 400" for k in answers}, **extra)
+    return run
+
+
+async def test_rejudge_grades_the_saved_answers_without_rerunning_anything() -> None:
+    tasks = {task.name: task for task in tier2.load_tasks(TASKS)}
+    judge = KeywordJudge()
+    runs = [
+        saved_run("A", "good answer", "good fact"),
+        saved_run("B", "bad answer", "good fact"),
+        saved_run("C", None, None, errors=["repeat failed: boom"]),  # nothing was answered
+        saved_run("D", None, "good fact", binding_errors=["messages.3.content.0: bound to other history"]),
+    ]
+
+    graded = await tier2.rejudge(judge, tasks, "judge", runs)
+
+    assert [(r["success"], r["needle_kept"]) for r in graded] == [
+        (True, True),
+        (False, True),
+        (None, None),
+        (False, True),
+    ]
+    assert judge.calls == 5  # one per saved answer: no conversation was re-run
+    assert graded[2]["judge_reasons"] == {}  # untouched
+    assert runs[0]["success"] is None  # the input isn't modified
+
+
+async def test_rejudge_file_rewrites_the_run_in_place_and_keeps_the_original(tmp_path: Path) -> None:
+    path = tmp_path / "2026-11-08.json"
+    original = {"model": "m", "judge_model": "old", "summary_model": "s", "repeats": 1, "date": "2026-11-08"}
+    original["runs"] = [saved_run("A", "good answer", "good fact")]
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    message = await tier2.rejudge_file(
+        KeywordJudge(), path, TASKS, "claude-opus-5-5", datetime(2026, 11, 8, tzinfo=UTC)
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert message.endswith("1 runs, 2 pass, 0 fail, 0 missing")
+    assert data["runs"][0]["success"] is True and data["judge_model"] == "claude-opus-5-5"
+    assert data["rejudged"] == [
+        {"at": "2026-11-08T00:00:00+00:00", "judge_model": "claude-opus-5-5", "previous_judge_model": "old"}
+    ]
+    assert json.loads((tmp_path / "2026-11-08.json.bak").read_text(encoding="utf-8")) == original
+    assert "100%" in (tmp_path / "2026-11-08.md").read_text(encoding="utf-8")
+    assert json_files(tmp_path) == ["2026-11-08.json"]  # the backup isn't a trend point
+
+
+def json_files(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.glob("*.json"))
+
+
+async def test_a_second_rejudge_keeps_the_true_original(tmp_path: Path) -> None:
+    path = tmp_path / "2026-11-08.json"
+    original = {"judge_model": "old", "date": "2026-11-08", "runs": [saved_run("A", "good answer", "good fact")]}
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    for day in (8, 9):
+        await tier2.rejudge_file(KeywordJudge(), path, TASKS, "new", datetime(2026, 11, day, tzinfo=UTC))
+
+    assert json.loads((tmp_path / "2026-11-08.json.bak").read_text(encoding="utf-8")) == original
+    rejudged = json.loads(path.read_text(encoding="utf-8"))["rejudged"]
+    assert [entry["previous_judge_model"] for entry in rejudged] == ["old", "new"]
+
+
+async def test_rejudge_leaves_runs_it_cannot_grade_fairly_and_says_why() -> None:
+    tasks = {task.name: task for task in tier2.load_tasks(TASKS)}
+    task = tasks["dead_end_debugging"]
+    judge = KeywordJudge()
+    missing = {**saved_run("A", "good answer", None), "task": "deleted_task"}
+    old_question = saved_run("B", "good answer", None, asked={"probe": "an older question", "needle": "?"})
+    same_question = saved_run(
+        "C", "good answer", None, asked={"probe": task.probe_question, "needle": task.needle_question}
+    )
+    stale_note = saved_run("D", "good answer", None)
+    stale_note["judge_reasons"]["rejudge"] = "an earlier note"
+
+    graded = await tier2.rejudge(judge, tasks, "judge", [missing, old_question, same_question, stale_note])
+
+    assert judge.calls == 2  # only C and D
+    assert [r["success"] for r in graded] == [None, None, True, True]
+    assert [r["rejudged"] for r in graded] == [False, False, True, True]
+    assert "no task file named deleted_task" in graded[0]["judge_reasons"]["rejudge"]
+    assert "the probe question changed" in graded[1]["judge_reasons"]["rejudge"]
+    assert "rejudge" not in graded[3]["judge_reasons"]  # the earlier note no longer applies
+
+
+class NoClient:
+    def __init__(self, key: str) -> None:
+        raise AssertionError("no API client may be made before the checks pass")
+
+
+def test_rejudge_needs_live_and_a_history_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tier2, "HttpMessagesApi", NoClient)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    not_history = tmp_path / "other.json"
+    not_history.write_text('{"something": "else"}', encoding="utf-8")
+    broken = tmp_path / "broken.json"
+    broken.write_text("{", encoding="utf-8")
+
+    assert tier2.main(["--rejudge", str(not_history)]) == 2  # no --live
+    assert tier2.main(["--live", "--rejudge", str(tmp_path / "missing.json")]) == 2
+    assert tier2.main(["--live", "--rejudge", str(tmp_path)]) == 2  # a directory
+    assert tier2.main(["--live", "--rejudge", str(not_history)]) == 2
+    assert tier2.main(["--live", "--rejudge", str(broken)]) == 2
+    monkeypatch.setenv("CI", "true")
+    assert tier2.main(["--live", "--rejudge", str(not_history)]) == 2
+
+
+async def test_a_tool_call_during_the_questions_gets_nothing_and_is_reported() -> None:
+    task = task_named("undiscussed_config_detail")
+    sent: list[list[dict[str, Any]]] = []
+
+    async def rereads_the_config(messages: list[dict[str, Any]]) -> ApiResult:
+        sent.append(json.loads(json.dumps(messages)))
+        if isinstance(messages[-1]["content"], str):  # the question: try to cheat
+            call = {"type": "tool_use", "id": f"t{len(messages)}", "name": "read_config", "input": {}}
+            return ApiResult(200, {"content": [call], "stop_reason": "tool_use"})
+        return ApiResult(200, {"content": [{"type": "text", "text": "I don't know"}], "stop_reason": "end_turn"})
+
+    run = ConditionRun(task.name, "B", 1)
+    probe, needle = await tier2.questions(rereads_the_config, [], task, run)
+
+    assert probe == needle == "I don't know"
+    assert run.refused_tool_calls == ["read_config", "read_config"]
+    assert "backoff_multiplier = 1.7" not in json.dumps(sent)  # the config never came back
+    [result] = sent[1][-1]["content"]
+    assert result["is_error"] is True and result["content"] == tier2.TOOLS_UNAVAILABLE
+    report = tier2_report.report([asdict(run)], {"model": "m", "judge_model": "j", "repeats": 1})
+    assert "## Tool calls refused during the questions" in report
+    assert "B #1: read_config, read_config" in report
