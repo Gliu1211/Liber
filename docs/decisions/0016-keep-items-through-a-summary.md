@@ -130,5 +130,5 @@ Built as decided. Details the decision left open:
   - `plan/apply.py` refuses to render a summary whose pins aren't in its own range
     (`PlanNotApplicable`, so the request goes through without the plan).
   - The validator needs no new rule: pins change only the frozen block's text.
-- **Not built yet:** the dashboard checkbox (the decision says later), and §4's wording in
-  ARCHITECTURE.md (once this ADR is accepted).
+- **Not built yet:** the dashboard checkbox (the decision says later). ARCHITECTURE.md §4 describes
+  pins as built.

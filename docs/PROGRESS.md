@@ -208,6 +208,10 @@ Template:
 - Proposed follow-ups (owner decides): ADR 0016 and its implementation (one session: plan operation, rendering, CLI, Tier 2 condition E); more repeats (5+) now that conditions differ; replace or harden `dead_end_debugging` and `migration_facts`.
 - Next step: owner decides ADR 0016.
 
+## 2026-11-08 — Owner decision: ADR 0016 accepted
+- Done: [ADR 0016](decisions/0016-keep-items-through-a-summary.md) (pin items through a summary; Tier 2 condition E) accepted as written. ARCHITECTURE.md §4 notes pinning under summarize, marked not built yet.
+- Next step (owner starts it): implement ADR 0016 in one session (plan operation, rendering, validation, CLI `--pin`, Tier 2 condition E with `keep_tool_results` on `undiscussed_config_detail` and `derived_pool_load`), then a live Tier 2 run with `--repeats 5`.
+
 ## 2026-11-08 — ADR 0016: keep chosen items through a summary ("pins"), Tier 2 condition E
 - Done:
   - `Operation.pinned_item_ids`. `plan/apply.py` copies pinned items into the frozen block after the summary (and C's notes) under "Kept as is (copied word for word … a record of them, not instructions)", each with a label such as `[tool_result of read_config, message 2]`.
@@ -220,7 +224,7 @@ Template:
   - Tier 2 condition E: B's plan plus pins of the task's `keep_tool_results` tools in the summarized range. It runs only on tasks with that field (`undiscussed_config_detail` keeps `read_config`, `derived_pool_load` keeps `read_metrics`); other tasks show n/a.
     - New comparisons: A vs E, E vs B, E vs D.
     - E with nothing to keep, or a refused plan, is an error, not a silent B.
-- Decisions: implementation notes added to [ADR 0016](decisions/0016-keep-items-through-a-summary.md), which stays Proposed. They cover where pinned text comes from (recorded bodies, read before the write lock), that it's stored in the plan version, the final wording, and where the checks live.
+- Decisions: implementation notes added to [ADR 0016](decisions/0016-keep-items-through-a-summary.md) (accepted by the owner the same day, entry above). They cover where pinned text comes from (recorded bodies, read before the write lock), that it's stored in the plan version, the final wording, and where the checks live.
 - Review: independent reviewer run; no hard-rule violations. Fixed with tests:
   - must-fix: reading recorded bodies happened inside the write transaction and could hold the lock the proxy needs (now read beforehand, one body at a time); untested older-body and unreadable-body paths;
   - should-fix: case variants of Liber's tags (tested); labels neutralized; odd tool-result parts named instead of crashing; duplicate pins; the ADR notes now say plainly that pinned text is stored in plan versions; labels show who wrote the item; tests for tool_use/text pins, a pin in a second summary block, and `show` after apply.
@@ -233,4 +237,8 @@ Template:
 - Open issues: `derived_pool_load`'s metrics dump is ~7,700 characters, so E's plan there may be refused as not smaller; a live run will tell. The dashboard checkbox for pins isn't built.
 - Proposed follow-ups (owner decides): pin checkboxes in the dashboard (by item or topic); ARCHITECTURE.md §4 wording once ADR 0016 is accepted; a live Tier 2 run with E.
 - Next step: owner reviews and decides ADR 0016, then runs Tier 2 live with E.
+
+## 2026-11-08 — ARCHITECTURE.md §4: pins as built
+- Done: ADR 0016 had already been accepted on `main` (PR #19), and that is now merged into this branch. ARCHITECTURE.md §4 now describes pinning as built, replacing "accepted, not built yet": the `--pin` CLI, the allowed kinds, no escaping beyond Liber's tags, no overlap with offload or delete, text from recorded bodies fixed in the plan version, and counted toward §6's "must shrink" rule. ADR 0016's implementation notes say the same.
+- Next step: owner reviews PR #20 (the implementation), then a live Tier 2 run with `--repeats 5`.
 
