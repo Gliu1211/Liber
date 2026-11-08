@@ -188,3 +188,6 @@ Template:
 - Open issues: the worker still sends `thinking: disabled` to its summary model; fine on Haiku 5.5, but it would 400 on a Sonnet/Opus 5.5 worker. The new tasks' difficulty is a guess until a live run.
 - Proposed follow-ups (owner decides): make the worker's thinking setting depend on its model; decide ADR 0015.
 - Next step: owner merges, runs `--rejudge` on the 2026-11-08 history (judge calls only), then a fresh `--live --repeats 3` with all five tasks.
+
+## 2026-11-07 — Owner decision: ADR 0015 accepted
+- Done: [ADR 0015](decisions/0015-tier2-quality-evals.md) (Tier 2 quality evals) accepted as written, including the judge, task and `--rejudge` updates from PR #16 (merged).

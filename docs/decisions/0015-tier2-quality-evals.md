@@ -1,6 +1,6 @@
 # 0015 — Tier 2 quality evals: shared history, Liber in-process, strict binding
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-07)
 - Date: 2026-11-07
 
 ## Context
