@@ -174,13 +174,13 @@ async def judge(api: MessagesApi, model: str, question: str, rubric: str, answer
     grading = grading.replace("<", "\\u003c").replace(">", "\\u003e")  # the answer can't close the tag
     request = {
         "model": model,
-        # Thinking stays on (below), so leave room for it before the verdict's JSON.
+        # The model may think by default (no `thinking` field, below), so leave room before the JSON.
         "max_tokens": JUDGE_MAX_TOKENS,
         "system": JUDGE_SYSTEM,
         "messages": [{"role": "user", "content": f"<grading>\n{grading}\n</grading>"}],
         # No `thinking` field: current models (Opus 5.5, Sonnet 5.5, Fable 5.1) reject
         # {"type": "disabled"} with a 400, and that rejected every verdict of the first live run.
-        # Low effort keeps the judge's thinking short instead.
+        # The model's default applies instead; low effort keeps any thinking short.
         "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": JUDGE_SCHEMA}},
     }
     result = await api.send(request, ())

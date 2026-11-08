@@ -34,9 +34,10 @@
   "needle_fact": "The ticket is DEV-318 and the reviewer is Ines Duarte.",
   "needle_question": "What was the ticket and who is the reviewer? One line.",
   "probe_question": "Answer from memory without calling any tools: write out the current parse() function exactly as it stands after all our edits. Code only.",
-  "probe_rubric": "Pass only if the code has all of: (1) the docstring 'Parse one line of the export format.'; (2) an early check that returns None for empty or whitespace-only input; (3) the stripped line split on '|'; (4) region from parts[1], lower-cased; (5) amount_cents = int(parts[2]); (6) tags from parts[3] split on ',' with empty tags dropped; (7) a returned dict with the keys id, region, amount_cents and tags. Fail if any of these is missing or different.",
+  "probe_rubric": "Pass only if the code has all of: (1) the docstring 'Parse one line of the export format.'; (2) an early check that returns None for empty or whitespace-only input; (3) the stripped line split on '|'; (4) region from parts[1], lower-cased; (5) amount_cents = int(parts[2]); (6) tags from parts[3] split on ',' with empty tags dropped; (7) id from parts[0]; (8) a returned dict with the keys id, region, amount_cents and tags. Fail if any of these is missing or different. Variable names and quote style don't matter.",
   "evidence_markers": [
     "split(\"|\")",
+    "split('|')",
     "int(parts[2])",
     "parts[1].lower()"
   ]

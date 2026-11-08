@@ -1,6 +1,9 @@
 """Tier 2 quality evals: what compaction costs in task success, against real models (ARCHITECTURE.md §12).
 
     ANTHROPIC_API_KEY=... uv run python -m liber.evals.tier2 --live [--repeats 3] [--model ...]
+    ANTHROPIC_API_KEY=... uv run python -m liber.evals.tier2 --live --rejudge evals/history/<date>.json
+
+The second form only grades a saved run's answers again (see `rejudge`): judge calls, nothing else.
 
 Manual and paid: it refuses to run without `--live`, refuses under CI, and reads the key from the
 environment only (hard rules 2, 7). Tests drive `run_eval` with fakes instead.
@@ -133,6 +136,8 @@ class ConditionRun:
     frozen_blocks: list[str] = field(default_factory=list)  # B/C: the summary blocks Liber sent
     summary_has_evidence: bool | None = None  # B/C: a frozen block contains an evidence marker
     answers: dict[str, str] = field(default_factory=dict)
+    asked: dict[str, str] = field(default_factory=dict)  # the questions as asked, so a rejudge can check
+    refused_tool_calls: list[str] = field(default_factory=list)  # tools the model tried during the questions
     judge_reasons: dict[str, str] = field(default_factory=dict)
 
 
@@ -141,13 +146,25 @@ class ConditionRun:
 Sender = Callable[[list[dict[str, Any]]], Awaitable[ApiResult]]
 
 
+TOOLS_UNAVAILABLE = "Tools are unavailable now. Answer from memory, from what is already in this conversation."
+
+
 async def turn(
-    send: Sender, messages: list[dict[str, Any]], prompt: str, task: Task, run: ConditionRun | None
+    send: Sender,
+    messages: list[dict[str, Any]],
+    prompt: str,
+    task: Task,
+    run: ConditionRun | None,
+    tools: bool = True,
 ) -> str | None:
     """One user turn on `messages` (extended in place), tool round trips included.
 
     The reply's text, or None if the turn failed: a rejected request, a reply cut off at
     max_tokens, or a model still calling tools after MAX_TOOL_ROUNDS (recorded on `run`).
+
+    With `tools=False` (the probe and needle questions), a tool call gets an error result instead of
+    the scripted output, and is recorded. Otherwise a model could pass a probe by reading the
+    config or file again, and the judge, who sees only the answer, would never know.
     """
     messages.append({"role": "user", "content": prompt})
     for _ in range(MAX_TOOL_ROUNDS):
@@ -172,10 +189,22 @@ async def turn(
         if stop != "tool_use":
             return reply_text(result.body)
         calls = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
-        results = [
-            {"type": "tool_result", "tool_use_id": b["id"], "content": task.tool_outputs.get(b["name"], "(no output)")}
-            for b in calls
-        ]
+        if tools:
+            results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": b["id"],
+                    "content": task.tool_outputs.get(b["name"], "(no output)"),
+                }
+                for b in calls
+            ]
+        else:
+            results = [
+                {"type": "tool_result", "tool_use_id": b["id"], "content": TOOLS_UNAVAILABLE, "is_error": True}
+                for b in calls
+            ]
+            if run is not None:
+                run.refused_tool_calls += [b["name"] for b in calls]
         messages.append({"role": "user", "content": results})
     if run is not None:
         run.errors.append(f"the model was still calling tools after {MAX_TOOL_ROUNDS} rounds")
@@ -338,17 +367,20 @@ async def run_client_compaction(
     run.overhead.add(result.body)
     messages: list[dict[str, Any]] = []
     first = CONTINUED.format(summary=reply_text(result.body), prompt=task.probe_question)
-    probe = await turn(send, messages, first, task, run)
-    needle = await turn(send, messages, task.needle_question, task, run) if probe is not None else None
+    probe = await turn(send, messages, first, task, run, tools=False)
+    needle = await turn(send, messages, task.needle_question, task, run, tools=False) if probe is not None else None
     return probe, needle
 
 
 async def questions(
     send: Sender, messages: list[dict[str, Any]], task: Task, run: ConditionRun
 ) -> tuple[str | None, str | None]:
-    """The probe, then (if it got an answer) the needle question in the same conversation."""
-    probe = await turn(send, messages, task.probe_question, task, run)
-    needle = await turn(send, messages, task.needle_question, task, run) if probe is not None else None
+    """The probe, then (if it got an answer) the needle question in the same conversation.
+
+    Tools stay offered (removing them would change the request), but calling one gets nothing back.
+    """
+    probe = await turn(send, messages, task.probe_question, task, run, tools=False)
+    needle = await turn(send, messages, task.needle_question, task, run, tools=False) if probe is not None else None
     return probe, needle
 
 
@@ -374,20 +406,36 @@ async def rejudge(
     """Grade an earlier run's saved answers again; no conversation is re-run, only the judge is paid.
 
     Why: the first live run's judge calls all failed (HTTP 400), but every answer was saved. Uses the
-    task files as they are now, so an edited rubric applies too. Runs with no answers (a failed
-    repeat) are left as they were. A binding break still counts as a failed answer, as in grade().
+    task files' rubrics as they are now, so an edited rubric applies too. But an answer is only
+    graded if its question is unchanged: an answer to an old question, graded against a new one,
+    would mean nothing. (Runs saved before questions were recorded can't be checked.)
+
+    Runs with no answers (a failed repeat) are left as they were. A binding break still counts as a
+    failed answer, as in grade(). Each run that was graded again is marked `"rejudged": True`.
     """
     graded = []
     for saved in runs:
         run = {**saved, "judge_reasons": dict(saved.get("judge_reasons") or {})}
+        run["judge_reasons"].pop("rejudge", None)  # a note from an earlier rejudge no longer applies
+        run["rejudged"] = False
         task = tasks.get(run["task"])
         answers = run.get("answers") or {}
-        probe, needle = answers.get("probe"), answers.get("needle")
         if task is None:
-            if probe is not None or needle is not None:
+            if answers:
                 run["judge_reasons"]["rejudge"] = f"no task file named {run['task']}: left as it was"
             graded.append(run)
             continue
+        asked = run.get("asked") or {}
+        changed = [
+            key
+            for key, now in (("probe", task.probe_question), ("needle", task.needle_question))
+            if key in answers and key in asked and asked[key] != now
+        ]
+        if changed:
+            run["judge_reasons"]["rejudge"] = f"the {' and '.join(changed)} question changed since: left as it was"
+            graded.append(run)
+            continue
+        probe, needle = answers.get("probe"), answers.get("needle")
         if probe is not None:
             run["success"], run["judge_reasons"]["probe"] = await judge(
                 api, judge_model, task.probe_question, task.probe_rubric, probe
@@ -396,6 +444,7 @@ async def rejudge(
             run["needle_kept"], run["judge_reasons"]["needle"] = await judge(
                 api, judge_model, task.needle_question, needle_rubric(task), needle
             )
+        run["rejudged"] = probe is not None or needle is not None
         if run.get("binding_errors"):
             run["success"] = False if probe is None else run["success"]
             run["needle_kept"] = False if needle is None else run["needle_kept"]
@@ -416,31 +465,52 @@ async def rejudge_file(api: MessagesApi, path: Path, tasks_dir: Path, judge_mode
 
 
 def read_history(path: Path) -> dict[str, Any]:
-    data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    """A Tier 2 history file; ValueError if it isn't one (JSON, with a list of runs)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} isn't JSON: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("runs"), list):
+        raise ValueError(f"{path} isn't a Tier 2 history file (no list of runs)")
     return data
 
 
 def write_rejudged(
     path: Path, data: dict[str, Any], runs: list[dict[str, Any]], judge_model: str, now: datetime
 ) -> str:
-    """Back up the original, write the regraded run and its report, and say how the verdicts came out."""
-    path.with_name(path.name + ".bak").write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    """Back up the original, write the regraded run and its report, and say how the verdicts came out.
+
+    The backup is written once: a second rejudge must not replace the true original with the first
+    rejudge's output.
+    """
+    backup = path.with_name(path.name + ".bak")
+    if not backup.exists():
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     meta = {key: value for key, value in data.items() if key not in ("runs", "date")}
-    meta["judge_model"] = judge_model
     meta["rejudged"] = [
         *meta.get("rejudged", []),
-        {"at": now.isoformat(timespec="seconds"), "judge_model": judge_model},
+        {
+            "at": now.isoformat(timespec="seconds"),
+            "judge_model": judge_model,
+            "previous_judge_model": data.get("judge_model"),
+        },
     ]
+    meta["judge_model"] = judge_model
     tier2_report.save_history(path, path.with_suffix(".md"), runs, meta)
-    verdicts = [run.get(key) for run in runs for key in ("success", "needle_kept") if run.get("answers")]
+    regraded = [run for run in runs if run["rejudged"]]
+    verdicts = [run[key] for run in regraded for key in ("success", "needle_kept")]
     passed, failed = verdicts.count(True), verdicts.count(False)
-    return f"rejudged {path.resolve()}: {passed} pass, {failed} fail, {len(verdicts) - passed - failed} missing"
+    skipped = sum(1 for run in runs if "rejudge" in run["judge_reasons"])
+    message = f"rejudged {path.resolve()}: {len(regraded)} runs, {passed} pass, {failed} fail"
+    message += f", {len(verdicts) - passed - failed} missing"
+    return message + (f"; {skipped} runs left as they were (see judge_reasons)" if skipped else "")
 
 
 async def grade(
     api: MessagesApi, task: Task, settings: Settings, run: ConditionRun, probe: str | None, needle: str | None
 ) -> None:
     """The judge's verdicts. A binding break is a failed answer: in real use the request would have failed."""
+    run.asked = {"probe": task.probe_question, "needle": task.needle_question}
     if probe is not None:
         run.answers["probe"] = probe
         run.success, run.judge_reasons["probe"] = await judge(
@@ -541,8 +611,13 @@ def main(argv: list[str] | None = None) -> int:
         print("--repeats must be at least 1")
         return 2
     if args.rejudge is not None:
-        if not args.rejudge.exists():
+        if not args.rejudge.is_file():
             print(f"No such file: {args.rejudge}")
+            return 2
+        try:
+            read_history(args.rejudge)  # fail before any API client exists
+        except ValueError as exc:
+            print(exc)
             return 2
 
         async def regrade() -> str:

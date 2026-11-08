@@ -292,6 +292,12 @@ def report(runs: list[dict[str, Any]], meta: dict[str, Any], history: Path | Non
     if problems:
         lines += ["", "## Other errors", ""]
         lines += [f"- {task} {condition} #{repeat}: {error}" for task, condition, repeat, error in problems]
+    # A model that tried a tool during the questions got nothing back (tier2.turn), but say so.
+    refused = [(r["task"], r["condition"], r["repeat"], r.get("refused_tool_calls") or []) for r in runs]
+    refused = [(task, condition, repeat, calls) for task, condition, repeat, calls in refused if calls]
+    if refused:
+        lines += ["", "## Tool calls refused during the questions", ""]
+        lines += [f"- {task} {condition} #{repeat}: {', '.join(calls)}" for task, condition, repeat, calls in refused]
     if history is not None:
         points = trends(history)
         if points:
