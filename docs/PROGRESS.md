@@ -242,3 +242,32 @@ Template:
 - Done: ADR 0016 had already been accepted on `main` (PR #19), and that is now merged into this branch. ARCHITECTURE.md §4 now describes pinning as built, replacing "accepted, not built yet": the `--pin` CLI, the allowed kinds, no escaping beyond Liber's tags, no overlap with offload or delete, text from recorded bodies fixed in the plan version, and counted toward §6's "must shrink" rule. ADR 0016's implementation notes say the same.
 - Next step: owner reviews PR #20 (the implementation), then a live Tier 2 run with `--repeats 5`.
 
+## 2026-11-09 — Tier 2 run 2026-11-08-222804: eval fix, size estimate fix, a pin task, ADR 0017 proposed
+- Findings (owner's run, 5 repeats):
+  - pinning recovered `derived_pool_load` without notes (E 5/5 vs B 2/5);
+  - E's 5/5 on `undiscussed_config_detail` was mostly not E: 4 of 5 plans were refused, and the questions then went out unedited (condition A) but were counted as E;
+  - E on `derived_pool_load` sent more than full context;
+  - both pin tasks were the wrong shape;
+  - Liber's summaries can't hold code (`code_reconstruction`: B/C 0/5, D 5/5).
+- Done:
+  - Tier 2: a refused plan, E with nothing to pin, or a request Liber would send unedited now ends that condition with no verdict. No question is asked or sent, and the report shows it as `[k/n]` with the reason under Other errors. On the 2026-11-08 data, E on the config task would read 100% [1/5].
+  - Plan sizes leave thinking out on both sides (`plan/cost.py`): `show`, the dashboard, cost estimates and the "must shrink" check (ARCHITECTURE.md §6 updated).
+    - Why: on `derived_pool_load`, E dropped every earlier thinking block and still cost about 4% more than full context. Dropping that thinking saved ~nothing at the API, while its estimate (length including the signature) counted as a large saving. That let a plan that grew the request pass the check.
+    - The pinned metrics themselves were on both sides of the comparison, so their denser tokenization (~1.8 characters per token vs the estimate's 4) cancelled out.
+    - The thinking left out is still listed on its own.
+  - New task `small_config_in_long_session`: a ~300-character config with an undiscussed value (`cache.ttl_seconds = 270`) among ~11,000 characters of logs plus chat in the summarized range; E keeps `read_config`. This is the shape pinning is for.
+- Decisions:
+  - Owner: thinking isn't counted in plan sizes (2026-11-09).
+  - [ADR 0017](decisions/0017-keep-code-in-summaries.md) (Proposed, not built): keep the assistant's code word for word in summaries. The summarizer chooses candidate ids (fenced code in assistant replies, code fields of assistant tool calls) and Liber copies the bytes. Tool output is excluded (pins cover it). Capped at 4,000 characters per exchange, with a Tier 2 control (E pinning the assistant's code) first.
+- Tests:
+  - the refused plan asks nothing and gets no verdict (`n/a [0/1]`);
+  - an unedited Liber request isn't sent (with an unconfirmed model, the probe still goes out compacted and the needle request doesn't);
+  - plan sizes ignore dropped thinking;
+  - the new task end to end with rigged fakes: E's plan is accepted and keeps the value for under half of A's tokens.
+- make check: pass (433 tests; Tier 1 unchanged, eval gate passed)
+- Open issues:
+  - What prior-turn thinking costs at the API is inferred from totals on one task. A `count_tokens` call on the same request with and without its thinking would settle it (needs a key).
+  - Absolute size estimates still use 4 characters per token, which undercounts number-dense content.
+- Proposed follow-ups (owner decides): decide ADR 0017; a live Tier 2 run including `small_config_in_long_session`; that `count_tokens` check; scaling estimates by the worker's exact counts in the shrink check.
+- Next step: owner reviews this PR and decides ADR 0017.
+

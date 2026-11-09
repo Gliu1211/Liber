@@ -29,6 +29,7 @@ from tests.helpers import FakeModel
 REASONING = "the database is ruled out: pool 6/50, p99 4 ms"
 NEEDLE = "INC-4471"
 CONFIG_NEEDLE = "CHG-2291"
+SMALL_NEEDLE = "OPS-8812"
 TASKS = Path(__file__).parent.parent / "evals" / "tier2_tasks"
 SETTINGS = Settings(model="claude-sonnet-5-5", judge_model="claude-opus-5-5", repeats=2)
 
@@ -90,6 +91,10 @@ class FakeApi:
             answer = "1.7" if "backoff_multiplier = 1.7" in seen else "I don't know"
         elif "change ticket" in last:  # its needle
             answer = f"{CONFIG_NEEDLE}, Tomasz Wierzbicki" if CONFIG_NEEDLE in seen else "I don't know"
+        elif "cache.ttl_seconds" in last:  # small_config_in_long_session's probe
+            answer = "270" if "ttl_seconds = 270" in seen else "I don't know"
+        elif "ticket did I give you" in last:  # its needle
+            answer = f"{SMALL_NEEDLE}, Lena Brandt" if SMALL_NEEDLE in seen else "I don't know"
         else:
             answer = "Done." + " Details follow." * 40
         content.append({"type": "text", "text": answer})
@@ -99,9 +104,12 @@ class FakeApi:
         text = request["messages"][0]["content"].removeprefix("<grading>\n").removesuffix("\n</grading>")
         grading = json.loads(text)
         if "states this fact" in grading["rubric"]:
-            verdict = any(tag in grading["answer"] for tag in (NEEDLE, CONFIG_NEEDLE) if tag in grading["rubric"])
+            tags = (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE)
+            verdict = any(tag in grading["answer"] for tag in tags if tag in grading["rubric"])
         elif "the value 1.7" in grading["rubric"]:
             verdict = "1.7" in grading["answer"]
+        elif "the value 270" in grading["rubric"]:
+            verdict = "270" in grading["answer"]
         else:
             verdict = grading["answer"].startswith("ruled out")
         reply = json.dumps({"pass": verdict, "reason": "fake judge"})
@@ -115,7 +123,7 @@ def worker_model() -> FakeModel:
     def reply(call: dict[str, Any]) -> dict[str, Any]:
         if "notes" in call["schema"]["properties"]:
             return {"notes": [REASONING] if REASONING in call["prompt"] else []}
-        kept = "".join(f" Ticket {tag}." for tag in (NEEDLE, CONFIG_NEEDLE) if tag in call["prompt"])
+        kept = "".join(f" Ticket {tag}." for tag in (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE) if tag in call["prompt"])
         return {"topic": "checkout 500s", "summary": "Checkout 500s traced to an expired payments certificate." + kept}
 
     model.reply = reply
@@ -792,3 +800,18 @@ async def test_an_unedited_liber_request_is_never_sent(dead_end: tier2.Task) -> 
     assert b.success is not None and "probe" in b.answers  # the compacted probe was asked and graded
     assert b.needle_kept is None and "needle" not in b.answers  # the unedited needle request wasn't sent
     assert any(e.startswith("Liber didn't send the compaction: passthrough") for e in b.errors)
+
+
+async def test_a_small_pin_in_a_large_range_keeps_the_value_for_a_small_share_of_the_tokens() -> None:
+    """Pinning's intended shape: E's plan is accepted (the config is a small part of what's summarized),
+    E keeps the undiscussed value, and still sends far less than full context."""
+    task = task_named("small_config_in_long_session")
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    by = {r.condition: r for r in runs}
+    assert {c: by[c].success for c in by} == {"A": True, "B": False, "C": False, "D": False, "E": True}
+    e = by["E"]
+    assert e.errors == [] and e.liber_outcomes == ["rendered", "rendered"]
+    assert "ttl_seconds = 270" in e.frozen_blocks[0] and "status=504" not in e.frozen_blocks[0]  # config kept, logs not
+    assert e.usage.input_tokens < by["A"].usage.input_tokens / 2
