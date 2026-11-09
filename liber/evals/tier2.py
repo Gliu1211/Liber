@@ -179,7 +179,7 @@ async def turn(
         result = await send(messages)
         if result.status == NOT_SENT:
             if run is not None:
-                run.errors.append(str(result.body["error"]["message"]))
+                run.errors.append(str((result.body.get("error") or {}).get("message", "not sent")))
             return None
         if result.status != 200:
             problem = binding_error(result)
@@ -364,8 +364,8 @@ async def run_liber(
             )
             await commands.apply(store, session)
         except PlanError as exc:
-            # Without the plan the questions would go out unedited, as condition A. Liber refusing
-            # is the right call (ADR 0016), and it's recorded; there's nothing of this condition to ask.
+            # Without the plan the questions would go out unedited, as condition A. That holds for B, C
+            # and E alike: the refusal is recorded (Other errors) and the condition gets no verdict.
             run.errors.append(f"plan refused: {exc}")
             return None, None
         state = await versions.load_state(store, session)
@@ -453,6 +453,11 @@ def needle_rubric(task: Task) -> str:
     return f"Pass only if the answer states this fact correctly: {task.needle_fact}"
 
 
+# Errors after which an older run's answers aren't this condition's (see rejudge). "Liber didn't send
+# the compaction" isn't one: since 2026-11-09 an unsent question has no answer, and the rest are valid.
+UNVERDICTED = ("plan refused", "nothing to keep")
+
+
 async def rejudge(
     api: MessagesApi, tasks: dict[str, Task], judge_model: str, runs: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -486,6 +491,13 @@ async def rejudge(
         ]
         if changed:
             run["judge_reasons"]["rejudge"] = f"the {' and '.join(changed)} question changed since: left as it was"
+            graded.append(run)
+            continue
+        if any(str(e).startswith(UNVERDICTED) for e in run.get("errors") or []):
+            # Saved before 2026-11-09: after Liber refused the plan, the questions went out unedited
+            # (condition A). They say nothing about this condition, so no verdict.
+            run["success"] = run["needle_kept"] = None
+            run["judge_reasons"]["rejudge"] = "Liber's plan wasn't sent: no verdict (answers kept for reference)"
             graded.append(run)
             continue
         probe, needle = answers.get("probe"), answers.get("needle")

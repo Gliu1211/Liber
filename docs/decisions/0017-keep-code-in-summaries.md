@@ -56,7 +56,8 @@ Option 2, with option 3 as the Tier 2 control.
    (prompt-injection surface, ADR 0013/0016), and keeping them is the user's choice: a pin.
 2. **The summary call** returns a new field `keep_code`: the ids worth keeping, meaning the code a
    later turn would need exactly, such as the current version of something being worked on.
-   - The schema allows only ids from the given list.
+   - The schema lists only the given ids, and the worker also drops any id it didn't offer before
+     saving: structured output is a strong hint, not a guarantee.
    - The prompt says to prefer the latest version when an exchange revises the same code.
    - `PROMPT_VERSION` goes up, so old summaries aren't reused.
 3. **Rendering** (`plan/apply.frozen_text`). The chosen code goes in a section "Code kept as is
@@ -64,16 +65,29 @@ Option 2, with option 3 as the Tier 2 control.
    - Each block is labelled with where it came from, e.g. `[assistant code, message 5]` or
      `[assistant Write content, message 7]`.
    - It is fenced as it was, not escaped; only Liber's own tags are neutralized, as for pins.
+   - The bytes are the candidate's own: a fenced block's text, or a tool-call field's decoded string
+     value, never re-serialized JSON.
+   - An item the user also pinned (ADR 0016) is shown once, as the pin.
    - The text is fixed in the plan version, as summaries and pins are (ADR 0004 A2).
 4. **Limits.**
-   - At most 4,000 characters of kept code per exchange: whole blocks only, in the summarizer's
-     order. The rest is dropped and noted in the section.
-   - Kept code counts toward "a plan must make requests smaller" (§6).
+   - At most 4,000 characters of kept code per exchange, whole blocks only, in the summarizer's
+     order.
+   - A single block over the limit is not cut. It is left out, with a one-line note in the section
+     naming it and its size, so the reader knows code existed there. A large `Write` is the
+     commonest Claude Code case; pinning it (ADR 0016) or a later `recall` (D3) is the way to keep
+     it.
+   - Per summary range: at most 12,000 characters, newest exchanges first, since later code
+     supersedes earlier. What doesn't fit gets the same note.
+   - Kept code counts toward "a plan must make requests smaller" (§6). If it would make a plan
+     refuse, the refusal message says kept code is why, and the user can summarize a longer range.
+   - The numbers are starting points for Tier 2 to tune.
 5. **What's stored.** Kept code is stored with the exchange's summary row (`exchange_summaries`),
    like the summary text. It is conversation content, under the same rules as summaries (ADR
    0013): stored even with `LIBER_RECORD_BODIES=false`, and deleted by `liber purge`.
-6. **B and C stay comparable.** Kept code is part of the summary, so it is identical with
-   carry_forward_reasoning on and off. Only the notes differ (ADR 0004 A5).
+6. **B and C stay comparable.** Kept code is part of the summary call's result, so it is identical
+   with carry_forward_reasoning on and off. Only the notes, a separate call, differ (ADR 0004 A5).
+   Like the summary, it is cached per exchange and summarizer, and is rewritten once when
+   `PROMPT_VERSION` changes.
 7. **Tier 2.**
    - Before building 1–5, run a control: condition E on `code_reconstruction`, pinning the
      assistant's last full `parse()` reply. This needs a task field for pinning an assistant turn's

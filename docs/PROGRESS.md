@@ -264,7 +264,14 @@ Template:
   - an unedited Liber request isn't sent (with an unconfirmed model, the probe still goes out compacted and the needle request doesn't);
   - plan sizes ignore dropped thinking;
   - the new task end to end with rigged fakes: E's plan is accepted and keeps the value for under half of A's tokens.
-- make check: pass (433 tests; Tier 1 unchanged, eval gate passed)
+- Review: independent reviewer run; no must-fix. Fixed with tests:
+  - the docs (cost.py, §6) now call leaving thinking out a conservative owner choice pending a real count, and name its cost: where thinking is billed, its saving isn't shown;
+  - `rendered_tokens`' parameter is renamed `uncounted`;
+  - the comment says the no-verdict rule covers B, C and E;
+  - `--rejudge` gives no verdict to older runs whose plan was refused (the 2026-11-08 E runs), so re-reporting that file no longer shows the inflated E;
+  - stronger assertions, plus tests for an unsent probe (no questions at all), the shrink check refusing a plan whose only "saving" is thinking, and `show`'s wording;
+  - ADR 0017's gaps closed: a per-range budget, what happens to a block over the limit, overlap with pins, ids checked in code, bytes from decoded strings, and cache interplay.
+- make check: pass (437 tests; Tier 1 unchanged, eval gate passed)
 - Open issues:
   - What prior-turn thinking costs at the API is inferred from totals on one task. A `count_tokens` call on the same request with and without its thinking would settle it (needs a key).
   - Absolute size estimates still use 4 characters per token, which undercounts number-dense content.

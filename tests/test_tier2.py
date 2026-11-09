@@ -745,6 +745,7 @@ async def test_e_with_nothing_to_keep_is_an_error_not_a_silent_b(monkeypatch: py
 
     e = next(r for r in runs if r.condition == "E")
     assert e.errors and e.errors[0].startswith("nothing to keep")
+    assert e.success is None and e.answers == {} and e.usage.input_tokens == 0  # nothing was asked
 
 
 def test_the_report_has_the_three_e_comparisons() -> None:
@@ -802,7 +803,7 @@ async def test_an_unedited_liber_request_is_never_sent(dead_end: tier2.Task) -> 
     assert any(e.startswith("Liber didn't send the compaction: passthrough") for e in b.errors)
 
 
-async def test_a_small_pin_in_a_large_range_keeps_the_value_for_a_small_share_of_the_tokens() -> None:
+async def test_small_pin_task_plumbing_e_is_accepted_and_keeps_the_value() -> None:
     """Pinning's intended shape: E's plan is accepted (the config is a small part of what's summarized),
     E keeps the undiscussed value, and still sends far less than full context."""
     task = task_named("small_config_in_long_session")
@@ -815,3 +816,36 @@ async def test_a_small_pin_in_a_large_range_keeps_the_value_for_a_small_share_of
     assert e.errors == [] and e.liber_outcomes == ["rendered", "rendered"]
     assert "ttl_seconds = 270" in e.frozen_blocks[0] and "status=504" not in e.frozen_blocks[0]  # config kept, logs not
     assert e.usage.input_tokens < by["A"].usage.input_tokens / 2
+
+
+async def test_an_unsent_probe_means_no_questions_at_all(dead_end: tier2.Task, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If Liber wouldn't send even the probe compacted, neither question is sent."""
+    original = tier2.pipeline.prepare
+
+    async def falls_back_on_the_probe(store: Any, body: bytes, *args: Any, **kwargs: Any) -> Any:
+        prepared = await original(store, body, *args, **kwargs)
+        if dead_end.probe_question.encode() in body:
+            prepared.outcome = "fallback"
+        return prepared
+
+    monkeypatch.setattr(tier2.pipeline, "prepare", falls_back_on_the_probe)
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [dead_end], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    b = next(r for r in runs if r.condition == "B")
+    assert b.liber_outcomes == ["fallback"]  # only the probe was prepared; the needle never asked
+    assert b.success is None and b.needle_kept is None and b.answers == {} and b.usage.input_tokens == 0
+
+
+async def test_rejudge_gives_no_verdict_to_old_runs_whose_plan_was_refused(dead_end: tier2.Task) -> None:
+    old = run("dead_end_debugging", "E", 1, True, 900, errors=["plan refused: wouldn't make it smaller"])
+    old["answers"] = {"probe": "ruled out: something", "needle": f"{NEEDLE}, Priya Raman"}
+    valid = run("dead_end_debugging", "B", 1, None, 600, errors=["Liber didn't send the compaction: passthrough"])
+    valid["answers"] = {"probe": f"ruled out: {REASONING}"}  # since 2026-11-09 the sent probe is valid
+
+    graded = await tier2.rejudge(FakeApi(), {dead_end.name: dead_end}, "j", [old, valid])
+
+    assert graded[0]["success"] is None and graded[0]["needle_kept"] is None
+    assert "no verdict" in graded[0]["judge_reasons"]["rejudge"]
+    assert graded[1]["success"] is True

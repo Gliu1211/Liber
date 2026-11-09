@@ -197,3 +197,25 @@ async def test_create_refuses_to_offload_or_delete_thinking(store: Store) -> Non
 
     with pytest.raises(PlanError, match="thinking blocks are never offloaded or deleted"):
         await commands.create(store, prepared.session_id, offload=(thinking,))
+
+
+async def test_dropping_thinking_alone_does_not_make_a_plan_smaller(store: Store) -> None:
+    """2026-11-08 Tier 2: leaving thinking out saved ~nothing at the API but counted as a big saving."""
+    request = json.loads(chat(*SHORT_TURNS))  # one word each: no summary is shorter than the text
+    request["messages"][1]["content"] = [
+        {"type": "thinking", "thinking": "", "signature": "s" * 20_000},  # an estimate of ~5,000 tokens
+        {"type": "text", "text": "a0"},
+    ]
+    prepared = await pipeline.prepare(store, json.dumps(request).encode())
+    assert prepared.session_id is not None and prepared.parsed is not None
+    await summarize_now(store, prepared.session_id, prepared.parsed)
+
+    with pytest.raises(PlanError, match="thinking not counted"):  # the summary outweighs "u0" + "a0"
+        await commands.create(store, prepared.session_id, summarize_through=1)
+
+
+async def test_show_says_thinking_is_not_counted(store: Store) -> None:
+    session = await a_session(store)
+    await commands.create(store, session, summarize_through=1)
+
+    assert "tokens per request (thinking not counted)" in await commands.show(store, session)

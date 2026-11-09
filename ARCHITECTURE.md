@@ -173,7 +173,7 @@ Early edits (anything before the frozen/live boundary) trigger a **major compact
 - tokens that will be reprocessed, estimated one-time cost, estimated per-turn savings, and the payback period in turns.
 - Pricing ratios come from a user-editable config table, not hard-coded claims.
 
-**A plan must make requests smaller** (owner, 2026-11-06). `liber plan create` estimates the request size with the applied version and with the new one (the same estimate `liber plan show` prints; thinking isn't counted on either side, since leaving it out wasn't a measurable saving in Tier 2, owner 2026-11-09) and refuses the new version unless it is smaller. Every compaction costs a cache restart and drops older reasoning; one that saves nothing isn't worth it. Typical cases: a summary of short exchanges, or offloading an item smaller than its pointer note.
+**A plan must make requests smaller** (owner, 2026-11-06). `liber plan create` estimates the request size with the applied version and with the new one (the same estimate `liber plan show` prints; thinking isn't counted on either side: a conservative choice by the owner, 2026-11-09, since leaving it out wasn't a measurable saving in one Tier 2 task, pending a `count_tokens` check) and refuses the new version unless it is smaller. Every compaction costs a cache restart and drops older reasoning; one that saves nothing isn't worth it. Typical cases: a summary of short exchanges, or offloading an item smaller than its pointer note.
 
 Optional v1 auto-rules (off by default, deterministic, no LLM): e.g. "offload tool results larger than N tokens that are older than K turns".
 
