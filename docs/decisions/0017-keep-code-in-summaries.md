@@ -1,6 +1,6 @@
 # 0017 — Keep the assistant's code word for word in summaries
 
-- Status: Proposed
+- Status: Accepted (owner, 2026-11-09)
 - Date: 2026-11-09
 
 ## Context
@@ -40,7 +40,7 @@ Where code lives in a conversation:
    Liber to understand code identity (which block is a newer version of which). A later
    refinement of option 2, not a start.
 
-## Decision (proposed)
+## Decision
 Option 2, with option 3 as the Tier 2 control.
 
 1. **Candidates** (`worker/summarize.py`). For each exchange, the code candidates are:
