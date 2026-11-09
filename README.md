@@ -227,3 +227,9 @@ are recorded in [docs/decisions/](docs/decisions/).
   in `~/.liber/blobs/` (files mode 600) and summary text in the plan versions.
 - With `LIBER_WORKER_API_KEY` set, each completed exchange is sent to the summary model on the
   same upstream, and its summary is kept in `liber.db` (also with body recording off).
+
+## License
+
+[MIT](LICENSE). The dashboard ships HTMX 2.0.4 (`liber/dashboard/static/htmx.min.js`), which keeps
+its own Zero-Clause BSD license (`liber/dashboard/static/htmx.LICENSE`).
+
