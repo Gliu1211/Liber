@@ -28,9 +28,14 @@ RETRY_STATUSES = {408, 409, 429, 500, 502, 503, 504, 529}  # what the SDK itself
 RETRY_DELAYS = (2.0, 4.0, 8.0, 16.0)  # seconds between attempts
 
 
+# A B/C/E request that Liber would have sent unedited isn't sent at all: its answer would be
+# condition A's, counted under another condition's name (docs/decisions/0016).
+NOT_SENT = -1
+
+
 @dataclass(frozen=True)
 class ApiResult:
-    status: int
+    status: int  # HTTP status; 0: the network failed; NOT_SENT: Tier 2 chose not to send it
     body: dict[str, Any]
 
 

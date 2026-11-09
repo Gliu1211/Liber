@@ -1,7 +1,8 @@
 """What applying a pending plan version costs and saves (ARCHITECTURE.md §6, D6, ADR 0004 A4).
 
-Before a compaction is applied, the user sees (`liber plan show`, later the dashboard):
-- tokens per request now (applied version) and after (pending version);
+Before a compaction is applied, the user sees (`liber plan show`, the dashboard):
+- tokens per request now (applied version) and after (pending version), thinking not counted
+  (see below);
 - tokens reprocessed once: written to the prompt cache again because the history changed
   before them. A minor compaction (only appends after the frozen/live boundary) reprocesses from
   the old frozen boundary on; a major one (anything else) everything after the system prompt;
@@ -9,6 +10,16 @@ Before a compaction is applied, the user sees (`liber plan show`, later the dash
   later request), and the payback period in turns;
 - the reasoning dropped: every thinking block in the history when the version takes effect is
   stale from then on and left out (ADR 0012). That loss isn't priced; it's shown.
+
+Why thinking isn't counted in the sizes (owner's choice, 2026-11-09; conservative, pending a
+real count): a thinking block's estimate is its length, signature included. In the 2026-11-08
+Tier 2 run, a request with every earlier thinking block left out cost about as much as the full
+request (E vs A on derived_pool_load; inferred from totals on one task, where E also differed by
+its summary and pins). Counting dropped thinking as a saving made plans look smaller than they
+were, and let `liber plan create` accept a plan that grew the request. The cost of this choice:
+where thinking really is billed, its saving isn't shown (a smaller saving per turn, a longer or no
+payback). A `count_tokens` check of one request with and without its thinking would settle it.
+Until then the sizes compare everything else, and the thinking left out is listed on its own.
 
 Everything is an estimate from the items' token estimates (D9), not from the content, so it
 works from the database alone. Where the worker has an exchange's exact count, its items' estimates
@@ -105,7 +116,10 @@ def price_for(model: str | None, pricing: dict[str, ModelPrice]) -> ModelPrice |
 def estimate(
     items: Iterable[ItemFacts], applied: Plan, pending: Plan, price: ModelPrice | None, activated_at: int | None = None
 ) -> Estimate:
-    """`activated_at`: where the applied version took effect, if any (thinking before it is already left out)."""
+    """`activated_at`: where the applied version took effect, if any (thinking before it is already left out).
+
+    It only affects the reasoning-dropped figures: the sizes don't count thinking at all.
+    """
     items = list(items)
     minor = is_minor(applied, pending)
     removed = removed_ids(pending)
@@ -113,9 +127,10 @@ def estimate(
     thinking_now = [i for i in items if i.kind == "thinking" and i.msg_index >= (activated_at or 0)]
     # Once the pending version takes effect, every thinking block in the history is stale (ADR 0012).
     stale = [i for i in thinking_now if i.id not in removed]
-    left_out_now = {i.id for i in items if i.kind == "thinking"} - {i.id for i in thinking_now}
-    tokens_now = rendered_tokens(items, applied, left_out_now if activated_at else set())
-    tokens_after = rendered_tokens(items, pending, {i.id for i in items if i.kind == "thinking"})
+    # Sizes without thinking on either side (module docstring); the dropped reasoning is listed apart.
+    thinking = {i.id for i in items if i.kind == "thinking"}
+    tokens_now = rendered_tokens(items, applied, thinking)
+    tokens_after = rendered_tokens(items, pending, thinking)
     reprocessed = tokens_after - frozen_tokens(applied) if minor else tokens_after
 
     one_time = saving = None
@@ -150,12 +165,12 @@ def frozen_tokens(plan: Plan) -> int:
     return sum(math.ceil(len(op.summary or "") / 4) for op in plan.operations if op.kind is OperationKind.SUMMARIZE)
 
 
-def rendered_tokens(items: list[ItemFacts], plan: Plan, left_out: set[str]) -> int:
+def rendered_tokens(items: list[ItemFacts], plan: Plan, uncounted: set[str]) -> int:
     """Estimated message tokens of a request rendered with `plan` (system and tools not included).
 
-    `left_out`: thinking items the request leaves out as stale (ADR 0012).
+    `uncounted`: items left out of the count (all thinking, see the module docstring).
     """
-    removed = removed_ids(plan) | left_out
+    removed = removed_ids(plan) | uncounted
     offloaded = {
         item_id for op in plan.operations if op.kind is OperationKind.OFFLOAD for item_id in op.item_ids
     } - removed

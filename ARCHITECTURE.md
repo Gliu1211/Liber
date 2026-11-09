@@ -126,7 +126,11 @@ Every content unit becomes an `Item`:
 ### Operations (per item or contiguous range)
 - **keep** — default.
 - **summarize** — a range of whole exchanges becomes one frozen block (D5, D8).
-  - **pin** (ADR 0016; accepted, not built yet): items inside the range can be pinned. Their text is copied, as it was, into the frozen block under a labelled section, while the rest of the range is summarized. Text, `tool_use` and `tool_result` items only; never thinking.
+  - **summarize, keeping chosen items** (pins, ADR 0016): items inside the range can be pinned (`liber plan create … --pin ID`). Their text is copied, as it was, into the frozen block under a labelled section after the summary, while the rest of the range is summarized.
+    - Text, `tool_use` and `tool_result` items only. Never thinking (§5), and not images or documents (they can't become text).
+    - Not escaped, so code and config read as they were. Only Liber's own `<liber:` tags are neutralized.
+    - An item can't be both pinned and offloaded or deleted.
+    - The text is read from the session's recorded request bodies and fixed in the plan version, like summary text (byte-identical on every request). It counts toward "a plan must make requests smaller" (§6).
 - **offload** — content replaced by a pointer note; original stored on disk by hash. For a `tool_result`, keep the block and its `tool_use_id`, replace only its content, so pairing stays valid. Example note:
   `[Liber: offloaded item 3f2a91 — "npm install build log", 4,812 tokens. Stored locally; restore from the Liber dashboard.]`
 - **delete** — remove the item. Deleting half of a tool pair deletes both; a deletion that would leave a message empty removes the message's whole exchange.
@@ -169,7 +173,7 @@ Early edits (anything before the frozen/live boundary) trigger a **major compact
 - tokens that will be reprocessed, estimated one-time cost, estimated per-turn savings, and the payback period in turns.
 - Pricing ratios come from a user-editable config table, not hard-coded claims.
 
-**A plan must make requests smaller** (owner, 2026-11-06). `liber plan create` estimates the request size with the applied version and with the new one (the same estimate `liber plan show` prints, ADR 0012's stale thinking included) and refuses the new version unless it is smaller. Every compaction costs a cache restart and drops older reasoning; one that saves nothing isn't worth it. Typical cases: a summary of short exchanges, or offloading an item smaller than its pointer note.
+**A plan must make requests smaller** (owner, 2026-11-06). `liber plan create` estimates the request size with the applied version and with the new one (the same estimate `liber plan show` prints; thinking isn't counted on either side: a conservative choice by the owner, 2026-11-09, since leaving it out wasn't a measurable saving in one Tier 2 task, pending a `count_tokens` check) and refuses the new version unless it is smaller. Every compaction costs a cache restart and drops older reasoning; one that saves nothing isn't worth it. Typical cases: a summary of short exchanges, or offloading an item smaller than its pointer note.
 
 Optional v1 auto-rules (off by default, deterministic, no LLM): e.g. "offload tool results larger than N tokens that are older than K turns".
 

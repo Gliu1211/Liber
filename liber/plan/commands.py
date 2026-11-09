@@ -174,7 +174,8 @@ def describe_estimate(estimate: cost.Estimate, exact_exchanges: int = 0) -> list
     )
     lines = [
         f"  applying the pending version: {kind} (estimates, from {source})",
-        f"    tokens per request: about {estimate.tokens_now:,} now, {estimate.tokens_after:,} after",
+        f"    tokens per request (thinking not counted): about {estimate.tokens_now:,} now, "
+        f"{estimate.tokens_after:,} after",
         f"    reprocessed once: about {estimate.reprocessed_tokens:,} tokens",
         f"    reasoning dropped: {estimate.dropped_thinking_blocks} thinking blocks "
         f"(about {estimate.dropped_thinking_tokens:,} tokens), left out from then on",
@@ -270,7 +271,8 @@ def refuse_unless_smaller(
     reasoning is dropped (ADR 0012). One that doesn't shrink the request pays that and gains
     nothing, e.g. a summary longer than the short exchanges it replaces, or a pointer note bigger
     than the item it offloads. Uses the same estimate `liber plan show` prints, so the numbers
-    in the refusal match what show would say.
+    in the refusal match what show would say. Thinking isn't counted on either side (plan/cost.py):
+    leaving it out isn't a saving the API was shown to give.
     """
     base = state.pending or state.applied  # a new version builds on the newest one
     candidate = Plan(operations=base.plan.operations + operations)
@@ -283,7 +285,8 @@ def refuse_unless_smaller(
     if estimate.tokens_after >= estimate.tokens_now:
         raise PlanError(
             f"this plan wouldn't make the conversation smaller (about {estimate.tokens_now:,} tokens per "
-            f"request now, {estimate.tokens_after:,} after), so it isn't worth the cache restart. "
+            f"request now, {estimate.tokens_after:,} after, thinking not counted), so it isn't worth the "
+            "cache restart. "
             "Summarize a longer range, or offload or delete larger items."
         )
 

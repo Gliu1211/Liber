@@ -29,6 +29,7 @@ from tests.helpers import FakeModel
 REASONING = "the database is ruled out: pool 6/50, p99 4 ms"
 NEEDLE = "INC-4471"
 CONFIG_NEEDLE = "CHG-2291"
+SMALL_NEEDLE = "OPS-8812"
 TASKS = Path(__file__).parent.parent / "evals" / "tier2_tasks"
 SETTINGS = Settings(model="claude-sonnet-5-5", judge_model="claude-opus-5-5", repeats=2)
 
@@ -90,6 +91,10 @@ class FakeApi:
             answer = "1.7" if "backoff_multiplier = 1.7" in seen else "I don't know"
         elif "change ticket" in last:  # its needle
             answer = f"{CONFIG_NEEDLE}, Tomasz Wierzbicki" if CONFIG_NEEDLE in seen else "I don't know"
+        elif "cache.ttl_seconds" in last:  # small_config_in_long_session's probe
+            answer = "270" if "ttl_seconds = 270" in seen else "I don't know"
+        elif "ticket did I give you" in last:  # its needle
+            answer = f"{SMALL_NEEDLE}, Lena Brandt" if SMALL_NEEDLE in seen else "I don't know"
         else:
             answer = "Done." + " Details follow." * 40
         content.append({"type": "text", "text": answer})
@@ -99,9 +104,12 @@ class FakeApi:
         text = request["messages"][0]["content"].removeprefix("<grading>\n").removesuffix("\n</grading>")
         grading = json.loads(text)
         if "states this fact" in grading["rubric"]:
-            verdict = any(tag in grading["answer"] for tag in (NEEDLE, CONFIG_NEEDLE) if tag in grading["rubric"])
+            tags = (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE)
+            verdict = any(tag in grading["answer"] for tag in tags if tag in grading["rubric"])
         elif "the value 1.7" in grading["rubric"]:
             verdict = "1.7" in grading["answer"]
+        elif "the value 270" in grading["rubric"]:
+            verdict = "270" in grading["answer"]
         else:
             verdict = grading["answer"].startswith("ruled out")
         reply = json.dumps({"pass": verdict, "reason": "fake judge"})
@@ -115,7 +123,7 @@ def worker_model() -> FakeModel:
     def reply(call: dict[str, Any]) -> dict[str, Any]:
         if "notes" in call["schema"]["properties"]:
             return {"notes": [REASONING] if REASONING in call["prompt"] else []}
-        kept = "".join(f" Ticket {tag}." for tag in (NEEDLE, CONFIG_NEEDLE) if tag in call["prompt"])
+        kept = "".join(f" Ticket {tag}." for tag in (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE) if tag in call["prompt"])
         return {"topic": "checkout 500s", "summary": "Checkout 500s traced to an expired payments certificate." + kept}
 
     model.reply = reply
@@ -737,6 +745,7 @@ async def test_e_with_nothing_to_keep_is_an_error_not_a_silent_b(monkeypatch: py
 
     e = next(r for r in runs if r.condition == "E")
     assert e.errors and e.errors[0].startswith("nothing to keep")
+    assert e.success is None and e.answers == {} and e.usage.input_tokens == 0  # nothing was asked
 
 
 def test_the_report_has_the_three_e_comparisons() -> None:
@@ -753,3 +762,90 @@ def test_the_report_has_the_three_e_comparisons() -> None:
     assert comparisons["E vs D"].success_delta == 1.0 and comparisons["E vs D"].input_change == pytest.approx(
         500 / 300 - 1
     )
+
+
+async def test_a_refused_plan_asks_nothing_and_gets_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-11-08: E's plan was refused on 4 of 5 repeats, the questions went out unedited (condition A),
+    and their passes were counted as E's. Now a refused plan ends the condition with no verdict."""
+    task = task_named("undiscussed_config_detail")
+    original = tier2.commands.create
+
+    async def refuse_e(store: Any, session_id: str, *args: Any, **kwargs: Any) -> str:
+        if kwargs.get("pin"):
+            raise tier2.PlanError("this plan wouldn't make the conversation smaller")
+        return await original(store, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(tier2.commands, "create", refuse_e)
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+    text = tier2_report.report([asdict(r) for r in runs], {"date": "d", "repeats": 1})
+
+    e = next(r for r in runs if r.condition == "E")
+    assert e.success is None and e.needle_kept is None and e.answers == {}
+    assert e.errors == ["plan refused: this plan wouldn't make the conversation smaller"]
+    assert e.usage.input_tokens == 0  # nothing was sent for E
+    assert "| E: Liber, chosen items kept | n/a [0/1]" in text
+
+
+async def test_an_unedited_liber_request_is_never_sent(dead_end: tier2.Task) -> None:
+    """With a model Liber can't confirm, the probe still goes out compacted (all its thinking was stale
+    and left out), but the needle request carries the probe reply's thinking, so Liber would send it
+    unedited: that one isn't sent, and gets no verdict."""
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [dead_end], Settings("some-other-model", "j", repeats=1), quiet)
+
+    b = next(r for r in runs if r.condition == "B")
+    assert b.liber_outcomes[0] == "rendered" and b.liber_outcomes[1].startswith("passthrough")
+    assert b.success is not None and "probe" in b.answers  # the compacted probe was asked and graded
+    assert b.needle_kept is None and "needle" not in b.answers  # the unedited needle request wasn't sent
+    assert any(e.startswith("Liber didn't send the compaction: passthrough") for e in b.errors)
+
+
+async def test_small_pin_task_plumbing_e_is_accepted_and_keeps_the_value() -> None:
+    """Pinning's intended shape: E's plan is accepted (the config is a small part of what's summarized),
+    E keeps the undiscussed value, and still sends far less than full context."""
+    task = task_named("small_config_in_long_session")
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    by = {r.condition: r for r in runs}
+    assert {c: by[c].success for c in by} == {"A": True, "B": False, "C": False, "D": False, "E": True}
+    e = by["E"]
+    assert e.errors == [] and e.liber_outcomes == ["rendered", "rendered"]
+    assert "ttl_seconds = 270" in e.frozen_blocks[0] and "status=504" not in e.frozen_blocks[0]  # config kept, logs not
+    assert e.usage.input_tokens < by["A"].usage.input_tokens / 2
+
+
+async def test_an_unsent_probe_means_no_questions_at_all(dead_end: tier2.Task, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If Liber wouldn't send even the probe compacted, neither question is sent."""
+    original = tier2.pipeline.prepare
+
+    async def falls_back_on_the_probe(store: Any, body: bytes, *args: Any, **kwargs: Any) -> Any:
+        prepared = await original(store, body, *args, **kwargs)
+        if dead_end.probe_question.encode() in body:
+            prepared.outcome = "fallback"
+        return prepared
+
+    monkeypatch.setattr(tier2.pipeline, "prepare", falls_back_on_the_probe)
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [dead_end], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    b = next(r for r in runs if r.condition == "B")
+    assert b.liber_outcomes == ["fallback"]  # only the probe was prepared; the needle never asked
+    assert b.success is None and b.needle_kept is None and b.answers == {} and b.usage.input_tokens == 0
+
+
+async def test_rejudge_gives_no_verdict_to_old_runs_whose_plan_was_refused(dead_end: tier2.Task) -> None:
+    old = run("dead_end_debugging", "E", 1, True, 900, errors=["plan refused: wouldn't make it smaller"])
+    old["answers"] = {"probe": "ruled out: something", "needle": f"{NEEDLE}, Priya Raman"}
+    valid = run("dead_end_debugging", "B", 1, None, 600, errors=["Liber didn't send the compaction: passthrough"])
+    valid["answers"] = {"probe": f"ruled out: {REASONING}"}  # since 2026-11-09 the sent probe is valid
+
+    graded = await tier2.rejudge(FakeApi(), {dead_end.name: dead_end}, "j", [old, valid])
+
+    assert graded[0]["success"] is None and graded[0]["needle_kept"] is None
+    assert "no verdict" in graded[0]["judge_reasons"]["rejudge"]
+    assert graded[1]["success"] is True
