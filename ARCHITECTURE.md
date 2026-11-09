@@ -131,6 +131,7 @@ Every content unit becomes an `Item`:
     - Not escaped, so code and config read as they were. Only Liber's own `<liber:` tags are neutralized.
     - An item can't be both pinned and offloaded or deleted.
     - The text is read from the session's recorded request bodies and fixed in the plan version, like summary text (byte-identical on every request). It counts toward "a plan must make requests smaller" (§6).
+  - **keeping the assistant's code** (ADR 0017; accepted, not built yet): the summarizer picks which of the assistant's code (fenced blocks in its replies, code fields of its file-writing tool calls) a later turn would need exactly, and Liber copies those bytes into the frozen block, word for word. Tool output is never kept this way; it's the user's to pin. Capped per exchange and per range; kept code counts toward §6's rule.
 - **offload** — content replaced by a pointer note; original stored on disk by hash. For a `tool_result`, keep the block and its `tool_use_id`, replace only its content, so pairing stays valid. Example note:
   `[Liber: offloaded item 3f2a91 — "npm install build log", 4,812 tokens. Stored locally; restore from the Liber dashboard.]`
 - **delete** — remove the item. Deleting half of a tool pair deletes both; a deletion that would leave a message empty removes the message's whole exchange.

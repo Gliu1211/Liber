@@ -278,3 +278,13 @@ Template:
 - Proposed follow-ups (owner decides): decide ADR 0017; a live Tier 2 run including `small_config_in_long_session`; that `count_tokens` check; scaling estimates by the worker's exact counts in the shrink check.
 - Next step: owner reviews this PR and decides ADR 0017.
 
+## 2026-11-09 — Owner decision: ADR 0017 accepted
+- Done: [ADR 0017](decisions/0017-keep-code-in-summaries.md) (keep the assistant's code word for word in summaries) accepted as written. ARCHITECTURE.md §4 notes it under summarize, marked not built yet.
+- Next step (owner starts it): the Tier 2 control first: condition E on `code_reconstruction`, pinning the assistant's last full `parse()` reply, through a task field such as `keep_assistant_text_of_turns`. It shows what keeping the code is worth. Then build ADR 0017:
+  - candidates: fenced code in assistant replies, and code fields of file-writing tool calls;
+  - `keep_code` in the summary call, with ids checked in code;
+  - the "Code kept as is" section in the frozen block;
+  - the 4,000-character per-exchange and 12,000-character per-range limits;
+  - a `PROMPT_VERSION` bump;
+  - a Claude Code-shaped Tier 2 task that writes code through `Write`/`Edit`.
+
