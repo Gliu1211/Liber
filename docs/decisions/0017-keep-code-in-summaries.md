@@ -1,6 +1,6 @@
 # 0017 — Keep the assistant's code word for word in summaries
 
-- Status: Accepted (owner, 2026-11-09)
+- Status: Accepted (owner, 2026-11-09); amended (owner, 2026-11-09): code that exists only in the conversation
 - Date: 2026-11-09
 
 ## Context
@@ -43,17 +43,17 @@ Where code lives in a conversation:
 ## Decision
 Option 2, with option 3 as the Tier 2 control.
 
-1. **Candidates** (`worker/summarize.py`). For each exchange, the code candidates are:
-   - fenced code blocks in the assistant's text replies;
-   - string fields of the assistant's tool-call inputs that look like code: at least 3 lines, from
-     tools that write or edit files (`content`, `new_string` and the like; the field names are a
-     configurable list).
+1. **Candidates** (`worker/summarize.py`): only code that exists just in the conversation, meaning
+   **fenced code blocks in the assistant's text replies** (amended, see below).
 
    Each is given an id (`code-1`, `code-2`, …) and marked as a candidate in the transcript the
    summarizer sees, inside the quoted data.
 
-   Tool results (file reads, command output) are **not** candidates. They are external content
-   (prompt-injection surface, ADR 0013/0016), and keeping them is the user's choice: a pin.
+   Not candidates:
+   - **Code the assistant wrote to files** (`Write`'s `content`, `Edit`'s `new_string` and the
+     like). It is on disk, and the model can read the file again, exactly and on demand.
+   - **Tool results** (file reads, command output). They are external content (prompt-injection
+     surface, ADR 0013/0016), and keeping them is the user's choice: a pin.
 2. **The summary call** returns a new field `keep_code`: the ids worth keeping, meaning the code a
    later turn would need exactly, such as the current version of something being worked on.
    - The schema lists only the given ids, and the worker also drops any id it didn't offer before
@@ -62,20 +62,17 @@ Option 2, with option 3 as the Tier 2 control.
    - `PROMPT_VERSION` goes up, so old summaries aren't reused.
 3. **Rendering** (`plan/apply.frozen_text`). The chosen code goes in a section "Code kept as is
    (written by the assistant earlier; copied word for word):".
-   - Each block is labelled with where it came from, e.g. `[assistant code, message 5]` or
-     `[assistant Write content, message 7]`.
+   - Each block is labelled with where it came from, e.g. `[assistant code, message 5]`.
    - It is fenced as it was, not escaped; only Liber's own tags are neutralized, as for pins.
-   - The bytes are the candidate's own: a fenced block's text, or a tool-call field's decoded string
-     value, never re-serialized JSON.
+   - The bytes are the fenced block's own text, copied from the transcript.
    - An item the user also pinned (ADR 0016) is shown once, as the pin.
    - The text is fixed in the plan version, as summaries and pins are (ADR 0004 A2).
 4. **Limits.**
    - At most 4,000 characters of kept code per exchange, whole blocks only, in the summarizer's
      order.
    - A single block over the limit is not cut. It is left out, with a one-line note in the section
-     naming it and its size, so the reader knows code existed there. A large `Write` is the
-     commonest Claude Code case; pinning it (ADR 0016) or a later `recall` (D3) is the way to keep
-     it.
+     naming it and its size, so the reader knows code existed there. Pinning it (ADR 0016) or a
+     later `recall` (D3) is the way to keep it.
    - Per summary range: at most 12,000 characters, newest exchanges first, since later code
      supersedes earlier. What doesn't fit gets the same note.
    - Kept code counts toward "a plan must make requests smaller" (§6). If it would make a plan
@@ -93,7 +90,27 @@ Option 2, with option 3 as the Tier 2 control.
      assistant's last full `parse()` reply. This needs a task field for pinning an assistant turn's
      text, such as `keep_assistant_text_of_turns`.
    - E then shows what keeping the code is worth, and B after this change should approach E.
-   - Add a Claude Code-shaped task where code is written through `Write`/`Edit` tool calls.
+   - `code_reconstruction_reread` is the on-disk counterpart: the same edits, saved with
+     `write_file` in a simulated workspace, and questions allowed to reread the file. It measures
+     whether compaction still costs success when the code is on disk, and what the reread costs
+     in tokens. This change should leave it unaffected.
+
+## Amendment (owner, 2026-11-09): only code that exists just in the conversation
+- **What changed:** candidates are now fenced code in the assistant's replies only. Code the
+  assistant wrote to files through tool calls is no longer kept.
+- **Why:** in a Claude Code session most code is written to disk, and the model can read a file
+  again, exactly and cheaply, when it needs it. Keeping that code in the summary spends tokens on
+  something the model can fetch. Code that lives only in the conversation is different: proposed
+  patches, functions the user asked to see but never saved, earlier versions since overwritten.
+  Nothing can fetch it back, so it's what a summary must keep. `code_reconstruction` is exactly
+  this case: `parse()` was only ever printed in replies.
+- **What it measures:** `code_reconstruction_reread` is the on-disk twin. If rereads recover
+  success there at a modest token cost, the narrower scope is right.
+- **Out of scope:** code the user pasted into their own messages also exists only in the
+  conversation. It isn't a candidate in v1 (the user's text is summarized like any other text), and
+  could be added the same way if Tier 2 shows a need.
+- **Consequences:** fewer and smaller candidates, so the per-exchange and per-range limits bind
+  less often. There is no longer a list of tool-call field names to maintain as clients change.
 
 ## Consequences
 - **Code-heavy sessions keep their working code** at the cost of its tokens, chosen per exchange
@@ -106,6 +123,5 @@ Option 2, with option 3 as the Tier 2 control.
   - Assistant-written code is lower risk than tool output, but not zero: an assistant can quote
     hostile text into a code block.
   - It is labelled as a record, as pins are, and a summarizer can't add bytes, only choose ids.
-- **Tool-call field names are a list to maintain** as clients and tools change.
 - **Revisit when** a model can recall offloaded items on demand (D3's v2 `recall`). Kept code
   could then become a pointer for large files.

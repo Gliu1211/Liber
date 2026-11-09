@@ -111,6 +111,14 @@ class Task:
     # summary. Item ids differ per run, so the task names tools; E pins their results in the
     # summarized range. Tasks without it don't run E.
     keep_tool_results: list[str] = field(default_factory=list)
+    # A simulated workspace: path -> content. With it, `read_file` returns a file's current content
+    # and `write_file` replaces it, so edits made during setup are on "disk" afterwards. Each
+    # condition starts from its own copy of the workspace as setup left it.
+    files: dict[str, str] = field(default_factory=dict)
+    # Whether the probe and needle questions may use tools (served as in setup). Off by default: most
+    # tasks test what survives in context, and a reread would hide that. On, the task measures the
+    # realistic case where the model can look again, and what that costs (its extra requests count).
+    questions_may_use_tools: bool = False
 
     def conditions(self) -> tuple[str, ...]:
         return CONDITIONS if self.keep_tool_results else tuple(c for c in CONDITIONS if c != "E")
@@ -146,6 +154,7 @@ class ConditionRun:
     answers: dict[str, str] = field(default_factory=dict)
     asked: dict[str, str] = field(default_factory=dict)  # the questions as asked, so a rejudge can check
     refused_tool_calls: list[str] = field(default_factory=list)  # tools the model tried during the questions
+    question_tool_calls: list[str] = field(default_factory=list)  # tools used during the questions, where allowed
     judge_reasons: dict[str, str] = field(default_factory=dict)
 
 
@@ -164,6 +173,7 @@ async def turn(
     task: Task,
     run: ConditionRun | None,
     tools: bool = True,
+    workspace: dict[str, str] | None = None,
 ) -> str | None:
     """One user turn on `messages` (extended in place), tool round trips included.
 
@@ -203,13 +213,11 @@ async def turn(
         calls = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
         if tools:
             results = [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": b["id"],
-                    "content": task.tool_outputs.get(b["name"], "(no output)"),
-                }
+                {"type": "tool_result", "tool_use_id": b["id"], "content": tool_output(task, workspace, b)}
                 for b in calls
             ]
+            if run is not None:
+                run.question_tool_calls += [b["name"] for b in calls]
         else:
             results = [
                 {"type": "tool_result", "tool_use_id": b["id"], "content": TOOLS_UNAVAILABLE, "is_error": True}
@@ -221,6 +229,24 @@ async def turn(
     if run is not None:
         run.errors.append(f"the model was still calling tools after {MAX_TOOL_ROUNDS} rounds")
     return None
+
+
+def tool_output(task: Task, workspace: dict[str, str] | None, call: dict[str, Any]) -> str:
+    """What a tool call returns: the workspace for read_file/write_file (if the task has files), else
+    the task's scripted output."""
+    name = call.get("name")
+    given = call.get("input")
+    arguments: dict[str, Any] = given if isinstance(given, dict) else {}
+    if workspace is not None and task.files and name in ("read_file", "write_file"):
+        path = str(arguments.get("path", ""))
+        if name == "read_file":
+            return workspace.get(path, f"No such file: {path}")
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            return "write_file needs a path and the file's full content as a string."
+        workspace[path] = content
+        return f"Wrote {len(content)} characters to {path}."
+    return task.tool_outputs.get(str(name), "(no output)")
 
 
 # --- The four conditions ----------------------------------------------------------------------------
@@ -273,17 +299,21 @@ def liber_sender(api: MessagesApi, base: dict[str, Any], store: Store, run: Cond
     return send
 
 
-async def setup_history(api: MessagesApi, task: Task, settings: Settings) -> tuple[list[dict[str, Any]], list[int]]:
-    """The task's turns with full context: the shared history, and where each turn starts."""
+async def setup_history(
+    api: MessagesApi, task: Task, settings: Settings
+) -> tuple[list[dict[str, Any]], list[int], dict[str, str]]:
+    """The task's turns with full context: the shared history, where each turn starts, and the
+    workspace as setup left it."""
     send = direct_sender(api, base_request(task, settings.model))
     messages: list[dict[str, Any]] = []
     starts = []
+    workspace = dict(task.files)
     for prompt in task.turns:
         starts.append(len(messages))
         failed = ConditionRun(task.name, "setup", 0)
-        if await turn(send, messages, prompt, task, failed) is None:
+        if await turn(send, messages, prompt, task, failed, workspace=workspace) is None:
             raise RuntimeError(f"a setup turn failed: {(failed.binding_errors + failed.errors)[:1]}")
-    return messages, starts
+    return messages, starts, workspace
 
 
 def thinking_with_text(messages: list[dict[str, Any]]) -> int:
@@ -329,6 +359,7 @@ async def run_liber(
     summaries: list[tuple[str, ExchangeSummary]],
     run: ConditionRun,
     directory: Path,
+    workspace: dict[str, str],
 ) -> tuple[str | None, str | None]:
     """B, C or E: plan from the shared summaries, applied at the probe (a clean turn), then both questions.
 
@@ -374,7 +405,7 @@ async def run_liber(
         if task.evidence_markers:
             text = "\n".join(run.frozen_blocks).lower()
             run.summary_has_evidence = any(marker.lower() in text for marker in task.evidence_markers)
-        return await questions(liber_sender(api, base, store, run), list(history), task, run)
+        return await questions(liber_sender(api, base, store, run), list(history), task, run, workspace)
     finally:
         await store.close()
 
@@ -409,7 +440,12 @@ def recorded_request(session_id: str, request: dict[str, Any]) -> RequestRecord:
 
 
 async def run_client_compaction(
-    api: MessagesApi, task: Task, settings: Settings, history: list[dict[str, Any]], run: ConditionRun
+    api: MessagesApi,
+    task: Task,
+    settings: Settings,
+    history: list[dict[str, Any]],
+    run: ConditionRun,
+    workspace: dict[str, str],
 ) -> tuple[str | None, str | None]:
     """D: the model summarizes the whole history; the client continues from that summary alone."""
     send = direct_sender(api, base_request(task, settings.model))
@@ -420,20 +456,27 @@ async def run_client_compaction(
     run.overhead.add(result.body)
     messages: list[dict[str, Any]] = []
     first = CONTINUED.format(summary=reply_text(result.body), prompt=task.probe_question)
-    probe = await turn(send, messages, first, task, run, tools=False)
-    needle = await turn(send, messages, task.needle_question, task, run, tools=False) if probe is not None else None
+    tools = task.questions_may_use_tools
+    probe = await turn(send, messages, first, task, run, tools, workspace)
+    needle = (
+        await turn(send, messages, task.needle_question, task, run, tools, workspace) if probe is not None else None
+    )
     return probe, needle
 
 
 async def questions(
-    send: Sender, messages: list[dict[str, Any]], task: Task, run: ConditionRun
+    send: Sender, messages: list[dict[str, Any]], task: Task, run: ConditionRun, workspace: dict[str, str]
 ) -> tuple[str | None, str | None]:
     """The probe, then (if it got an answer) the needle question in the same conversation.
 
-    Tools stay offered (removing them would change the request), but calling one gets nothing back.
+    Tools stay offered (removing them would change the request). Unless the task allows tools here,
+    calling one gets nothing back. `workspace`: this condition's own copy.
     """
-    probe = await turn(send, messages, task.probe_question, task, run, tools=False)
-    needle = await turn(send, messages, task.needle_question, task, run, tools=False) if probe is not None else None
+    tools = task.questions_may_use_tools
+    probe = await turn(send, messages, task.probe_question, task, run, tools, workspace)
+    needle = (
+        await turn(send, messages, task.needle_question, task, run, tools, workspace) if probe is not None else None
+    )
     return probe, needle
 
 
@@ -594,7 +637,7 @@ async def grade(
 async def run_task_repeat(
     api: MessagesApi, worker_client: ModelClient, task: Task, settings: Settings, repeat: int
 ) -> list[ConditionRun]:
-    history, starts = await setup_history(api, task, settings)
+    history, starts, after_setup = await setup_history(api, task, settings)
     with_text = thinking_with_text(history)
     through = starts[task.compact_through_turn + 1] - 1  # the message before the next turn starts
     runs = []
@@ -605,13 +648,16 @@ async def run_task_repeat(
             run = ConditionRun(task.name, condition, repeat, task.reasoning_dependent, thinking_with_text=with_text)
             if task.reasoning_dependent and with_text == 0:
                 run.errors.append("no thinking text came back in setup: C can't differ from B on this repeat")
+            workspace = dict(after_setup)  # each condition reads and writes its own copy
             if condition == "A":
                 send = direct_sender(api, base_request(task, settings.model))
-                probe, needle = await questions(send, list(history), task, run)
+                probe, needle = await questions(send, list(history), task, run, workspace)
             elif condition in ("B", "C", "E"):
-                probe, needle = await run_liber(api, task, settings, history, through, summaries, run, directory)
+                probe, needle = await run_liber(
+                    api, task, settings, history, through, summaries, run, directory, workspace
+                )
             else:
-                probe, needle = await run_client_compaction(api, task, settings, history, run)
+                probe, needle = await run_client_compaction(api, task, settings, history, run, workspace)
             await grade(api, task, settings, run, probe, needle)
             run.cost = input_cost(run.usage + run.overhead, settings.model, settings.pricing)
             runs.append(run)

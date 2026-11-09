@@ -302,6 +302,13 @@ def report(runs: list[dict[str, Any]], meta: dict[str, Any], history: Path | Non
     if refused:
         lines += ["", "## Tool calls refused during the questions", ""]
         lines += [f"- {task} {condition} #{repeat}: {', '.join(calls)}" for task, condition, repeat, calls in refused]
+    # Tasks that allow tools during the questions: rereads are part of the answer's cost (their requests
+    # are in the token columns), so list who reread what.
+    used = [(r["task"], r["condition"], r["repeat"], r.get("question_tool_calls") or []) for r in runs]
+    used = [(task, condition, repeat, calls) for task, condition, repeat, calls in used if calls]
+    if used:
+        lines += ["", "## Tool calls during the questions (allowed by the task; in the token counts)", ""]
+        lines += [f"- {task} {condition} #{repeat}: {', '.join(calls)}" for task, condition, repeat, calls in used]
     if history is not None:
         points = trends(history)
         if points:
