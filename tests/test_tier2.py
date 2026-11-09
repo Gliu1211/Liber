@@ -30,6 +30,27 @@ REASONING = "the database is ruled out: pool 6/50, p99 4 ms"
 NEEDLE = "INC-4471"
 CONFIG_NEEDLE = "CHG-2291"
 SMALL_NEEDLE = "OPS-8812"
+CODE_NEEDLE = "DEV-318"
+# code_reconstruction_reread: what the fake "model" saves, and how its probe is recognised.
+EDITED = "# edited: empty-input check, docstring"
+PARSE_ANSWER = f"def parse(line):\n    {EDITED}\n    ..."
+REREAD_PROBE = "in etl/parser.py exactly as it stands now"
+
+
+def write_call(number: int) -> dict[str, Any]:
+    """The fake model saves etl/parser.py with all the task's edits (what workspace_checks expects)."""
+    source = json.loads((TASKS / "code_reconstruction_reread.json").read_text())["files"]["etl/parser.py"]
+    edited = source.replace("def load(", "def load_records(").replace(
+        "def parse(line):\n", f'def parse(line):\n    """Parse one line of the export format."""\n    {EDITED}\n'
+    )
+    return {
+        "type": "tool_use",
+        "id": f"toolu_{number}",
+        "name": "write_file",
+        "input": {"path": "etl/parser.py", "content": edited},
+    }
+
+
 TASKS = Path(__file__).parent.parent / "evals" / "tier2_tasks"
 SETTINGS = Settings(model="claude-sonnet-5-5", judge_model="claude-opus-5-5", repeats=2)
 
@@ -75,12 +96,32 @@ class FakeApi:
         content: list[dict[str, Any]] = [{"type": "thinking", "thinking": text, "signature": bound_to(messages)}]
         last = messages[-1]["content"]
         if not isinstance(last, str):  # tool results came back
+            asked = next(m["content"] for m in reversed(messages) if isinstance(m["content"], str))
+            wrote = "Wrote " in json.dumps(last)
+            if "save" in asked.lower() and not wrote:  # code_reconstruction_reread: save after reading
+                return message([*content, write_call(len(messages))], "tool_use", seen)
+            if REREAD_PROBE in asked:  # its probe, answered after reading the file
+                answer = PARSE_ANSWER if EDITED in seen else "I can't tell."
+                return message([*content, {"type": "text", "text": answer}], "end_turn", seen)
             content.append({"type": "text", "text": "Expired payments certificate." + " Details follow." * 40})
             return message(content, "end_turn", seen)
         tool = next((t["name"] for t in request.get("tools", []) if f"Call {t['name']}" in last), None)
         if tool is not None:
-            content.append({"type": "tool_use", "id": f"toolu_{len(messages)}", "name": tool, "input": {}})
+            arguments = {"path": "etl/parser.py"} if tool == "read_file" else {}
+            content.append({"type": "tool_use", "id": f"toolu_{len(messages)}", "name": tool, "input": arguments})
             return message(content, "tool_use", seen)
+        if "save" in last.lower() and any(t["name"] == "write_file" for t in request.get("tools", [])):
+            return message([*content, write_call(len(messages))], "tool_use", seen)
+        if REREAD_PROBE in last:  # answer from context, or reread the file
+            if EDITED in seen:
+                return message([*content, {"type": "text", "text": PARSE_ANSWER}], "end_turn", seen)
+            read = {
+                "type": "tool_use",
+                "id": f"toolu_{len(messages)}",
+                "name": "read_file",
+                "input": {"path": "etl/parser.py"},
+            }
+            return message([*content, read], "tool_use", seen)
         if last == tier2.COMPACT_PROMPT:
             answer = "Summary: the checkout 500s come from an expired payments certificate; it was rotated."
         elif "rule out the database" in last:
@@ -93,6 +134,8 @@ class FakeApi:
             answer = f"{CONFIG_NEEDLE}, Tomasz Wierzbicki" if CONFIG_NEEDLE in seen else "I don't know"
         elif "cache.ttl_seconds" in last:  # small_config_in_long_session's probe
             answer = "270" if "ttl_seconds = 270" in seen else "I don't know"
+        elif "who is the reviewer" in last:  # code_reconstruction(_reread)'s needle
+            answer = f"{CODE_NEEDLE}, Ines Duarte" if CODE_NEEDLE in seen else "I don't know"
         elif "ticket did I give you" in last:  # its needle
             answer = f"{SMALL_NEEDLE}, Lena Brandt" if SMALL_NEEDLE in seen else "I don't know"
         else:
@@ -104,8 +147,10 @@ class FakeApi:
         text = request["messages"][0]["content"].removeprefix("<grading>\n").removesuffix("\n</grading>")
         grading = json.loads(text)
         if "states this fact" in grading["rubric"]:
-            tags = (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE)
+            tags = (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE, CODE_NEEDLE)
             verdict = any(tag in grading["answer"] for tag in tags if tag in grading["rubric"])
+        elif "Parse one line of the export format" in grading["rubric"]:
+            verdict = EDITED in grading["answer"]
         elif "the value 1.7" in grading["rubric"]:
             verdict = "1.7" in grading["answer"]
         elif "the value 270" in grading["rubric"]:
@@ -123,7 +168,8 @@ def worker_model() -> FakeModel:
     def reply(call: dict[str, Any]) -> dict[str, Any]:
         if "notes" in call["schema"]["properties"]:
             return {"notes": [REASONING] if REASONING in call["prompt"] else []}
-        kept = "".join(f" Ticket {tag}." for tag in (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE) if tag in call["prompt"])
+        tags = (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE, CODE_NEEDLE)
+        kept = "".join(f" Ticket {tag}." for tag in tags if tag in call["prompt"])
         return {"topic": "checkout 500s", "summary": "Checkout 500s traced to an expired payments certificate." + kept}
 
     model.reply = reply
@@ -420,7 +466,10 @@ def test_the_task_fixtures_load_and_one_is_reasoning_dependent() -> None:
 
     assert any(task.reasoning_dependent and task.evidence_markers for task in tasks)
     for task in tasks:
-        assert task.needle_fact and task.probe_rubric and set(task.tool_outputs) == {t["name"] for t in task.tools}
+        workspace_tools = {"read_file", "write_file"} if task.files else set()
+        assert not set(task.tool_outputs) & workspace_tools  # the workspace would shadow them silently
+        served = set(task.tool_outputs) | workspace_tools
+        assert task.needle_fact and task.probe_rubric and served == {t["name"] for t in task.tools}
 
 
 # --- The report on a fixed dataset --------------------------------------------------------------------
@@ -695,7 +744,7 @@ async def test_a_tool_call_during_the_questions_gets_nothing_and_is_reported() -
         return ApiResult(200, {"content": [{"type": "text", "text": "I don't know"}], "stop_reason": "end_turn"})
 
     run = ConditionRun(task.name, "B", 1)
-    probe, needle = await tier2.questions(rereads_the_config, [], task, run)
+    probe, needle = await tier2.questions(rereads_the_config, [], task, run, {})
 
     assert probe == needle == "I don't know"
     assert run.refused_tool_calls == ["read_config", "read_config"]
@@ -849,3 +898,103 @@ async def test_rejudge_gives_no_verdict_to_old_runs_whose_plan_was_refused(dead_
     assert graded[0]["success"] is None and graded[0]["needle_kept"] is None
     assert "no verdict" in graded[0]["judge_reasons"]["rejudge"]
     assert graded[1]["success"] is True
+
+
+# --- code_reconstruction_reread: the code is on disk and the model may look again -------------------
+
+
+async def test_with_rereads_allowed_compacted_conditions_read_the_saved_file() -> None:
+    """Plumbing with rigged fakes: setup's edits land in the workspace, and a condition that lost the
+    code from context rereads it (and that reread is recorded and counted) instead of failing."""
+    task = task_named("code_reconstruction_reread")
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    by = {r.condition: r for r in runs}
+    assert {c: by[c].success for c in by} == {"A": True, "B": True, "C": True, "D": True}
+    assert by["A"].question_tool_calls == []  # the code was still in its context
+    for condition in "BCD":
+        assert by[condition].question_tool_calls == ["read_file"]  # the reread, recorded
+        assert by[condition].refused_tool_calls == []
+    assert all(r.errors == [] and r.binding_errors == [] for r in runs)
+
+
+def test_the_workspace_reads_and_writes_files() -> None:
+    task = task_named("code_reconstruction_reread")
+    workspace = dict(task.files)
+
+    def call(name: str, **arguments: Any) -> str:
+        return tier2.tool_output(task, workspace, {"name": name, "input": arguments})
+
+    assert call("read_file", path="etl/parser.py").startswith('"""Parse the nightly orders export')
+    assert call("read_file", path="missing.py") == "No such file: missing.py. Files: etl/parser.py"
+    assert call("read_file", path="./etl/parser.py") == call("read_file", path="/etl/parser.py")  # one file
+    assert call("write_file", path="etl/parser.py", content="new") == "Wrote 3 characters to etl/parser.py."
+    assert call("read_file", path="etl/parser.py") == "new"
+    assert call("write_file", path="etl/parser.py").startswith("write_file needs")
+    assert task.files["etl/parser.py"] != "new"  # the task's own files are never changed
+
+
+async def test_each_condition_gets_its_own_copy_of_the_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = task_named("code_reconstruction_reread")
+    seen: list[dict[str, str]] = []
+    original = tier2.questions
+
+    async def scribbling(send: Any, messages: Any, task: Any, run: Any, workspace: dict[str, str]) -> Any:
+        seen.append(dict(workspace))  # what this condition started from
+        workspace[f"scribble-{run.condition}"] = "x"  # a write that must not reach the next condition
+        return await original(send, messages, task, run, workspace)
+
+    monkeypatch.setattr(tier2, "questions", scribbling)
+
+    await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    assert len(seen) == 3  # A, B and C go through questions(); D asks its own
+    assert all(not any(path.startswith("scribble-") for path in start) for start in seen)
+    assert all(EDITED in start["etl/parser.py"] for start in seen)  # setup's save, in every copy
+    assert EDITED not in task.files["etl/parser.py"]  # and never in the task itself
+
+
+async def test_tasks_with_files_still_refuse_tools_in_questions_unless_allowed() -> None:
+    from dataclasses import replace
+
+    task = replace(task_named("code_reconstruction_reread"), questions_may_use_tools=False)
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    b = next(r for r in runs if r.condition == "B")
+    assert b.refused_tool_calls == ["read_file"] and b.question_tool_calls == []
+
+
+async def test_a_setup_that_left_the_file_wrong_gets_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = task_named("code_reconstruction_reread")
+    monkeypatch.setattr(tier2, "workspace_problems", lambda task, workspace: ["setup left etl/parser.py without 'x'"])
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    assert all(
+        r.success is None and r.answers == {} and r.errors == ["setup left etl/parser.py without 'x'"] for r in runs
+    )
+
+
+def test_without_a_workspace_a_task_with_files_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="no workspace"):
+        tier2.tool_output(task_named("code_reconstruction_reread"), None, {"name": "read_file", "input": {"path": "x"}})
+
+
+async def test_the_report_counts_rereads_and_averages_those_tasks_apart() -> None:
+    runs = await tier2.run_eval(
+        FakeApi(),
+        worker_model(),
+        [task_named("code_reconstruction_reread")],
+        Settings(SETTINGS.model, "j", repeats=1),
+        quiet,
+    )
+
+    text = tier2_report.report([asdict(r) for r in runs], {"date": "d", "repeats": 1})
+
+    assert "## Comparisons, averaged over tasks where the questions may reread" in text
+    assert "averaged over other tasks" not in text  # the reread task isn't mixed into the others
+    assert "- code_reconstruction_reread A: reread in 0 of 1 runs (0 tool calls)" in text
+    assert "- code_reconstruction_reread B: reread in 1 of 1 runs (1 tool calls)" in text

@@ -199,6 +199,11 @@ Runs each task in `evals/tier2_tasks/` under these conditions (§12, [ADR 0015](
 - **E:** B plus the task's chosen tool results kept as they were (only tasks with
   `keep_tool_results`, [ADR 0016](docs/decisions/0016-keep-items-through-a-summary.md)).
 
+A task can also give the model a small simulated workspace (`files`: `read_file` and `write_file`
+on real contents) and let the final questions use tools (`questions_may_use_tools`), as
+`code_reconstruction_reread` does. Rereads made then are listed in the report and counted in its
+tokens.
+
 Each condition runs 3 times by default (`--repeats`). An LLM judge grades task success and
 whether the planted "needle" fact survived. Every request asks the API to fail, not drop, on
 thinking bound to other history, so a Liber mistake shows up as a 400 naming the block.
@@ -230,6 +235,7 @@ are recorded in [docs/decisions/](docs/decisions/).
 
 ## License
 
-[MIT](LICENSE). The dashboard ships HTMX 2.0.4 (`liber/dashboard/static/htmx.min.js`), which keeps
-its own Zero-Clause BSD license (`liber/dashboard/static/htmx.LICENSE`).
+[Apache License 2.0](LICENSE); see also [NOTICE](NOTICE). The dashboard ships HTMX 2.0.4
+(`liber/dashboard/static/htmx.min.js`), which keeps its own Zero-Clause BSD license
+(`liber/dashboard/static/htmx.LICENSE`).
 

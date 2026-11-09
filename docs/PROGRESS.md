@@ -288,3 +288,24 @@ Template:
   - a `PROMPT_VERSION` bump;
   - a Claude Code-shaped Tier 2 task that writes code through `Write`/`Edit`.
 
+## 2026-11-09 — ADR 0017 amended (conversation-only code); Tier 2 task where the model may reread the file
+- Done:
+  - [ADR 0017](decisions/0017-keep-code-in-summaries.md) amended at the owner's request: candidates are only fenced code blocks in the assistant's replies, i.e. code that exists just in the conversation. Code written to files through tool calls (`Write`/`Edit`) is out, because the model can reread the file exactly and on demand. Tool output stays the user's to pin. The decision text is edited in place, with an Amendment section saying what changed and why. ARCHITECTURE.md §4's note follows. Still not built.
+  - Tier 2 runner:
+    - a task can declare `files`, a simulated workspace: `read_file` returns a file's current content and `write_file` replaces it. Setup's edits stay on "disk", and each condition starts from its own copy of the workspace as setup left it;
+    - a task can set `questions_may_use_tools`, letting the probe and needle questions use tools. Such tool calls are recorded per run (`question_tool_calls`), listed in the report, and their requests count in the token columns;
+    - both are off by default, so existing tasks are unchanged.
+  - New task `code_reconstruction_reread`: `code_reconstruction`'s edits, saved with `write_file`, and a probe that may read `etl/parser.py`. It's the on-disk twin, measuring whether compaction still costs success when the code is on disk, and what the reread costs.
+- Tests:
+  - the workspace: read, a missing file, `./` and `/` paths, write, a bad write, the task's own files untouched, and each condition starting from its own copy;
+  - the reread task end to end with rigged fakes: A answers from context; B, C and D reread and pass, with the reread recorded;
+  - tasks with files still refuse tools unless allowed;
+  - a setup that left the file wrong gets no verdict, and a missing workspace fails loudly;
+  - the report's reread counts and separate averages;
+  - the fixture check counts workspace tools and rejects overlap.
+- Review: independent reviewer run; no hard-rule issues. Fixed:
+  - must-fix: the twin's setup replies printed `parse()`, so once ADR 0017 is built, the summary would carry the code and hide the reread (now replies of just 'saved', so the only copies of the code are the `write_file` inputs and the file); nothing checked that setup's saves happened (`workspace_checks`: otherwise no verdict, since a stale file would look like a compaction failure); a task with files given no workspace fell back silently to "(no output)" (now raises);
+  - should-fix: the report averages tasks with rereads apart and counts rereads per condition; paths are normalised and a missing file lists the available ones; the fixture check rejects tools the workspace would shadow; ADR 0017's amendment says plainly that the Claude Code case is left to rereads, with the twin as its evidence.
+- make check: pass (444 tests; Tier 1 unchanged, eval gate passed)
+- Next step: a live Tier 2 run with both code tasks side by side (conversation-only vs on disk); then the ADR 0017 control (E pinning the assistant's code on `code_reconstruction`) and the build.
+
