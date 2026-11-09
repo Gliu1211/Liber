@@ -104,8 +104,12 @@ Option 2, with option 3 as the Tier 2 control.
   patches, functions the user asked to see but never saved, earlier versions since overwritten.
   Nothing can fetch it back, so it's what a summary must keep. `code_reconstruction` is exactly
   this case: `parse()` was only ever printed in replies.
-- **What it measures:** `code_reconstruction_reread` is the on-disk twin. If rereads recover
-  success there at a modest token cost, the narrower scope is right.
+- **What this leaves to rereads:** the main Claude Code case, code written to files through tool
+  calls, which the Context above calls a real weakness. That rests on evidence still to come:
+  `code_reconstruction_reread`, the on-disk twin. Its replies are prose only ("saved"), so the
+  only copies of the code are the `write_file` inputs, summarized away, and the file. If rereads
+  recover success there at a modest token cost, the narrower scope is right. If not, writes go
+  back into scope.
 - **Out of scope:** code the user pasted into their own messages also exists only in the
   conversation. It isn't a candidate in v1 (the user's text is summarized like any other text), and
   could be added the same way if Tier 2 shows a need.

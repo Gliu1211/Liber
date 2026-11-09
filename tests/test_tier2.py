@@ -38,12 +38,16 @@ REREAD_PROBE = "in etl/parser.py exactly as it stands now"
 
 
 def write_call(number: int) -> dict[str, Any]:
-    content = f"def parse(line):\n    {EDITED}\n    ...\n"
+    """The fake model saves etl/parser.py with all the task's edits (what workspace_checks expects)."""
+    source = json.loads((TASKS / "code_reconstruction_reread.json").read_text())["files"]["etl/parser.py"]
+    edited = source.replace("def load(", "def load_records(").replace(
+        "def parse(line):\n", f'def parse(line):\n    """Parse one line of the export format."""\n    {EDITED}\n'
+    )
     return {
         "type": "tool_use",
         "id": f"toolu_{number}",
         "name": "write_file",
-        "input": {"path": "etl/parser.py", "content": content},
+        "input": {"path": "etl/parser.py", "content": edited},
     }
 
 
@@ -462,7 +466,9 @@ def test_the_task_fixtures_load_and_one_is_reasoning_dependent() -> None:
 
     assert any(task.reasoning_dependent and task.evidence_markers for task in tasks)
     for task in tasks:
-        served = set(task.tool_outputs) | ({"read_file", "write_file"} if task.files else set())
+        workspace_tools = {"read_file", "write_file"} if task.files else set()
+        assert not set(task.tool_outputs) & workspace_tools  # the workspace would shadow them silently
+        served = set(task.tool_outputs) | workspace_tools
         assert task.needle_fact and task.probe_rubric and served == {t["name"] for t in task.tools}
 
 
@@ -921,8 +927,74 @@ def test_the_workspace_reads_and_writes_files() -> None:
         return tier2.tool_output(task, workspace, {"name": name, "input": arguments})
 
     assert call("read_file", path="etl/parser.py").startswith('"""Parse the nightly orders export')
-    assert call("read_file", path="missing.py") == "No such file: missing.py"
+    assert call("read_file", path="missing.py") == "No such file: missing.py. Files: etl/parser.py"
+    assert call("read_file", path="./etl/parser.py") == call("read_file", path="/etl/parser.py")  # one file
     assert call("write_file", path="etl/parser.py", content="new") == "Wrote 3 characters to etl/parser.py."
     assert call("read_file", path="etl/parser.py") == "new"
     assert call("write_file", path="etl/parser.py").startswith("write_file needs")
     assert task.files["etl/parser.py"] != "new"  # the task's own files are never changed
+
+
+async def test_each_condition_gets_its_own_copy_of_the_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = task_named("code_reconstruction_reread")
+    seen: list[dict[str, str]] = []
+    original = tier2.questions
+
+    async def scribbling(send: Any, messages: Any, task: Any, run: Any, workspace: dict[str, str]) -> Any:
+        seen.append(dict(workspace))  # what this condition started from
+        workspace[f"scribble-{run.condition}"] = "x"  # a write that must not reach the next condition
+        return await original(send, messages, task, run, workspace)
+
+    monkeypatch.setattr(tier2, "questions", scribbling)
+
+    await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    assert len(seen) == 3  # A, B and C go through questions(); D asks its own
+    assert all(not any(path.startswith("scribble-") for path in start) for start in seen)
+    assert all(EDITED in start["etl/parser.py"] for start in seen)  # setup's save, in every copy
+    assert EDITED not in task.files["etl/parser.py"]  # and never in the task itself
+
+
+async def test_tasks_with_files_still_refuse_tools_in_questions_unless_allowed() -> None:
+    from dataclasses import replace
+
+    task = replace(task_named("code_reconstruction_reread"), questions_may_use_tools=False)
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    b = next(r for r in runs if r.condition == "B")
+    assert b.refused_tool_calls == ["read_file"] and b.question_tool_calls == []
+
+
+async def test_a_setup_that_left_the_file_wrong_gets_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = task_named("code_reconstruction_reread")
+    monkeypatch.setattr(tier2, "workspace_problems", lambda task, workspace: ["setup left etl/parser.py without 'x'"])
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    assert all(
+        r.success is None and r.answers == {} and r.errors == ["setup left etl/parser.py without 'x'"] for r in runs
+    )
+
+
+def test_without_a_workspace_a_task_with_files_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="no workspace"):
+        tier2.tool_output(task_named("code_reconstruction_reread"), None, {"name": "read_file", "input": {"path": "x"}})
+
+
+async def test_the_report_counts_rereads_and_averages_those_tasks_apart() -> None:
+    runs = await tier2.run_eval(
+        FakeApi(),
+        worker_model(),
+        [task_named("code_reconstruction_reread")],
+        Settings(SETTINGS.model, "j", repeats=1),
+        quiet,
+    )
+
+    text = tier2_report.report([asdict(r) for r in runs], {"date": "d", "repeats": 1})
+
+    assert "## Comparisons, averaged over tasks where the questions may reread" in text
+    assert "averaged over other tasks" not in text  # the reread task isn't mixed into the others
+    assert "- code_reconstruction_reread A: reread in 0 of 1 runs (0 tool calls)" in text
+    assert "- code_reconstruction_reread B: reread in 1 of 1 runs (1 tool calls)" in text

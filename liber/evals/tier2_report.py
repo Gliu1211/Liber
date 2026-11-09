@@ -172,6 +172,11 @@ def reasoning_tasks(runs: list[dict[str, Any]]) -> set[str]:
     return {r["task"] for r in runs if r.get("reasoning_dependent")}
 
 
+def reread_tasks(runs: list[dict[str, Any]]) -> set[str]:
+    """Tasks whose questions may use tools: their token counts include rereads."""
+    return {r["task"] for r in runs if r.get("tools_in_questions")}
+
+
 Trend = tuple[str, str, dict[str, tuple[float | None, float | None]]]  # date, task, condition -> values
 
 
@@ -250,9 +255,16 @@ def report(runs: list[dict[str, Any]], meta: dict[str, Any], history: Path | Non
         f"{meta.get('repeats')} repeat(s) per condition. Spread: mean (min to max, sd); [k/n]: verdicts out of runs.",
         "Success difference: + means the first condition did better. Input tokens: + means the first used more.",
     ]
+    rereads = reread_tasks(runs)
+    # Averaged apart: a factual task would water down what dropping thinking costs, and a task with
+    # rereads mixes "summary savings" with "what the reread cost" in its token change.
     groups = [
-        ("reasoning-dependent tasks", {t: c for t, c in per_task.items() if t in reasoning}),
-        ("other tasks", {t: c for t, c in per_task.items() if t not in reasoning}),
+        ("reasoning-dependent tasks", {t: c for t, c in per_task.items() if t in reasoning and t not in rereads}),
+        ("other tasks", {t: c for t, c in per_task.items() if t not in reasoning and t not in rereads}),
+        (
+            "tasks where the questions may reread (tokens include the rereads)",
+            {t: c for t, c in per_task.items() if t in rereads},
+        ),
     ]
     for label, chosen in groups:
         if chosen:
@@ -264,6 +276,7 @@ def report(runs: list[dict[str, Any]], meta: dict[str, Any], history: Path | Non
     )
     for task, by_condition in stats.items():
         kind = "reasoning-dependent" if task in reasoning else "factual"
+        kind += "; questions may reread" if task in rereads else ""
         lines += ["", f"## {task} ({kind})", "", header, "|---" * 12 + "|"]
         for condition, s in by_condition.items():
             evidence = f"{s.summary_had_evidence}/{s.evidence_checked}" if s.evidence_checked else NONE
@@ -304,11 +317,16 @@ def report(runs: list[dict[str, Any]], meta: dict[str, Any], history: Path | Non
         lines += [f"- {task} {condition} #{repeat}: {', '.join(calls)}" for task, condition, repeat, calls in refused]
     # Tasks that allow tools during the questions: rereads are part of the answer's cost (their requests
     # are in the token columns), so list who reread what.
-    used = [(r["task"], r["condition"], r["repeat"], r.get("question_tool_calls") or []) for r in runs]
-    used = [(task, condition, repeat, calls) for task, condition, repeat, calls in used if calls]
-    if used:
-        lines += ["", "## Tool calls during the questions (allowed by the task; in the token counts)", ""]
-        lines += [f"- {task} {condition} #{repeat}: {', '.join(calls)}" for task, condition, repeat, calls in used]
+    allowed = [r for r in runs if r.get("tools_in_questions")]
+    if allowed:
+        lines += ["", "## Rereads during the questions (allowed by the task; in the token counts)", ""]
+        for task in sorted({r["task"] for r in allowed}):
+            for condition in CONDITIONS:
+                cell = [r for r in allowed if r["task"] == task and r["condition"] == condition]
+                if cell:
+                    reread = sum(1 for r in cell if r.get("question_tool_calls"))
+                    calls = sum(len(r.get("question_tool_calls") or []) for r in cell)
+                    lines.append(f"- {task} {condition}: reread in {reread} of {len(cell)} runs ({calls} tool calls)")
     if history is not None:
         points = trends(history)
         if points:

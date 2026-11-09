@@ -119,6 +119,8 @@ class Task:
     # tasks test what survives in context, and a reread would hide that. On, the task measures the
     # realistic case where the model can look again, and what that costs (its extra requests count).
     questions_may_use_tools: bool = False
+    # path -> strings setup must have written there (checked after setup; see workspace_problems).
+    workspace_checks: dict[str, list[str]] = field(default_factory=dict)
 
     def conditions(self) -> tuple[str, ...]:
         return CONDITIONS if self.keep_tool_results else tuple(c for c in CONDITIONS if c != "E")
@@ -155,6 +157,7 @@ class ConditionRun:
     asked: dict[str, str] = field(default_factory=dict)  # the questions as asked, so a rejudge can check
     refused_tool_calls: list[str] = field(default_factory=list)  # tools the model tried during the questions
     question_tool_calls: list[str] = field(default_factory=list)  # tools used during the questions, where allowed
+    tools_in_questions: bool = False  # the task allowed tools during the questions (rereads in the tokens)
     judge_reasons: dict[str, str] = field(default_factory=dict)
 
 
@@ -180,9 +183,11 @@ async def turn(
     The reply's text, or None if the turn failed: a rejected request, a reply cut off at
     max_tokens, or a model still calling tools after MAX_TOOL_ROUNDS (recorded on `run`).
 
-    With `tools=False` (the probe and needle questions), a tool call gets an error result instead of
-    the scripted output, and is recorded. Otherwise a model could pass a probe by reading the
-    config or file again, and the judge, who sees only the answer, would never know.
+    With `tools=False` (the probe and needle questions, unless the task allows tools there), a tool
+    call gets an error result instead of the scripted output, and is recorded. Otherwise a model
+    could pass a probe by reading the config or file again, and the judge, who sees only the
+    answer, would never know. With `tools=True`, calls are served (`tool_output`, from `workspace`
+    for a task with files) and recorded in `question_tool_calls` (meaningful for question turns).
     """
     messages.append({"role": "user", "content": prompt})
     for _ in range(MAX_TOOL_ROUNDS):
@@ -237,16 +242,42 @@ def tool_output(task: Task, workspace: dict[str, str] | None, call: dict[str, An
     name = call.get("name")
     given = call.get("input")
     arguments: dict[str, Any] = given if isinstance(given, dict) else {}
-    if workspace is not None and task.files and name in ("read_file", "write_file"):
-        path = str(arguments.get("path", ""))
+    if task.files and name in ("read_file", "write_file"):
+        if workspace is None:  # a caller forgot it: fail loudly rather than serve "(no output)"
+            raise ValueError(f"{task.name} has files, but this turn was given no workspace")
+        path = workspace_path(str(arguments.get("path", "")))
         if name == "read_file":
-            return workspace.get(path, f"No such file: {path}")
+            if path in workspace:
+                return workspace[path]
+            return f"No such file: {path}. Files: {', '.join(sorted(workspace))}"
         content = arguments.get("content")
         if not isinstance(content, str):
             return "write_file needs a path and the file's full content as a string."
         workspace[path] = content
         return f"Wrote {len(content)} characters to {path}."
     return task.tool_outputs.get(str(name), "(no output)")
+
+
+def workspace_path(path: str) -> str:
+    """`./etl/parser.py` and `/etl/parser.py` name the same file as `etl/parser.py`."""
+    path = path.strip()
+    while path.startswith(("./", "/")):
+        path = path.removeprefix("./").removeprefix("/")
+    return path
+
+
+def workspace_problems(task: Task, workspace: dict[str, str]) -> list[str]:
+    """What setup should have left in the workspace but didn't (the task's `workspace_checks`).
+
+    If the model skipped or botched a save, the file and the conversation disagree, and a reread
+    would fail for reasons that have nothing to do with compaction.
+    """
+    problems = []
+    for path, markers in task.workspace_checks.items():
+        missing = [marker for marker in markers if marker not in workspace.get(path, "")]
+        if missing:
+            problems.append(f"setup left {path} without {', '.join(repr(m) for m in missing)}")
+    return problems
 
 
 # --- The four conditions ----------------------------------------------------------------------------
@@ -638,6 +669,7 @@ async def run_task_repeat(
     api: MessagesApi, worker_client: ModelClient, task: Task, settings: Settings, repeat: int
 ) -> list[ConditionRun]:
     history, starts, after_setup = await setup_history(api, task, settings)
+    problems = workspace_problems(task, after_setup)
     with_text = thinking_with_text(history)
     through = starts[task.compact_through_turn + 1] - 1  # the message before the next turn starts
     runs = []
@@ -645,7 +677,18 @@ async def run_task_repeat(
         directory = Path(temp)
         summaries = await worker_summaries(task, settings, history, worker_client, directory)
         for condition in task.conditions():
-            run = ConditionRun(task.name, condition, repeat, task.reasoning_dependent, thinking_with_text=with_text)
+            run = ConditionRun(
+                task.name,
+                condition,
+                repeat,
+                task.reasoning_dependent,
+                thinking_with_text=with_text,
+                tools_in_questions=task.questions_may_use_tools,
+            )
+            if problems:  # the file and the conversation disagree: nothing fair to ask
+                run.errors += problems
+                runs.append(run)
+                continue
             if task.reasoning_dependent and with_text == 0:
                 run.errors.append("no thinking text came back in setup: C can't differ from B on this repeat")
             workspace = dict(after_setup)  # each condition reads and writes its own copy
