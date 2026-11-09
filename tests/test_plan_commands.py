@@ -106,7 +106,11 @@ async def test_create_refuses_a_plan_that_would_not_shrink_the_conversation(stor
     session = await a_session(store, turns=SHORT_TURNS)
 
     with pytest.raises(
-        PlanError, match=r"wouldn't make the conversation smaller \(about \d+ tokens per request now, \d+ after\)"
+        PlanError,
+        match=(
+            r"wouldn't make the conversation smaller "
+            r"\(about \d+ tokens per request now, \d+ after, thinking not counted\)"
+        ),
     ):
         await commands.create(store, session, summarize_through=1)
     assert (await versions.load_state(store, session)).pending is None  # nothing was created

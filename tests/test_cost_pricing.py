@@ -66,3 +66,24 @@ def test_a_long_prompt_tier_can_be_set_from_the_environment(monkeypatch: pytest.
     price = Settings().pricing["my-model"]
 
     assert price.rates_for(1000).cache_read == 0.1 and price.rates_for(1001).cache_read == 0.2
+
+
+def test_dropped_thinking_is_not_counted_as_a_smaller_request() -> None:
+    """2026-11-08 Tier 2: leaving earlier thinking out saved ~nothing at the API, while its estimate
+    (signature included) made plans look smaller. Sizes now leave thinking out on both sides."""
+    from liber.model.items import Operation, OperationKind, Plan
+    from liber.plan.cost import CountedItem, estimate
+
+    items = [
+        CountedItem("q", "text", 0, 100),
+        CountedItem("t", "thinking", 1, 1000),  # mostly signature
+        CountedItem("a", "text", 1, 20),
+        CountedItem("next", "text", 2, 10),
+        CountedItem("later", "thinking", 3, 500),  # after the summary: left out once the version applies
+    ]
+    summary = Operation(kind=OperationKind.SUMMARIZE, item_ids=("q", "t", "a"), summary="s" * 600)  # 150 tokens
+
+    result = estimate(items, Plan(), Plan(operations=(summary,)), None)
+
+    assert (result.tokens_now, result.tokens_after) == (130, 160)  # bigger: the summary outweighs 120 tokens of text
+    assert result.dropped_thinking_blocks == 1 and result.dropped_thinking_tokens == 500  # still shown, apart

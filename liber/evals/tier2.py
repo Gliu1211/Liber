@@ -56,6 +56,7 @@ from liber.cache import exchanges
 from liber.config import DEFAULT_PRICING, DEFAULT_SUMMARY_MODEL, ModelPrice
 from liber.evals import tier2_report
 from liber.evals.tier2_api import (
+    NOT_SENT,
     ApiResult,
     HttpMessagesApi,
     MessagesApi,
@@ -176,6 +177,10 @@ async def turn(
     messages.append({"role": "user", "content": prompt})
     for _ in range(MAX_TOOL_ROUNDS):
         result = await send(messages)
+        if result.status == NOT_SENT:
+            if run is not None:
+                run.errors.append(str(result.body["error"]["message"]))
+            return None
         if result.status != 200:
             problem = binding_error(result)
             if run is not None and problem is not None:
@@ -260,6 +265,8 @@ def liber_sender(api: MessagesApi, base: dict[str, Any], store: Store, run: Cond
         prepared = await pipeline.prepare(store, pipeline.encode_request({**base, "messages": messages}), recent)
         outcome = prepared.outcome if not prepared.edit_skipped else f"{prepared.outcome}: {prepared.edit_skipped}"
         run.liber_outcomes.append(outcome)
+        if prepared.outcome != "rendered":  # unedited, it would be condition A: don't send it
+            return ApiResult(NOT_SENT, {"error": {"message": f"Liber didn't send the compaction: {outcome}"}})
         request, betas = with_strict_binding(json.loads(prepared.body))
         return await api.send(request, betas)
 
@@ -341,8 +348,9 @@ async def run_liber(
         pins: tuple[str, ...] = ()
         if run.condition == "E":
             pins = kept_results(task, history, base, through)
-            if not pins:
+            if not pins:  # E without pins would be B: no questions, no verdict
                 run.errors.append(f"nothing to keep: no {task.keep_tool_results} result in messages 0-{through}")
+                return None, None
             # Pinned text is read from recorded requests, as the proxy records them.
             await store.add_request(recorded_request(session, {**base, "messages": history}))
         try:
@@ -356,19 +364,17 @@ async def run_liber(
             )
             await commands.apply(store, session)
         except PlanError as exc:
+            # Without the plan the questions would go out unedited, as condition A. Liber refusing
+            # is the right call (ADR 0016), and it's recorded; there's nothing of this condition to ask.
             run.errors.append(f"plan refused: {exc}")
+            return None, None
         state = await versions.load_state(store, session)
         plan = state.pending.plan if state.pending is not None else state.applied.plan
         run.frozen_blocks = [op.summary for op in plan.operations if op.summary is not None]
         if task.evidence_markers:
             text = "\n".join(run.frozen_blocks).lower()
             run.summary_has_evidence = any(marker.lower() in text for marker in task.evidence_markers)
-        answers = await questions(liber_sender(api, base, store, run), list(history), task, run)
-        # A request Liber didn't send compacted makes this condition A again: say so in the results.
-        unsent = [outcome for outcome in run.liber_outcomes if outcome != "rendered"]
-        if unsent:
-            run.errors.append(f"Liber didn't send the compaction: {unsent[0]}")
-        return answers
+        return await questions(liber_sender(api, base, store, run), list(history), task, run)
     finally:
         await store.close()
 

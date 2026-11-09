@@ -753,3 +753,42 @@ def test_the_report_has_the_three_e_comparisons() -> None:
     assert comparisons["E vs D"].success_delta == 1.0 and comparisons["E vs D"].input_change == pytest.approx(
         500 / 300 - 1
     )
+
+
+async def test_a_refused_plan_asks_nothing_and_gets_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-11-08: E's plan was refused on 4 of 5 repeats, the questions went out unedited (condition A),
+    and their passes were counted as E's. Now a refused plan ends the condition with no verdict."""
+    task = task_named("undiscussed_config_detail")
+    original = tier2.commands.create
+
+    async def refuse_e(store: Any, session_id: str, *args: Any, **kwargs: Any) -> str:
+        if kwargs.get("pin"):
+            raise tier2.PlanError("this plan wouldn't make the conversation smaller")
+        return await original(store, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(tier2.commands, "create", refuse_e)
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+    text = tier2_report.report([asdict(r) for r in runs], {"date": "d", "repeats": 1})
+
+    e = next(r for r in runs if r.condition == "E")
+    assert e.success is None and e.needle_kept is None and e.answers == {}
+    assert e.errors == ["plan refused: this plan wouldn't make the conversation smaller"]
+    assert e.usage.input_tokens == 0  # nothing was sent for E
+    assert "| E: Liber, chosen items kept | n/a [0/1]" in text
+
+
+async def test_an_unedited_liber_request_is_never_sent(dead_end: tier2.Task) -> None:
+    """With a model Liber can't confirm, the probe still goes out compacted (all its thinking was stale
+    and left out), but the needle request carries the probe reply's thinking, so Liber would send it
+    unedited: that one isn't sent, and gets no verdict."""
+    api = FakeApi()
+
+    runs = await tier2.run_eval(api, worker_model(), [dead_end], Settings("some-other-model", "j", repeats=1), quiet)
+
+    b = next(r for r in runs if r.condition == "B")
+    assert b.liber_outcomes[0] == "rendered" and b.liber_outcomes[1].startswith("passthrough")
+    assert b.success is not None and "probe" in b.answers  # the compacted probe was asked and graded
+    assert b.needle_kept is None and "needle" not in b.answers  # the unedited needle request wasn't sent
+    assert any(e.startswith("Liber didn't send the compaction: passthrough") for e in b.errors)
