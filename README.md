@@ -230,6 +230,7 @@ are recorded in [docs/decisions/](docs/decisions/).
 
 ## License
 
-[MIT](LICENSE). The dashboard ships HTMX 2.0.4 (`liber/dashboard/static/htmx.min.js`), which keeps
-its own Zero-Clause BSD license (`liber/dashboard/static/htmx.LICENSE`).
+[Apache License 2.0](LICENSE); see also [NOTICE](NOTICE). The dashboard ships HTMX 2.0.4
+(`liber/dashboard/static/htmx.min.js`), which keeps its own Zero-Clause BSD license
+(`liber/dashboard/static/htmx.LICENSE`).
 
