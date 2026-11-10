@@ -111,6 +111,9 @@ class Task:
     # summary. Item ids differ per run, so the task names tools; E pins their results in the
     # summarized range. Tasks without it don't run E.
     keep_tool_results: list[str] = field(default_factory=list)
+    # Condition E can also keep what the assistant wrote: the text replies of these setup turns
+    # (0-based). The ADR 0017 control: on code_reconstruction, the reply that printed parse().
+    keep_assistant_text_of_turns: list[int] = field(default_factory=list)
     # A simulated workspace: path -> content. With it, `read_file` returns a file's current content
     # and `write_file` replaces it, so edits made during setup are on "disk" afterwards. Each
     # condition starts from its own copy of the workspace as setup left it.
@@ -123,7 +126,8 @@ class Task:
     workspace_checks: dict[str, list[str]] = field(default_factory=dict)
 
     def conditions(self) -> tuple[str, ...]:
-        return CONDITIONS if self.keep_tool_results else tuple(c for c in CONDITIONS if c != "E")
+        keeps = self.keep_tool_results or self.keep_assistant_text_of_turns
+        return CONDITIONS if keeps else tuple(c for c in CONDITIONS if c != "E")
 
 
 def load_tasks(directory: Path = TASKS_DIR) -> list[Task]:
@@ -131,6 +135,8 @@ def load_tasks(directory: Path = TASKS_DIR) -> list[Task]:
     for task in tasks:
         if not 0 <= task.compact_through_turn < len(task.turns) - 1:
             raise ValueError(f"{task.name}: compact_through_turn must leave at least one turn after it")
+        if any(not 0 <= turn <= task.compact_through_turn for turn in task.keep_assistant_text_of_turns):
+            raise ValueError(f"{task.name}: keep_assistant_text_of_turns must be turns the summary covers")
     return tasks
 
 
@@ -387,6 +393,7 @@ async def run_liber(
     settings: Settings,
     history: list[dict[str, Any]],
     through: int,
+    starts: list[int],
     summaries: list[tuple[str, ExchangeSummary]],
     run: ConditionRun,
     directory: Path,
@@ -394,7 +401,9 @@ async def run_liber(
 ) -> tuple[str | None, str | None]:
     """B, C or E: plan from the shared summaries, applied at the probe (a clean turn), then both questions.
 
-    E is B's plan plus pins: the results of the task's `keep_tool_results` tools in the range.
+    E is B's plan plus pins: the results of the task's `keep_tool_results` tools in the range, and
+    the assistant's text replies in its `keep_assistant_text_of_turns` (`starts`: where each setup
+    turn begins).
     """
     base = base_request(task, settings.model)
     store = Store(directory / f"{run.condition}.db")
@@ -409,9 +418,10 @@ async def run_liber(
         await store.run(lambda db: copy_summaries(db, summaries, summarizer))
         pins: tuple[str, ...] = ()
         if run.condition == "E":
-            pins = kept_results(task, history, base, through)
+            pins = kept_results(task, history, base, through) + kept_replies(task, history, base, starts)
             if not pins:  # E without pins would be B: no questions, no verdict
-                run.errors.append(f"nothing to keep: no {task.keep_tool_results} result in messages 0-{through}")
+                chosen = task.keep_tool_results or [f"turn {t} reply" for t in task.keep_assistant_text_of_turns]
+                run.errors.append(f"nothing to keep: no {chosen} in messages 0-{through}")
                 return None, None
             # Pinned text is read from recorded requests, as the proxy records them.
             await store.add_request(recorded_request(session, {**base, "messages": history}))
@@ -451,6 +461,20 @@ def kept_results(task: Task, history: list[dict[str, Any]], base: dict[str, Any]
         if item.kind is Kind.TOOL_RESULT
         and item.msg_index <= through
         and calls.get(item.depends_on or "") in task.keep_tool_results
+    )
+
+
+def kept_replies(task: Task, history: list[dict[str, Any]], base: dict[str, Any], starts: list[int]) -> tuple[str, ...]:
+    """E's pins for `keep_assistant_text_of_turns`: the assistant's text blocks in those setup turns."""
+    bounds = [*starts, len(history)]
+    ranges = [(bounds[turn], bounds[turn + 1]) for turn in task.keep_assistant_text_of_turns]
+    items = parse({**base, "messages": history}).items
+    return tuple(
+        item.id
+        for item in items
+        if item.kind is Kind.TEXT
+        and item.role == "assistant"
+        and any(first <= item.msg_index < end for first, end in ranges)
     )
 
 
@@ -697,7 +721,7 @@ async def run_task_repeat(
                 probe, needle = await questions(send, list(history), task, run, workspace)
             elif condition in ("B", "C", "E"):
                 probe, needle = await run_liber(
-                    api, task, settings, history, through, summaries, run, directory, workspace
+                    api, task, settings, history, through, starts, summaries, run, directory, workspace
                 )
             else:
                 probe, needle = await run_client_compaction(api, task, settings, history, run, workspace)
