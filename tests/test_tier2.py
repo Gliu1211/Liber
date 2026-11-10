@@ -135,7 +135,7 @@ class FakeApi:
         elif "change ticket" in last:  # its needle
             answer = f"{CONFIG_NEEDLE}, Tomasz Wierzbicki" if CONFIG_NEEDLE in seen else "I don't know"
         elif "stale_while_revalidate_s" in last:  # obscure_setting_in_big_config's probe
-            answer = "45" if "stale_while_revalidate_s = 45" in seen else "I don't know"
+            answer = "35" if "stale_while_revalidate_s = 35" in seen else "I don't know"
         elif "Reply with the full updated parse() only" in last:  # code_reconstruction's setup
             version = FINAL_CODE if "docstring" in last else "def parse(line):\n    # first edit\n    ..."
             answer = f"```python\n{version}\n```"
@@ -161,8 +161,8 @@ class FakeApi:
             verdict = EDITED in grading["answer"] or FINAL_CODE in grading["answer"]
         elif "the value 1.7" in grading["rubric"]:
             verdict = "1.7" in grading["answer"]
-        elif "gives 45 for [cache.suggest]" in grading["rubric"]:
-            verdict = "45" in grading["answer"]
+        elif "gives 35 for [cache.suggest]" in grading["rubric"]:
+            verdict = "35" in grading["answer"]
         else:
             verdict = grading["answer"].startswith("ruled out")
         reply = json.dumps({"pass": verdict, "reason": "fake judge"})
@@ -780,7 +780,7 @@ async def test_e_keeps_the_chosen_tool_result_and_recovers_what_every_summary_lo
     e = by["E"]
     [block] = e.frozen_blocks
     assert "Kept as is" in block and "[tool_result of read_config, message 2]" in block
-    assert "stale_while_revalidate_s = 45" in block and "stale_while_revalidate_s = 45" not in by["B"].frozen_blocks[0]
+    assert "stale_while_revalidate_s = 35" in block and "stale_while_revalidate_s = 35" not in by["B"].frozen_blocks[0]
     assert e.liber_outcomes == ["rendered", "rendered"]
     # The kept item costs tokens: E sends more than B, still less than A.
     assert by["B"].usage.input_tokens < e.usage.input_tokens < by["A"].usage.input_tokens
@@ -872,7 +872,8 @@ async def test_big_config_task_plumbing_e_is_accepted_and_keeps_the_obscure_valu
     assert {c: by[c].success for c in by} == {"A": True, "B": False, "C": False, "D": False, "E": True}
     e = by["E"]
     assert e.errors == [] and e.liber_outcomes == ["rendered", "rendered"]
-    assert "[cache.suggest]" in e.frozen_blocks[0] and "status=504" not in e.frozen_blocks[0]  # config kept, logs not
+    assert "stale_while_revalidate_s = 35" in e.frozen_blocks[0]  # the config kept...
+    assert "status=504" not in e.frozen_blocks[0]  # ...the logs not
     assert e.usage.input_tokens < by["A"].usage.input_tokens / 2
 
 
@@ -897,6 +898,38 @@ def test_kept_turns_must_be_inside_the_summary(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="turns the summary covers"):
         tier2.load_tasks(tmp_path)
+    for bad in (-1, "2", True):
+        task["keep_assistant_text_of_turns"] = [bad]
+        (tmp_path / "bad.json").write_text(json.dumps(task))
+        with pytest.raises(ValueError, match="turns the summary covers"):
+            tier2.load_tasks(tmp_path)
+
+
+def test_kept_replies_takes_the_assistants_text_in_the_chosen_turn_only() -> None:
+    task = task_named("code_reconstruction")
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": "turn 0"},
+        {"role": "assistant", "content": [{"type": "text", "text": "zero"}]},
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+        {"role": "user", "content": "turn 2"},  # a turn with a tool call in it
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Let me look."},
+                {"type": "tool_use", "id": "t", "name": "read_file", "input": {}},
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "file"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "def parse(): ..."}]},
+        {"role": "user", "content": "turn 3"},
+    ]
+    base = tier2.base_request(task, SETTINGS.model)
+
+    ids = tier2.kept_replies(task, history, base, starts=[0, 2, 4, 8])
+
+    items = {item.id: item for item in tier2.parse({**base, "messages": history}).items}
+    assert [items[i].block["text"] for i in ids] == ["Let me look.", "def parse(): ..."]  # preamble and reply
 
 
 async def test_an_unsent_probe_means_no_questions_at_all(dead_end: tier2.Task, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -135,7 +135,8 @@ def load_tasks(directory: Path = TASKS_DIR) -> list[Task]:
     for task in tasks:
         if not 0 <= task.compact_through_turn < len(task.turns) - 1:
             raise ValueError(f"{task.name}: compact_through_turn must leave at least one turn after it")
-        if any(not 0 <= turn <= task.compact_through_turn for turn in task.keep_assistant_text_of_turns):
+        kept = task.keep_assistant_text_of_turns
+        if any(not isinstance(t, int) or isinstance(t, bool) or not 0 <= t <= task.compact_through_turn for t in kept):
             raise ValueError(f"{task.name}: keep_assistant_text_of_turns must be turns the summary covers")
     return tasks
 
@@ -465,7 +466,11 @@ def kept_results(task: Task, history: list[dict[str, Any]], base: dict[str, Any]
 
 
 def kept_replies(task: Task, history: list[dict[str, Any]], base: dict[str, Any], starts: list[int]) -> tuple[str, ...]:
-    """E's pins for `keep_assistant_text_of_turns`: the assistant's text blocks in those setup turns."""
+    """E's pins for `keep_assistant_text_of_turns`: every assistant text block in those setup turns.
+
+    That's all of the assistant's text in the turn, a short preamble before a tool call included,
+    not only the code; on code_reconstruction the reply asked for is the code itself.
+    """
     bounds = [*starts, len(history)]
     ranges = [(bounds[turn], bounds[turn + 1]) for turn in task.keep_assistant_text_of_turns]
     items = parse({**base, "messages": history}).items
