@@ -196,8 +196,9 @@ Runs each task in `evals/tier2_tasks/` under these conditions (§12, [ADR 0015](
 - **B:** Liber with thinking dropped;
 - **C:** Liber with `carry_forward_reasoning`;
 - **D:** simulated client auto-compaction;
-- **E:** B plus the task's chosen tool results kept as they were (only tasks with
-  `keep_tool_results`, [ADR 0016](docs/decisions/0016-keep-items-through-a-summary.md)).
+- **E:** B plus the task's chosen items kept as they were: tool results (`keep_tool_results`) or
+  the assistant's replies from given setup turns (`keep_assistant_text_of_turns`). Only tasks
+  that name some run E ([ADR 0016](docs/decisions/0016-keep-items-through-a-summary.md)).
 
 A task can also give the model a small simulated workspace (`files`: `read_file` and `write_file`
 on real contents) and let the final questions use tools (`questions_may_use_tools`), as

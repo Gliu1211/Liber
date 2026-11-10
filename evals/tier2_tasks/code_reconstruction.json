@@ -40,5 +40,8 @@
     "split('|')",
     "int(parts[2])",
     "parts[1].lower()"
+  ],
+  "keep_assistant_text_of_turns": [
+    2
   ]
 }

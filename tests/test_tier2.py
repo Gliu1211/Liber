@@ -35,6 +35,8 @@ CODE_NEEDLE = "DEV-318"
 EDITED = "# edited: empty-input check, docstring"
 PARSE_ANSWER = f"def parse(line):\n    {EDITED}\n    ..."
 REREAD_PROBE = "in etl/parser.py exactly as it stands now"
+# code_reconstruction: the fake "model" prints this as its final parse() (setup turn 2's reply).
+FINAL_CODE = 'def parse(line):\n    """Parse one line of the export format."""\n    # final version'
 
 
 def write_call(number: int) -> dict[str, Any]:
@@ -132,8 +134,14 @@ class FakeApi:
             answer = "1.7" if "backoff_multiplier = 1.7" in seen else "I don't know"
         elif "change ticket" in last:  # its needle
             answer = f"{CONFIG_NEEDLE}, Tomasz Wierzbicki" if CONFIG_NEEDLE in seen else "I don't know"
-        elif "cache.ttl_seconds" in last:  # small_config_in_long_session's probe
-            answer = "270" if "ttl_seconds = 270" in seen else "I don't know"
+        elif "stale_while_revalidate_s" in last:  # obscure_setting_in_big_config's probe
+            answer = "35" if "stale_while_revalidate_s = 35" in seen else "I don't know"
+        elif "Reply with the full updated parse() only" in last:  # code_reconstruction's setup
+            version = FINAL_CODE if "docstring" in last else "def parse(line):\n    # first edit\n    ..."
+            answer = f"```python\n{version}\n```"
+        elif "exactly as it stands after all our edits" in last:  # code_reconstruction's probe
+            # `seen` is JSON (newlines escaped), so look for the code's one-line marker.
+            answer = FINAL_CODE if "# final version" in seen else "I can't reproduce it exactly from memory."
         elif "who is the reviewer" in last:  # code_reconstruction(_reread)'s needle
             answer = f"{CODE_NEEDLE}, Ines Duarte" if CODE_NEEDLE in seen else "I don't know"
         elif "ticket did I give you" in last:  # its needle
@@ -150,11 +158,11 @@ class FakeApi:
             tags = (NEEDLE, CONFIG_NEEDLE, SMALL_NEEDLE, CODE_NEEDLE)
             verdict = any(tag in grading["answer"] for tag in tags if tag in grading["rubric"])
         elif "Parse one line of the export format" in grading["rubric"]:
-            verdict = EDITED in grading["answer"]
+            verdict = EDITED in grading["answer"] or FINAL_CODE in grading["answer"]
         elif "the value 1.7" in grading["rubric"]:
             verdict = "1.7" in grading["answer"]
-        elif "the value 270" in grading["rubric"]:
-            verdict = "270" in grading["answer"]
+        elif "gives 35 for [cache.suggest]" in grading["rubric"]:
+            verdict = "35" in grading["answer"]
         else:
             verdict = grading["answer"].startswith("ruled out")
         reply = json.dumps({"pass": verdict, "reason": "fake judge"})
@@ -760,7 +768,7 @@ async def test_a_tool_call_during_the_questions_gets_nothing_and_is_reported() -
 
 
 async def test_e_keeps_the_chosen_tool_result_and_recovers_what_every_summary_lost() -> None:
-    task = task_named("undiscussed_config_detail")
+    task = task_named("obscure_setting_in_big_config")
 
     runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
 
@@ -772,7 +780,7 @@ async def test_e_keeps_the_chosen_tool_result_and_recovers_what_every_summary_lo
     e = by["E"]
     [block] = e.frozen_blocks
     assert "Kept as is" in block and "[tool_result of read_config, message 2]" in block
-    assert "backoff_multiplier = 1.7" in block and "backoff_multiplier = 1.7" not in by["B"].frozen_blocks[0]
+    assert "stale_while_revalidate_s = 35" in block and "stale_while_revalidate_s = 35" not in by["B"].frozen_blocks[0]
     assert e.liber_outcomes == ["rendered", "rendered"]
     # The kept item costs tokens: E sends more than B, still less than A.
     assert by["B"].usage.input_tokens < e.usage.input_tokens < by["A"].usage.input_tokens
@@ -787,8 +795,9 @@ async def test_tasks_without_kept_tools_dont_run_e(dead_end: tier2.Task) -> None
 
 
 async def test_e_with_nothing_to_keep_is_an_error_not_a_silent_b(monkeypatch: pytest.MonkeyPatch) -> None:
-    task = task_named("undiscussed_config_detail")
+    task = task_named("obscure_setting_in_big_config")
     monkeypatch.setattr(tier2, "kept_results", lambda *args: ())
+    monkeypatch.setattr(tier2, "kept_replies", lambda *args: ())
 
     runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
 
@@ -816,7 +825,7 @@ def test_the_report_has_the_three_e_comparisons() -> None:
 async def test_a_refused_plan_asks_nothing_and_gets_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
     """2026-11-08: E's plan was refused on 4 of 5 repeats, the questions went out unedited (condition A),
     and their passes were counted as E's. Now a refused plan ends the condition with no verdict."""
-    task = task_named("undiscussed_config_detail")
+    task = task_named("obscure_setting_in_big_config")
     original = tier2.commands.create
 
     async def refuse_e(store: Any, session_id: str, *args: Any, **kwargs: Any) -> str:
@@ -852,10 +861,10 @@ async def test_an_unedited_liber_request_is_never_sent(dead_end: tier2.Task) -> 
     assert any(e.startswith("Liber didn't send the compaction: passthrough") for e in b.errors)
 
 
-async def test_small_pin_task_plumbing_e_is_accepted_and_keeps_the_value() -> None:
-    """Pinning's intended shape: E's plan is accepted (the config is a small part of what's summarized),
-    E keeps the undiscussed value, and still sends far less than full context."""
-    task = task_named("small_config_in_long_session")
+async def test_big_config_task_plumbing_e_is_accepted_and_keeps_the_obscure_value() -> None:
+    """Pinning's intended shape: the config is a small part of what's summarized, so E's plan is
+    accepted, E keeps the undiscussed value, and still sends far less than full context."""
+    task = task_named("obscure_setting_in_big_config")
 
     runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
 
@@ -863,8 +872,64 @@ async def test_small_pin_task_plumbing_e_is_accepted_and_keeps_the_value() -> No
     assert {c: by[c].success for c in by} == {"A": True, "B": False, "C": False, "D": False, "E": True}
     e = by["E"]
     assert e.errors == [] and e.liber_outcomes == ["rendered", "rendered"]
-    assert "ttl_seconds = 270" in e.frozen_blocks[0] and "status=504" not in e.frozen_blocks[0]  # config kept, logs not
+    assert "stale_while_revalidate_s = 35" in e.frozen_blocks[0]  # the config kept...
+    assert "status=504" not in e.frozen_blocks[0]  # ...the logs not
     assert e.usage.input_tokens < by["A"].usage.input_tokens / 2
+
+
+async def test_e_on_code_reconstruction_keeps_the_assistants_code_reply() -> None:
+    """The ADR 0017 control: E pins setup turn 2's reply, the one that printed the final parse()."""
+    task = task_named("code_reconstruction")
+
+    runs = await tier2.run_eval(FakeApi(), worker_model(), [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    by = {r.condition: r for r in runs}
+    assert {c: by[c].success for c in by} == {"A": True, "B": False, "C": False, "D": False, "E": True}
+    [block] = by["E"].frozen_blocks
+    assert "[assistant text, message" in block and FINAL_CODE in block
+    assert "# first edit" not in block  # only the chosen turn's reply, not the earlier version
+    assert FINAL_CODE not in by["B"].frozen_blocks[0]
+
+
+def test_kept_turns_must_be_inside_the_summary(tmp_path: Path) -> None:
+    task = json.loads((TASKS / "code_reconstruction.json").read_text())
+    task["keep_assistant_text_of_turns"] = [task["compact_through_turn"] + 1]
+    (tmp_path / "bad.json").write_text(json.dumps(task))
+
+    with pytest.raises(ValueError, match="turns the summary covers"):
+        tier2.load_tasks(tmp_path)
+    for bad in (-1, "2", True):
+        task["keep_assistant_text_of_turns"] = [bad]
+        (tmp_path / "bad.json").write_text(json.dumps(task))
+        with pytest.raises(ValueError, match="turns the summary covers"):
+            tier2.load_tasks(tmp_path)
+
+
+def test_kept_replies_takes_the_assistants_text_in_the_chosen_turn_only() -> None:
+    task = task_named("code_reconstruction")
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": "turn 0"},
+        {"role": "assistant", "content": [{"type": "text", "text": "zero"}]},
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+        {"role": "user", "content": "turn 2"},  # a turn with a tool call in it
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Let me look."},
+                {"type": "tool_use", "id": "t", "name": "read_file", "input": {}},
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "file"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "def parse(): ..."}]},
+        {"role": "user", "content": "turn 3"},
+    ]
+    base = tier2.base_request(task, SETTINGS.model)
+
+    ids = tier2.kept_replies(task, history, base, starts=[0, 2, 4, 8])
+
+    items = {item.id: item for item in tier2.parse({**base, "messages": history}).items}
+    assert [items[i].block["text"] for i in ids] == ["Let me look.", "def parse(): ..."]  # preamble and reply
 
 
 async def test_an_unsent_probe_means_no_questions_at_all(dead_end: tier2.Task, monkeypatch: pytest.MonkeyPatch) -> None:

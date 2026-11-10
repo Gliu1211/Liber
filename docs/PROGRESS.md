@@ -309,3 +309,36 @@ Template:
 - make check: pass (444 tests; Tier 1 unchanged, eval gate passed)
 - Next step: a live Tier 2 run with both code tasks side by side (conversation-only vs on disk); then the ADR 0017 control (E pinning the assistant's code on `code_reconstruction`) and the build.
 
+## 2026-11-10 — Tier 2: a pin task that discriminates; the ADR 0017 control
+- Owner's run (after #24, 5 repeats):
+  - `code_reconstruction_reread`: 5/5 everywhere; B, C and D reread in every run. Liber was about 40% below auto-compact with the reread included (5,685 vs 9,526). This supports ADR 0017's narrowing.
+  - `code_reconstruction`: B and C 2/5, D 3/5. Conversation-only code is still a weakness, for auto-compact too.
+  - `derived_pool_load`: C 5/5, B 3/5 (13/13 vs 6/13 over three runs).
+  - The fixes held: refused pin plans read `n/a [0/5]`, and the metrics pin is now correctly refused.
+  - `small_config_in_long_session` didn't discriminate: B, C and D also got 5/5, because Haiku listed the small config's values in passing.
+- Done:
+  - New task `obscure_setting_in_big_config`, replacing `small_config_in_long_session`:
+    - 65 settings in 13 sections (~1,500 characters) among ~16,700 characters of logs plus chat;
+    - the probe asks for `[cache.suggest] stale_while_revalidate_s` (45), a name that also appears in two other sections with other values (40, 50);
+    - a 120-word summary can't list them all, and the pin is under a tenth of the range;
+    - E keeps `read_config`.
+  - The ADR 0017 control: a task field `keep_assistant_text_of_turns` (setup turns whose assistant text replies E pins, checked to lie inside the summary). `code_reconstruction` sets `[2]`, the reply that printed the final `parse()`. E there shows what keeping conversation-only code is worth before the summarizer change is built.
+  - E removed from `derived_pool_load` and `undiscussed_config_detail`: their pin plans are correctly refused every time (the pinned item is most of the range).
+- Tests (rigged fakes, plumbing only):
+  - E on the new task: accepted, keeps the obscure value, logs not kept, under half of A's tokens; A and E pass, B, C and D fail;
+  - E on `code_reconstruction`: pins only turn 2's reply; A and E pass, B, C and D fail;
+  - a kept turn outside the summary is rejected when tasks load;
+  - the E tests that used `undiscussed_config_detail` now use the new task.
+- Review: independent reviewer run; no must-fix. Fixed:
+  - the probed value is 35, not 45, so it isn't the midpoint of the 40/50 decoys;
+  - the task description counts the config in the range;
+  - kept-turn indexes must be real integers;
+  - `kept_replies` documents that it pins all of the assistant's text in the turn (a preamble before a tool call too), with a test;
+  - a stronger plumbing assertion.
+- Reading the next run:
+  - E on `code_reconstruction` has a thin margin under "must shrink" (by estimate: the range is ~830 tokens; E's block is ~450 with short summaries and could reach ~750 if Haiku writes 120 words for each of the three exchanges). So E reading `n/a` there means "the pin plus long summaries didn't shrink the range", not "ADR 0017 untested"; the refusal message under Other errors gives the numbers.
+  - The "E vs B" average in the report's "other tasks" group mixes the ADR 0017 control (`code_reconstruction`) with the pinning task (`obscure_setting_in_big_config`): read their per-task tables.
+  - D may pass the new task if its own, uncapped summary keeps the whole config; the task is built to separate B and C from E.
+- make check: pass (447 tests; Tier 1 unchanged, eval gate passed)
+- Next step: owner runs Tier 2 live (`--repeats 5`). If E clearly beats B on `code_reconstruction`, build ADR 0017 with B approaching E as the target.
+
