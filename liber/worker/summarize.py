@@ -27,7 +27,6 @@ output (that's the user's to pin, ADR 0016).
 """
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,8 +52,6 @@ MAX_REPLY_TOKENS = 1024
 # ADR 0017: kept code per exchange, whole blocks only. A block over it, or one that no longer fits,
 # is noted instead (its label and size), so the reader knows code was there.
 CODE_PER_EXCHANGE_CHARS = 4_000
-# An opening fence (``` or ~~~, maybe with a language), the code, and the same fence on its own line.
-CODE_FENCE = re.compile(r"^(```|~~~)[^\n]*\n.*?^\1[ \t]*$", re.MULTILINE | re.DOTALL)
 
 SUMMARY_SYSTEM = """\
 You summarize one exchange from a conversation between a user and an AI assistant, so that the \
@@ -141,7 +138,7 @@ async def summarize(client: ModelClient, model: str, exchange: Exchange[Item]) -
     topic, summary = plain(topic, TOPIC_MAX_CHARS), plain(summary, SUMMARY_MAX_CHARS)
     if not topic or not summary:
         raise ModelReplyRejected("the summary reply is empty")
-    return ExchangeSummary(topic=topic, summary=summary, kept_code=kept_code(candidates, keep))
+    return ExchangeSummary(topic=topic, summary=summary, kept_code=kept_code(candidates, keep, exchange.first))
 
 
 @dataclass(frozen=True)
@@ -152,30 +149,75 @@ class CodeCandidate:
 
 
 def code_candidates(exchange: Exchange[Item]) -> list[CodeCandidate]:
-    """The fenced code blocks in the assistant's text replies, in conversation order."""
+    """The fenced code blocks in the assistant's text replies, in conversation order.
+
+    Only blocks the summarizer can see: a block past the point where Liber cuts a long entry
+    (BLOCK_MAX_CHARS) isn't offered, so it's never chosen blind.
+    """
     found: list[CodeCandidate] = []
     for item in exchange.items:
         if item.kind is Kind.TEXT and item.role == "assistant":
-            for match in CODE_FENCE.finditer(str(item.block.get("text", ""))):
-                found.append(CodeCandidate(f"code-{len(found) + 1}", item, match.group(0)))
+            text = str(item.block.get("text", ""))
+            for start, end in fenced_blocks(text):
+                if end <= BLOCK_MAX_CHARS - 1:  # excerpt() keeps this much of an entry's text
+                    found.append(CodeCandidate(f"code-{len(found) + 1}", item, text[start:end]))
     return found
 
 
-def kept_code(candidates: list[CodeCandidate], chosen: list[Any]) -> tuple[KeptCode, ...]:
-    """The chosen candidates, copied as they are, within CODE_PER_EXCHANGE_CHARS (whole blocks only).
+def fenced_blocks(text: str) -> list[tuple[int, int]]:
+    """(start, end) of each closed fenced code block in Markdown `text`, read line by line.
 
-    Ids that weren't offered, and repeats, are dropped: structured output is a strong hint, not a
-    guarantee. A block over the limit, or one that no longer fits, is kept as a note (no text).
+    Markdown's rules, as far as they matter here: a fence is three or more backticks or tildes,
+    indented by at most three spaces; a backtick fence's info string can't contain a backtick (so
+    "```x```" isn't an opener); the closing fence is the same character, at least as long, with
+    nothing after it. Line endings may be \n or \r\n. One pass, so a long reply full of fences
+    costs time in proportion to its length. An unclosed block isn't offered.
     """
-    by_id = {candidate.id: candidate for candidate in candidates}
+    blocks: list[tuple[int, int]] = []
+    opener: tuple[str, int, int] | None = None  # (character, length, start offset)
+    position = 0
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        body = content.lstrip(" ")
+        indent = len(content) - len(body)
+        fence = fence_marker(body) if indent <= 3 else None
+        if opener is None:
+            if fence is not None and not (fence[0] == "`" and "`" in body[len(fence) :]):
+                opener = (fence[0], len(fence), position)
+        elif fence is not None and fence[0] == opener[0] and len(fence) >= opener[1] and not body[len(fence) :].strip():
+            blocks.append((opener[2], position + len(content)))
+            opener = None
+        position += len(line)
+    return blocks
+
+
+def fence_marker(body: str) -> str | None:
+    """The run of backticks or tildes a line starts with, if it's three or more long."""
+    for character in "`~":
+        length = len(body) - len(body.lstrip(character))
+        if length >= 3:
+            return body[:length]
+    return None
+
+
+def kept_code(candidates: list[CodeCandidate], chosen: list[Any], first: int) -> tuple[KeptCode, ...]:
+    """The chosen candidates, copied as they are, in conversation order, within
+    CODE_PER_EXCHANGE_CHARS (whole blocks only).
+
+    Ids that weren't offered, repeats and non-strings are dropped: structured output is a strong
+    hint, not a guarantee. A block over the limit, or one that no longer fits, is kept as a note
+    (no text). `first`: the exchange's first message; positions are stored relative to it.
+    """
+    wanted = {c for c in chosen if isinstance(c, str)}
     kept: list[KeptCode] = []
     used = 0
-    for code_id in dict.fromkeys(c for c in chosen if isinstance(c, str) and c in by_id):
-        candidate = by_id[code_id]
-        label = f"[assistant code, message {candidate.item.msg_index}]"
+    for candidate in candidates:  # conversation order, whatever order the reply listed them in
+        if candidate.id not in wanted:
+            continue
         size = len(candidate.text)
         fits = used + size <= CODE_PER_EXCHANGE_CHARS
-        kept.append(KeptCode(candidate.item.id, label, size, candidate.text if fits else None))
+        offset, block = candidate.item.msg_index - first, candidate.item.block_index
+        kept.append(KeptCode(offset, block, size, candidate.text if fits else None))
         used += size if fits else 0
     return tuple(kept)
 

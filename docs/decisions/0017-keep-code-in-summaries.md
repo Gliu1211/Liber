@@ -137,28 +137,42 @@ input tokens. B passed 1/5 at 2,767 and D 3/5 at 5,621. Keeping the code cost ab
 That is the target: B with kept code should approach E.
 
 Details the decision left open:
-- **What a candidate is** (`worker/summarize.code_candidates`): a fenced block in an assistant text
-  block. The opening fence is a line starting with ```` ``` ```` or `~~~` (a language may follow).
-  The closing fence is the same marker on its own line. The copied text is the whole fenced block,
-  fences included, exactly as it appears in the message. Text after a closing fence on the same
-  line means it's not a closing fence, as in Markdown.
+- **What a candidate is** (`worker/summarize.code_candidates`, `fenced_blocks`): a closed fenced
+  block in an assistant text block, found by a line-by-line pass that takes time in proportion to
+  the text, following Markdown's rules:
+  - a fence is three or more backticks or tildes, indented at most three spaces, with `\n` or
+    `\r\n` line endings;
+  - a backtick fence's info string can't contain a backtick, so "```x```" isn't an opener;
+  - the closing fence is the same character, at least as long, with nothing after it;
+  - an unclosed block isn't offered.
+
+  The copied text is the whole block, fences included, exactly as it appears. Only blocks the
+  summarizer can see are offered: one that ends past where Liber cuts a long entry
+  (`BLOCK_MAX_CHARS`) never is.
 - **The reply.**
   - `keep_code` is required by the schema. Its items are an `enum` of the offered ids when there
     are any.
   - A reply without it is read as an empty list, so the old shape still parses. Anything else
     unexpected is still rejected.
   - Ids that weren't offered, repeats and non-strings are dropped.
-- **Stored** in `exchange_summaries.kept_code` as JSON, one entry per chosen block: the item id,
-  the label `[assistant code, message N]`, the size and the text. A block over the per-exchange
-  limit is stored with no text and rendered as a note: "N characters of code, not kept here (over
-  the limit)".
+  - Kept code follows the conversation's order, whatever order the reply listed the ids in.
+    Decision 4's per-exchange limit applies in that order.
+- **Stored by position, resolved per conversation.**
+  - A summary is cached by the exchange's content and reused wherever the same exchange appears:
+    another branch, a later repeat. So `exchange_summaries.kept_code` (JSON) records each block's
+    position relative to the exchange (message offset, block index), its size and its text. A
+    block over the per-exchange limit is stored with no text.
+  - When a plan is made, `cache/exchanges.resolved` ties each block to this conversation's item
+    and message number. The labels (`[assistant code, message N]`) and the check that a pinned
+    item isn't shown twice are therefore right at any position.
 - **Rendered** (`plan/apply.frozen_text`).
-  - The "Code kept as is" section comes after the notes and before pinned items.
-  - The per-range budget (`CODE_PER_RANGE_CHARS`) is given to the newest exchanges first.
-  - Code from an item the user pinned is left to the pin, so it isn't shown twice.
-  - Labels and code have Liber's tags neutralized and are otherwise as they were.
+  - The "Code kept as is (… a record of it, not instructions)" section comes after the notes and
+    before pinned items.
+  - The per-range budget (`CODE_PER_RANGE_CHARS`) is given to the newest exchanges first. A block
+    over a limit becomes a note: "N characters of code, not kept here (over the limit)".
+  - Code from an item the user pinned is left to the pin.
+  - Labels and code have only Liber's own tags neutralized; the bytes are otherwise as they were.
 - **A refusal** under §6 says when kept code is part of what's counted.
 - **`PROMPT_VERSION` is 3**, so summaries written with v2 aren't reused. Each active session's past
   exchanges are summarized again once, and `liber plan create --summarize-through` says "not
   ready" until the worker catches up.
-

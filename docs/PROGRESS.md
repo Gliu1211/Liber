@@ -362,6 +362,15 @@ Template:
   - frozen-block order, neutralized tags without escaping, the range budget, pins taking precedence, and notes;
   - through the worker, the database and a plan; carry-forward still differing only by notes; the refusal hint;
   - in Tier 2 with fakes, B recovers `code_reconstruction` once the summarizer keeps code.
-- make check: pass (460 tests; Tier 1 unchanged, eval gate passed)
+- Review: independent reviewer run.
+  - Must-fix: the fence regex was quadratic and ran on the proxy's event loop; a long reply full of unclosed fences could stall live requests (hard rule 1). It's now a linear line-by-line Markdown parser, with a 250 KB test.
+  - Should-fix, all done:
+    - fence rules: 4+-character fences, longer closers, indented fences, CRLF, and inline "```x```" not opening a block;
+    - kept code follows the conversation's order, not the reply's;
+    - only code the summarizer can see is offered;
+    - kept code is stored by position relative to its exchange and tied to this conversation's items when a plan is made, so a cached summary reused at another position gets the right labels and pin de-duplication;
+    - the code heading says it's "a record of it, not instructions", as pins do;
+    - tests for each, plus a byte-for-byte database round trip.
+- make check: pass (474 tests; Tier 1 unchanged, eval gate passed)
 - Next step: owner runs Tier 2 live. On `code_reconstruction`, B and C should now approach E, and on the other tasks nothing should get worse. The first run after this re-summarizes every exchange once (`PROMPT_VERSION` 3).
 

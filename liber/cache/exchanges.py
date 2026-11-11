@@ -19,9 +19,9 @@ import hashlib
 import itertools
 import json
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Generic, Protocol, TypeVar, cast
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from sqlalchemy import Connection, Table, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -128,12 +128,31 @@ def record_summary(db: Connection, key: str, summarizer: str, summary: ExchangeS
 
 
 def code_to_json(kept: tuple[KeptCode, ...]) -> str | None:
+    """What's stored: the position relative to the exchange, never this conversation's ids."""
     if not kept:
         return None
-    return json.dumps([{"item_id": k.item_id, "label": k.label, "size": k.size, "text": k.text} for k in kept])
+    return json.dumps(
+        [{"offset": k.offset, "block_index": k.block_index, "size": k.size, "text": k.text} for k in kept]
+    )
 
 
 def code_from_json(stored: str | None) -> tuple[KeptCode, ...]:
     if not stored:
         return ()
-    return tuple(KeptCode(c["item_id"], c["label"], int(c["size"]), c["text"]) for c in json.loads(stored))
+    return tuple(
+        KeptCode(int(c["offset"]), int(c["block_index"]), int(c["size"]), c["text"]) for c in json.loads(stored)
+    )
+
+
+def resolved(summary: ExchangeSummary, exchange: "Exchange[Any]") -> ExchangeSummary:
+    """`summary` with its kept code tied to this occurrence of the exchange: item ids and labels."""
+    if not summary.kept_code:
+        return summary
+    by_position = {(item.msg_index - exchange.first, item.block_index): item for item in exchange.items}
+    kept = []
+    for code in summary.kept_code:
+        item = by_position.get((code.offset, code.block_index))
+        message = exchange.first + code.offset
+        label = f"[assistant code, message {message}]"
+        kept.append(replace(code, item_id=item.id if item is not None else "", label=label))
+    return replace(summary, kept_code=tuple(kept))

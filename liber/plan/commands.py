@@ -338,7 +338,7 @@ def summary_through(
             "worker_gave_up); a summary the worker gave up on is tried again after the proxy restarts. "
             "Meanwhile you can summarize through an earlier message, or offload or delete items instead."
         )
-    chosen = [written[e.key] for e in in_range]
+    chosen = [exchanges.resolved(written[e.key], e) for e in in_range]  # kept code tied to this occurrence
     if not writer.carry_forward_reasoning:
         chosen = [replace(summary, notes=None) for summary in chosen]  # notes only with the setting on
     pinned = pinned_items(items, first, last, writer.pin, writer.pin_blocks)

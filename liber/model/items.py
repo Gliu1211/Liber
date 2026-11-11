@@ -83,12 +83,20 @@ class Operation(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class KeptCode:
-    """A fenced code block from an assistant reply, kept word for word (docs/decisions/0017)."""
+    """A fenced code block from an assistant reply, kept word for word (docs/decisions/0017).
 
-    item_id: str  # the assistant text block it's from (a pin of that item takes precedence)
-    label: str  # e.g. "[assistant code, message 5]"
+    Stored with its exchange's summary, which is reused wherever the same exchange appears, so it
+    records where the block is relative to the exchange (`offset`, `block_index`). The item it's
+    in and the message number are only known for a given conversation: `resolved()` fills them in
+    when a plan is made.
+    """
+
+    offset: int  # the block's message, counted from the exchange's first message
+    block_index: int  # the text block's position in that message
     size: int  # characters
     text: str | None  # the fenced block exactly as it was; None: over a limit, only noted
+    item_id: str = ""  # set by resolved(): the text block's item (a pin of it takes precedence)
+    label: str = ""  # set by resolved(): e.g. "[assistant code, message 5]"
 
 
 @dataclass(frozen=True, slots=True)

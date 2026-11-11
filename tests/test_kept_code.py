@@ -78,7 +78,8 @@ async def test_only_fenced_code_in_assistant_replies_is_offered() -> None:
     assert [entry.get("code_blocks") for entry in data] == [None, ["code-1", "code-2"], None, None, None]
     # Copied from the conversation byte for byte, fences, comment and accents included.
     assert [k.text for k in summary.kept_code] == [OLD_PARSE, PARSE]
-    assert summary.kept_code[1].label == "[assistant code, message 1]"
+    # Stored by position in the exchange; this conversation's ids are filled in at plan time.
+    assert [(k.offset, k.block_index, k.item_id) for k in summary.kept_code] == [(1, 0, ""), (1, 0, "")]
 
 
 async def test_the_model_only_chooses_unknown_and_repeated_ids_are_dropped() -> None:
@@ -119,7 +120,8 @@ async def test_no_code_offered_means_the_old_reply_shape_still_works() -> None:
 
 
 def kept(item_id: str, text: str | None, size: int | None = None) -> KeptCode:
-    return KeptCode(item_id, f"[assistant code, message {item_id}]", size or len(text or ""), text)
+    """Kept code as a plan sees it, resolved for its conversation."""
+    return KeptCode(0, 0, size or len(text or ""), text, item_id=item_id, label=f"[assistant code, message {item_id}]")
 
 
 def test_the_code_section_follows_the_notes_and_precedes_the_pins() -> None:
@@ -247,3 +249,95 @@ async def test_a_refusal_says_when_kept_code_is_counted(store: Store, monkeypatc
 
     with pytest.raises(versions.PlanError, match="Kept code is part of the summary and counted too"):
         await commands.create(store, prepared.session_id, summarize_through=3)
+
+
+# --- Review findings: fences, order, visibility, positions, storage ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "blocks"),
+    [
+        # A 4-backtick fence around markdown that itself contains a fence: one block, the outer one.
+        ("````md\n```py\nx\n```\n````\ntext", ["````md\n```py\nx\n```\n````"]),
+        # A closing fence may be longer than the opening one.
+        ("```py\nx\n`````", ["```py\nx\n`````"]),
+        # "```x```" on its own line is inline code, not an opener.
+        ("```x```\nprose\n```py\ncode\n```", ["```py\ncode\n```"]),
+        # Indented by up to three spaces (inside a list item).
+        ("1. Step:\n   ```py\n   x = 1\n   ```", ["   ```py\n   x = 1\n   ```"]),
+        # Four spaces is an indented code block in Markdown, not a fence.
+        ("    ```py\n    x\n    ```", []),
+        # Windows line endings.
+        ("```py\r\nx = 1\r\n```\r\nafter", ["```py\r\nx = 1\r\n```"]),
+        # Tildes, closed only by tildes.
+        ("~~~\na ```\n~~~", ["~~~\na ```\n~~~"]),
+        # Unclosed: not offered.
+        ("```py\nnever closed", []),
+        # Text after a closing fence means it isn't one.
+        ("```\nx\n``` not a close\n```", ["```\nx\n``` not a close\n```"]),
+    ],
+)
+def test_fenced_blocks_follow_markdowns_rules(text: str, blocks: list[str]) -> None:
+    assert [text[start:end] for start, end in summarize.fenced_blocks(text)] == blocks
+
+
+def test_finding_fences_is_linear_in_the_text() -> None:
+    import time
+
+    text = "```a\n" * 50_000  # 250 KB of openers with no closer (a regex would scan to the end from each)
+
+    started = time.perf_counter()
+    summarize.fenced_blocks(text)
+
+    assert time.perf_counter() - started < 1.0
+
+
+async def test_kept_code_is_in_conversation_order_whatever_the_reply_order() -> None:
+    model = FakeModel()
+    model.reply = lambda call: {"topic": "t", "summary": "s", "keep_code": ["code-2", "code-1"]}
+
+    summary = await summarize.summarize(
+        model, DEFAULT_SUMMARY_MODEL, exchange_of(conversation("q", f"{OLD_PARSE}\n{PARSE}", "n"))
+    )
+
+    assert [k.text for k in summary.kept_code] == [OLD_PARSE, PARSE]
+
+
+async def test_code_the_summarizer_cannot_see_is_not_offered() -> None:
+    hidden = "x" * summarize.BLOCK_MAX_CHARS + f"\n{PARSE}"  # past the point Liber cuts the entry
+    model = FakeModel()
+    model.reply = keeps_all_code
+
+    exchange = exchange_of(conversation("q", f"{OLD_PARSE}\n{hidden}", "n"))
+
+    assert [c.text for c in summarize.code_candidates(exchange)] == [OLD_PARSE]
+
+
+def test_the_same_exchange_at_two_positions_gets_its_own_ids_and_labels() -> None:
+    reply = [{"type": "text", "text": f"Here:\n{PARSE}"}]
+    request = conversation("same question", reply, "same question", reply, "next")
+    first, second = exchanges.completed_exchanges(parse(request).items)
+    assert first.key == second.key  # one cached summary serves both
+    stored = ExchangeSummary("t", "s", kept_code=(KeptCode(1, 0, len(PARSE), PARSE),))
+
+    one, two = exchanges.resolved(stored, first), exchanges.resolved(stored, second)
+
+    assert [k.label for k in one.kept_code] == ["[assistant code, message 1]"]
+    assert [k.label for k in two.kept_code] == ["[assistant code, message 3]"]
+    assert one.kept_code[0].item_id == first.items[1].id and two.kept_code[0].item_id == second.items[1].id
+    # So a pin of the second occurrence's reply suppresses only its own copy.
+    pin = Pinned(second.items[1].id, "[assistant text, message 3]", PARSE)
+    assert frozen_text(1, 0, 3, [one, two], [pin]).count(PARSE) == 2  # once kept (first), once pinned (second)
+
+
+async def test_kept_code_survives_the_database_byte_for_byte(store: Store) -> None:
+    from datetime import UTC, datetime
+
+    tricky = "```py\r\nprint('𝄞 é \\u0000')\r\n```"
+    summary = ExchangeSummary("t", "s", kept_code=(KeptCode(1, 2, len(tricky), tricky), KeptCode(3, 0, 9000, None)))
+    now = datetime.now(UTC)
+
+    await store.run(lambda db: exchanges.record_summary(db.connection(), "key", "summarizer", summary, now))
+    read = await store.run(lambda db: exchanges.cached_summaries(db.connection(), ["key"], "summarizer"))
+
+    assert read["key"].kept_code == summary.kept_code
