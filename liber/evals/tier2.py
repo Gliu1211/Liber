@@ -223,6 +223,14 @@ async def turn(
         if stop != "tool_use":
             return reply_text(result.body)
         calls = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if not calls:
+            # Answering with no tool results would send an empty user message, which the API (and
+            # Liber's validator) rejects. Say what the reply held: the run JSON keeps no raw replies.
+            if run is not None:
+                run.errors.append(
+                    f"the reply stopped for a tool call but had none (stop_reason tool_use): {described_reply(content)}"
+                )
+            return None
         if tools:
             results = [
                 {"type": "tool_result", "tool_use_id": b["id"], "content": tool_output(task, workspace, b)}
@@ -241,6 +249,33 @@ async def turn(
     if run is not None:
         run.errors.append(f"the model was still calling tools after {MAX_TOOL_ROUNDS} rounds")
     return None
+
+
+REPLY_EXCERPT_CHARS = 300  # per block, in an error that describes a reply
+
+
+def described_reply(content: list[Any]) -> str:
+    """A reply on one line, for an error: its block types in order, and the start of any text.
+
+    Text and thinking text are JSON-quoted, so newlines and quotes stay on the line; long ones are
+    cut, with their length. Signatures and tool inputs are left out, and a block without text (a
+    tool call, redacted thinking) shows only its type.
+    """
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            parts.append(type(block).__name__)
+            continue
+        kind = str(block.get("type"))
+        text = block.get("thinking") if kind == "thinking" else block.get("text")
+        if not isinstance(text, str) or not text.strip():
+            parts.append(kind)
+        elif len(text) > REPLY_EXCERPT_CHARS:
+            excerpt = json.dumps(text[:REPLY_EXCERPT_CHARS] + "…", ensure_ascii=False)
+            parts.append(f"{kind} ({len(text)} chars) {excerpt}")
+        else:
+            parts.append(f"{kind} {json.dumps(text, ensure_ascii=False)}")
+    return "; ".join(parts) or "no content blocks"
 
 
 def tool_output(task: Task, workspace: dict[str, str] | None, call: dict[str, Any]) -> str:

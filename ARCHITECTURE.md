@@ -315,7 +315,7 @@ Makefile              setup, check, fmt, eval targets
 
 ## 14. Roadmap
 
-- **v1:** passthrough proxy → context model + validator → Tier 1 eval gate → plans + frozen blocks → worker → dashboard → Tier 2 quality evals. Every step after the gate exists must pass it.
+- **v1 (complete, owner, 2026-11-11):** passthrough proxy → context model + validator → Tier 1 eval gate → plans + frozen blocks → worker → dashboard → Tier 2 quality evals. Every step after the gate exists must pass it.
 - **v2:** `recall` tool loop (D3c), OpenAI adapter (D2), embedding-based topic map, smarter auto-rules.
 
 ## 15. Engineering practices and agent harness

@@ -374,3 +374,22 @@ Template:
 - make check: pass (474 tests; Tier 1 unchanged, eval gate passed)
 - Next step: owner runs Tier 2 live. On `code_reconstruction`, B and C should now approach E, and on the other tasks nothing should get worse. The first run after this re-summarizes every exchange once (`PROMPT_VERSION` 3).
 
+
+## 2026-11-11 — Tier 2 run 2026-11-11; a harness fix; v1 concluded (owner)
+- Run (`evals/history/2026-11-11.*`, owner's machine, 3 repeats, the first with ADR 0017 built):
+  - **ADR 0017 closes the code gap.** On `code_reconstruction`, B passed 3/3 at 3,261 input tokens (1/5 on 2026-11-10). C passed 2/2 at 3,484, with one run that has no verdict (below). E, the pinned control, passed 3/3 at 3,343. D passed 2/3 at 6,651 (compaction call included). B now matches the control at about the same cost, on 3 repeats of one task. B's summary held the evidence 3/3, so this measures the summary, as intended, not what dropping thinking costs.
+  - **Pinning holds:** on `obscure_setting_in_big_config`, E passed 3/3 at 4,050, and B, C and D passed 0/3 (D at 13,588).
+  - **Rereads:** `code_reconstruction_reread` passed 3/3 in every condition, which supports the amendment's narrower scope.
+  - The other tasks are unchanged. Against D, B used 73% fewer input tokens on the reasoning-dependent tasks, 60% fewer on the others and 43% fewer on the reread tasks.
+- **The one error: `code_reconstruction` C #3** ("plan version 1 not used: its render broke empty_content"). The probe went out compacted and got a reply with `stop_reason: "tool_use"` but no `tool_use` block. The harness's `turn()` answered it with one refused result per call. With no calls, it appended a user message with empty content. Liber's validator rejected that message (the API would too) and fell back, so the request wasn't sent and the run has no verdict. Liber behaved correctly; the bug was in the harness.
+- Done (`evals/tier2.py`):
+  - A reply that stops for a tool call but holds none now ends the turn with an error, and nothing is sent.
+  - The error describes the reply, since the run JSON keeps no raw replies: its block types in order, plus the text and thinking text, JSON-quoted on one line and cut at 300 characters per block, with the length when cut (`described_reply`). Signatures and tool inputs are left out.
+  - Tests: with and without tools in the questions, the turn sends once, keeps the reply, records the described reply (no signature) and asks no needle question; a turn with no run to record on also just ends.
+- make check: pass (477 tests; Tier 1 unchanged, eval gate passed)
+- **v1 concluded (owner, 2026-11-11).** ARCHITECTURE.md §14 marks v1 complete.
+- Proposed follow-ups, for the owner to decide (none started):
+  - If the tool_use-without-a-call reply happens again, its error now shows what the model sent; decide then whether it's a model quirk worth handling.
+  - Plan sizes still leave thinking out on both sides, pending a `count_tokens` check (owner's conservative choice, 2026-11-09).
+  - v2 per §14: `recall` (D3c), which would also let kept code and pins become pointers; the OpenAI adapter (D2); an embedding-based topic map; smarter auto-rules.
+  - Code the user pastes into their own messages isn't a kept-code candidate yet (ADR 0017 amendment, "Out of scope").
