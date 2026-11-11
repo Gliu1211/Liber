@@ -263,6 +263,7 @@ class ExchangeSummaryRecord(Base):
     topic: Mapped[str] = mapped_column(Text)
     summary: Mapped[str] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)  # carry_forward_reasoning only (ADR 0004 A5)
+    kept_code: Mapped[str | None] = mapped_column(Text)  # JSON list of kept code blocks (ADR 0017)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

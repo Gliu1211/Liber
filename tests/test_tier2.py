@@ -1063,3 +1063,26 @@ async def test_the_report_counts_rereads_and_averages_those_tasks_apart() -> Non
     assert "averaged over other tasks" not in text  # the reread task isn't mixed into the others
     assert "- code_reconstruction_reread A: reread in 0 of 1 runs (0 tool calls)" in text
     assert "- code_reconstruction_reread B: reread in 1 of 1 runs (1 tool calls)" in text
+
+
+async def test_with_kept_code_b_recovers_the_conversation_only_code() -> None:
+    """ADR 0017 built: a summarizer that keeps the offered code gives B what E got by pinning."""
+    task = task_named("code_reconstruction")
+    model = worker_model()
+    summary_reply = model.reply
+    assert summary_reply is not None
+
+    def keeps_code(call: dict[str, Any]) -> dict[str, Any]:
+        reply = summary_reply(call)
+        if "keep_code" in call["schema"]["properties"]:
+            reply["keep_code"] = call["schema"]["properties"]["keep_code"]["items"].get("enum", [])
+        return reply
+
+    model.reply = keeps_code
+
+    runs = await tier2.run_eval(FakeApi(), model, [task], Settings(SETTINGS.model, "j", repeats=1), quiet)
+
+    by = {r.condition: r for r in runs}
+    assert by["B"].success is True and by["C"].success is True and by["E"].success is True
+    assert FINAL_CODE in by["B"].frozen_blocks[0]
+    assert "Code kept as is" in by["B"].frozen_blocks[0]

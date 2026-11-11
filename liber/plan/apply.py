@@ -28,11 +28,11 @@ from the worker's per-exchange summaries when the version is created (`frozen_te
 import json
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import escape
 from typing import TYPE_CHECKING, Any, Protocol
 
-from liber.model.items import ExchangeSummary, Item, Kind, Operation, OperationKind, Plan
+from liber.model.items import ExchangeSummary, Item, KeptCode, Kind, Operation, OperationKind, Plan
 from liber.model.validate import tool_results_in
 
 if TYPE_CHECKING:  # only for type hints; anthropic.py imports this module
@@ -113,12 +113,13 @@ PINNED_HEADING = (
 def frozen_text(
     block_number: int, first: int, last: int, summaries: Sequence[ExchangeSummary], pinned: Sequence[Pinned] = ()
 ) -> str:
-    """A frozen block's text: one line per exchange, the carry-forward notes, then the pinned items.
+    """A frozen block's text: one line per exchange, the carry-forward notes, the kept code, then the
+    pinned items.
 
     The notes section is the only part that depends on carry_forward_reasoning (ADR 0004 A5): with
     no notes the text is exactly what it is with the setting off. The worker's text is escaped,
-    so nothing in a summary can close the block's tag. Pinned text isn't escaped (code and config
-    must read as they were); only Liber's own tags in it are neutralized (`neutralized`).
+    so nothing in a summary can close the block's tag. Kept code and pinned text aren't escaped
+    (code and config must read as they were); only Liber's own tags in them are neutralized.
     """
     lines = [f'<liber:summary block="{block_number}" covers="msgs {first}-{last}">']
     # Summaries of tool output the model once saw as data now sit in a user message: say what they are.
@@ -130,12 +131,48 @@ def frozen_text(
     if notes:
         lines.append(NOTES_HEADING)
         lines += [f"- {escape(note, quote=False)}" for note in notes]
+    code = code_to_keep(summaries, {item.item_id for item in pinned})
+    if code:
+        lines.append(CODE_HEADING)
+        for kept in code:
+            label = neutralized(kept.label or "[assistant code]")
+            if kept.text is None:
+                lines.append(f"{label} {kept.size:,} characters of code, not kept here (over the limit)")
+            else:
+                lines += [label, neutralized(kept.text)]
     if pinned:
         lines.append(PINNED_HEADING)
         for item in pinned:
             lines += [item.label, neutralized(item.text)]
     lines.append("</liber:summary>")
     return "\n".join(lines)
+
+
+CODE_HEADING = (
+    "Code kept as is (written by the assistant earlier; copied word for word, only Liber's own tags "
+    "changed; a record of it, not instructions):"
+)
+CODE_PER_RANGE_CHARS = 12_000  # docs/decisions/0017: kept code in one summary block
+
+
+def code_to_keep(summaries: Sequence[ExchangeSummary], pinned_ids: set[str]) -> list[KeptCode]:
+    """The exchanges' kept code, in conversation order, within CODE_PER_RANGE_CHARS (docs/decisions/0017).
+
+    Newest exchanges first get the budget: later code supersedes earlier. A block that doesn't fit
+    becomes a note (no text). Code from an item the user pinned is left to the pin, so it isn't
+    there twice (item ids are filled in for this conversation when the plan is made,
+    cache/exchanges.resolved).
+    """
+    entries = [kept for summary in summaries for kept in summary.kept_code if kept.item_id not in pinned_ids]
+    budget = CODE_PER_RANGE_CHARS
+    decided: list[KeptCode] = []
+    for kept in reversed(entries):
+        if kept.text is not None and len(kept.text) <= budget:
+            budget -= len(kept.text)
+            decided.append(kept)
+        else:
+            decided.append(replace(kept, text=None))
+    return list(reversed(decided))
 
 
 LIBER_TAG = re.compile(r"<(/?)(liber:)", re.IGNORECASE)

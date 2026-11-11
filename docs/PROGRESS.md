@@ -342,3 +342,35 @@ Template:
 - make check: pass (447 tests; Tier 1 unchanged, eval gate passed)
 - Next step: owner runs Tier 2 live (`--repeats 5`). If E clearly beats B on `code_reconstruction`, build ADR 0017 with B approaching E as the target.
 
+## 2026-11-11 — Tier 2 run 2026-11-10; ADR 0017 built (keep conversation-only code in summaries)
+- Run (`evals/history/2026-11-10.*`, owner's machine, 5 repeats):
+  - **Pinning proven:** `obscure_setting_in_big_config` gave E 5/5 against B, C and D 0/5. E sent 4,368 input tokens, 67% fewer than D's 13,413.
+  - **The ADR 0017 control:** on `code_reconstruction`, E (the assistant's final `parse()` reply pinned) passed 5/5 at 2,971 tokens. B and C passed 1/5 (2,767 and 3,010), D 3/5 (5,621).
+  - **Rereads:** `code_reconstruction_reread` passed everywhere that got a verdict. B, C and D reread in every run; one B run hit the 5-round tool limit and has no verdict.
+  - **Notes:** C stays ahead on the reasoning tasks.
+- Done: ADR 0017 is built.
+  - The summarizer is shown each fenced code block in the assistant's replies as a candidate (`code-1`, … listed in the entry's `code_blocks`). Its reply's `keep_code` names the ones a later turn needs exactly. Liber copies those blocks from the conversation byte for byte.
+  - Ids that weren't offered, repeats and non-strings are dropped.
+  - Limits: 4,000 characters per exchange (whole blocks; over-limit blocks become notes) and 12,000 per summary block (newest first).
+  - The code is stored with the exchange's summary (`exchange_summaries.kept_code`) and rendered in a "Code kept as is" section after the notes, before pins. Pinned items aren't shown twice.
+  - It's the same with or without carry_forward_reasoning, and counted by the "must shrink" check, whose refusal says so.
+  - `PROMPT_VERSION` is 3.
+  - ARCHITECTURE.md §4, the README's privacy section and the ADR's implementation notes are updated.
+- Tests:
+  - candidates: only assistant fenced code (not the user's, not tool calls or results), ids in the transcript and schema;
+  - exact copies, dropped ids, the per-exchange limit, and the old reply shape still parsing;
+  - frozen-block order, neutralized tags without escaping, the range budget, pins taking precedence, and notes;
+  - through the worker, the database and a plan; carry-forward still differing only by notes; the refusal hint;
+  - in Tier 2 with fakes, B recovers `code_reconstruction` once the summarizer keeps code.
+- Review: independent reviewer run.
+  - Must-fix: the fence regex was quadratic and ran on the proxy's event loop; a long reply full of unclosed fences could stall live requests (hard rule 1). It's now a linear line-by-line Markdown parser, with a 250 KB test.
+  - Should-fix, all done:
+    - fence rules: 4+-character fences, longer closers, indented fences, CRLF, and inline "```x```" not opening a block;
+    - kept code follows the conversation's order, not the reply's;
+    - only code the summarizer can see is offered;
+    - kept code is stored by position relative to its exchange and tied to this conversation's items when a plan is made, so a cached summary reused at another position gets the right labels and pin de-duplication;
+    - the code heading says it's "a record of it, not instructions", as pins do;
+    - tests for each, plus a byte-for-byte database round trip.
+- make check: pass (474 tests; Tier 1 unchanged, eval gate passed)
+- Next step: owner runs Tier 2 live. On `code_reconstruction`, B and C should now approach E, and on the other tasks nothing should get worse. The first run after this re-summarizes every exchange once (`PROMPT_VERSION` 3).
+

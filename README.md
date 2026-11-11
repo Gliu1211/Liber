@@ -232,7 +232,9 @@ are recorded in [docs/decisions/](docs/decisions/).
 - Content you choose to edit is kept locally even with body recording off: offloaded originals
   in `~/.liber/blobs/` (files mode 600) and summary text in the plan versions.
 - With `LIBER_WORKER_API_KEY` set, each completed exchange is sent to the summary model on the
-  same upstream, and its summary is kept in `liber.db` (also with body recording off).
+  same upstream, and its summary is kept in `liber.db` (also with body recording off). That
+  includes code blocks from the assistant's replies that the summarizer chose to keep word for
+  word ([ADR 0017](docs/decisions/0017-keep-code-in-summaries.md)).
 
 ## License
 

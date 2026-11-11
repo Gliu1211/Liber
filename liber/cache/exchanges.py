@@ -19,14 +19,14 @@ import hashlib
 import itertools
 import json
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Generic, Protocol, TypeVar, cast
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from sqlalchemy import Connection, Table, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from liber.model.items import ExchangeSummary
+from liber.model.items import ExchangeSummary, KeptCode
 from liber.session.store import ExchangeSummaryRecord, ExchangeTokensRecord
 
 
@@ -103,17 +103,56 @@ def record_tokens(db: Connection, key: str, model: str, tokens: int, now: dateti
 def cached_summaries(db: Connection, keys: Iterable[str], summarizer: str) -> dict[str, ExchangeSummary]:
     table = ExchangeSummaryRecord
     rows = db.execute(
-        select(table.exchange_key, table.topic, table.summary, table.notes).where(
+        select(table.exchange_key, table.topic, table.summary, table.notes, table.kept_code).where(
             table.summarizer == summarizer, table.exchange_key.in_(set(keys))
         )
     )
-    return {key: ExchangeSummary(topic, summary, notes) for key, topic, summary, notes in rows}
+    return {
+        key: ExchangeSummary(topic, summary, notes, code_from_json(code)) for key, topic, summary, notes, code in rows
+    }
 
 
 def record_summary(db: Connection, key: str, summarizer: str, summary: ExchangeSummary, now: datetime) -> None:
-    values = {"topic": summary.topic, "summary": summary.summary, "notes": summary.notes, "updated_at": now}
+    values = {
+        "topic": summary.topic,
+        "summary": summary.summary,
+        "notes": summary.notes,
+        "kept_code": code_to_json(summary.kept_code),
+        "updated_at": now,
+    }
     db.execute(
         sqlite_insert(cast(Table, ExchangeSummaryRecord.__table__))
         .values(exchange_key=key, summarizer=summarizer, **values)
         .on_conflict_do_update(index_elements=["exchange_key", "summarizer"], set_=values)
     )
+
+
+def code_to_json(kept: tuple[KeptCode, ...]) -> str | None:
+    """What's stored: the position relative to the exchange, never this conversation's ids."""
+    if not kept:
+        return None
+    return json.dumps(
+        [{"offset": k.offset, "block_index": k.block_index, "size": k.size, "text": k.text} for k in kept]
+    )
+
+
+def code_from_json(stored: str | None) -> tuple[KeptCode, ...]:
+    if not stored:
+        return ()
+    return tuple(
+        KeptCode(int(c["offset"]), int(c["block_index"]), int(c["size"]), c["text"]) for c in json.loads(stored)
+    )
+
+
+def resolved(summary: ExchangeSummary, exchange: "Exchange[Any]") -> ExchangeSummary:
+    """`summary` with its kept code tied to this occurrence of the exchange: item ids and labels."""
+    if not summary.kept_code:
+        return summary
+    by_position = {(item.msg_index - exchange.first, item.block_index): item for item in exchange.items}
+    kept = []
+    for code in summary.kept_code:
+        item = by_position.get((code.offset, code.block_index))
+        message = exchange.first + code.offset
+        label = f"[assistant code, message {message}]"
+        kept.append(replace(code, item_id=item.id if item is not None else "", label=label))
+    return replace(summary, kept_code=tuple(kept))

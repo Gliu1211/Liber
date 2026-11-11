@@ -82,6 +82,24 @@ class Operation(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
+class KeptCode:
+    """A fenced code block from an assistant reply, kept word for word (docs/decisions/0017).
+
+    Stored with its exchange's summary, which is reused wherever the same exchange appears, so it
+    records where the block is relative to the exchange (`offset`, `block_index`). The item it's
+    in and the message number are only known for a given conversation: `resolved()` fills them in
+    when a plan is made.
+    """
+
+    offset: int  # the block's message, counted from the exchange's first message
+    block_index: int  # the text block's position in that message
+    size: int  # characters
+    text: str | None  # the fenced block exactly as it was; None: over a limit, only noted
+    item_id: str = ""  # set by resolved(): the text block's item (a pin of it takes precedence)
+    label: str = ""  # set by resolved(): e.g. "[assistant code, message 5]"
+
+
+@dataclass(frozen=True, slots=True)
 class ExchangeSummary:
     """What the worker wrote about one exchange (D10): its frozen-block entry is built from this."""
 
@@ -91,6 +109,9 @@ class ExchangeSummary:
     # exchange's thinking text. None: not used (the setting is off) or not written yet; "": no
     # thinking text to read.
     notes: str | None = None
+    # Code that exists only in the conversation, chosen by the summarizer and copied by Liber
+    # (docs/decisions/0017). Part of the summary call's result, so the same with or without notes.
+    kept_code: tuple[KeptCode, ...] = ()
 
 
 class Plan(BaseModel):
