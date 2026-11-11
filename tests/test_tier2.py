@@ -346,6 +346,59 @@ async def test_a_cut_off_reply_or_endless_tool_calls_is_an_error(dead_end: tier2
     assert second.errors == [f"the model was still calling tools after {tier2.MAX_TOOL_ROUNDS} rounds"]
 
 
+@pytest.mark.parametrize("tools", [False, True])
+async def test_a_reply_that_stops_for_tools_without_calling_one_is_an_error_that_describes_it(tools: bool) -> None:
+    # 2026-11-11, code_reconstruction C #3: such a reply was answered with an empty user message,
+    # which Liber's validator (and the API) rejects. The run JSON keeps no raw replies, so the error
+    # itself has to say what the reply held.
+    task = task_named("code_reconstruction")
+    long_text = "x" * (tier2.REPLY_EXCERPT_CHARS + 50)
+    content = [
+        {"type": "thinking", "thinking": 'I should read\n"parser.py"', "signature": "sig-not-reported"},
+        {"type": "text", "text": long_text},
+        {"type": "text", "text": "   "},
+    ]
+    sent: list[list[dict[str, Any]]] = []
+
+    async def no_call(messages: list[dict[str, Any]]) -> ApiResult:
+        sent.append(json.loads(json.dumps(messages)))
+        return ApiResult(200, {"content": content, "stop_reason": "tool_use"})
+
+    run = ConditionRun(task.name, "C", 1)
+    messages: list[dict[str, Any]] = []
+    answer = await tier2.turn(no_call, messages, task.probe_question, task, run, tools, {})
+
+    assert answer is None
+    assert len(sent) == 1  # no empty follow-up
+    assert messages[-1] == {"role": "assistant", "content": content}  # the reply is kept, as for any reply
+    excerpt = json.dumps("x" * tier2.REPLY_EXCERPT_CHARS + "…", ensure_ascii=False)
+    assert run.errors == [
+        "the reply stopped for a tool call but had none (stop_reason tool_use): "
+        f'thinking "I should read\\n\\"parser.py\\""; text ({len(long_text)} chars) {excerpt}; text'
+    ]
+    assert "…" in run.errors[0] and "sig-not-reported" not in run.errors[0]
+    assert run.refused_tool_calls == run.question_tool_calls == []
+    # Without a run to record on (setup's callers always pass one), it still just ends the turn.
+    assert await tier2.turn(no_call, [], "q", task, None, tools, {}) is None
+    assert tier2.described_reply([]) == "no content blocks"
+    assert tier2.described_reply([{"type": "redacted_thinking", "data": "opaque"}]) == "redacted_thinking"
+
+
+async def test_after_such_a_reply_the_needle_question_isnt_asked() -> None:
+    task = task_named("code_reconstruction")
+    sent = 0
+
+    async def no_call(messages: list[dict[str, Any]]) -> ApiResult:
+        nonlocal sent
+        sent += 1
+        return ApiResult(200, {"content": [], "stop_reason": "tool_use"})
+
+    run = ConditionRun(task.name, "B", 1)
+    assert await tier2.questions(no_call, [], task, run, {}) == (None, None)
+    assert sent == 1
+    assert run.errors == ["the reply stopped for a tool call but had none (stop_reason tool_use): no content blocks"]
+
+
 def judged(text: str, stop: str = "end_turn") -> ApiResult:
     return ApiResult(200, {"content": [{"type": "text", "text": text}], "stop_reason": stop})
 
