@@ -30,7 +30,7 @@ from liber.config import DEFAULT_PRICING, DEFAULT_SUMMARY_MODEL, ModelPrice
 from liber.model.anthropic import parse
 from liber.model.items import ExchangeSummary, Operation, OperationKind, Plan
 from liber.plan import cost, versions
-from liber.plan.apply import PINNABLE, Pinned, pinned_text, summarize_operation
+from liber.plan.apply import CODE_HEADING, PINNABLE, Pinned, pinned_text, summarize_operation
 from liber.plan.versions import PlanError
 from liber.session.store import BranchRecord, ChainNode, ItemRecord, RequestRecord, Store
 from liber.worker.summarize import summarizer_id
@@ -282,12 +282,14 @@ def refuse_unless_smaller(
     counted = cost.with_exact_counts(items, done, exact)
     # Compared with the applied version: that is what requests send today (a pending one isn't sent).
     estimate = cost.estimate(counted, state.applied.plan, candidate, None, state.activated_at)
+    candidate_text = "".join(op.summary or "" for op in operations)
     if estimate.tokens_after >= estimate.tokens_now:
         raise PlanError(
             f"this plan wouldn't make the conversation smaller (about {estimate.tokens_now:,} tokens per "
             f"request now, {estimate.tokens_after:,} after, thinking not counted), so it isn't worth the "
             "cache restart. "
-            "Summarize a longer range, or offload or delete larger items."
+            + ("Kept code is part of the summary and counted too. " if CODE_HEADING in candidate_text else "")
+            + "Summarize a longer range, or offload or delete larger items."
         )
 
 

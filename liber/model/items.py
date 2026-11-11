@@ -82,6 +82,16 @@ class Operation(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
+class KeptCode:
+    """A fenced code block from an assistant reply, kept word for word (docs/decisions/0017)."""
+
+    item_id: str  # the assistant text block it's from (a pin of that item takes precedence)
+    label: str  # e.g. "[assistant code, message 5]"
+    size: int  # characters
+    text: str | None  # the fenced block exactly as it was; None: over a limit, only noted
+
+
+@dataclass(frozen=True, slots=True)
 class ExchangeSummary:
     """What the worker wrote about one exchange (D10): its frozen-block entry is built from this."""
 
@@ -91,6 +101,9 @@ class ExchangeSummary:
     # exchange's thinking text. None: not used (the setting is off) or not written yet; "": no
     # thinking text to read.
     notes: str | None = None
+    # Code that exists only in the conversation, chosen by the summarizer and copied by Liber
+    # (docs/decisions/0017). Part of the summary call's result, so the same with or without notes.
+    kept_code: tuple[KeptCode, ...] = ()
 
 
 class Plan(BaseModel):

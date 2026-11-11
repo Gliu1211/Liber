@@ -26,7 +26,7 @@ from typing import Generic, Protocol, TypeVar, cast
 from sqlalchemy import Connection, Table, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from liber.model.items import ExchangeSummary
+from liber.model.items import ExchangeSummary, KeptCode
 from liber.session.store import ExchangeSummaryRecord, ExchangeTokensRecord
 
 
@@ -103,17 +103,37 @@ def record_tokens(db: Connection, key: str, model: str, tokens: int, now: dateti
 def cached_summaries(db: Connection, keys: Iterable[str], summarizer: str) -> dict[str, ExchangeSummary]:
     table = ExchangeSummaryRecord
     rows = db.execute(
-        select(table.exchange_key, table.topic, table.summary, table.notes).where(
+        select(table.exchange_key, table.topic, table.summary, table.notes, table.kept_code).where(
             table.summarizer == summarizer, table.exchange_key.in_(set(keys))
         )
     )
-    return {key: ExchangeSummary(topic, summary, notes) for key, topic, summary, notes in rows}
+    return {
+        key: ExchangeSummary(topic, summary, notes, code_from_json(code)) for key, topic, summary, notes, code in rows
+    }
 
 
 def record_summary(db: Connection, key: str, summarizer: str, summary: ExchangeSummary, now: datetime) -> None:
-    values = {"topic": summary.topic, "summary": summary.summary, "notes": summary.notes, "updated_at": now}
+    values = {
+        "topic": summary.topic,
+        "summary": summary.summary,
+        "notes": summary.notes,
+        "kept_code": code_to_json(summary.kept_code),
+        "updated_at": now,
+    }
     db.execute(
         sqlite_insert(cast(Table, ExchangeSummaryRecord.__table__))
         .values(exchange_key=key, summarizer=summarizer, **values)
         .on_conflict_do_update(index_elements=["exchange_key", "summarizer"], set_=values)
     )
+
+
+def code_to_json(kept: tuple[KeptCode, ...]) -> str | None:
+    if not kept:
+        return None
+    return json.dumps([{"item_id": k.item_id, "label": k.label, "size": k.size, "text": k.text} for k in kept])
+
+
+def code_from_json(stored: str | None) -> tuple[KeptCode, ...]:
+    if not stored:
+        return ()
+    return tuple(KeptCode(c["item_id"], c["label"], int(c["size"]), c["text"]) for c in json.loads(stored))

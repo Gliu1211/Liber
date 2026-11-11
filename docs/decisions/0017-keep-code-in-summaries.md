@@ -129,3 +129,36 @@ Option 2, with option 3 as the Tier 2 control.
   - It is labelled as a record, as pins are, and a summarizer can't add bytes, only choose ids.
 - **Revisit when** a model can recall offloaded items on demand (D3's v2 `recall`). Kept code
   could then become a pointer for large files.
+
+## Implementation notes (2026-11-11)
+Built after the control. In the 2026-11-10 Tier 2 run (`evals/history/2026-11-10.*`), E on
+`code_reconstruction`, which pinned the assistant's final `parse()` reply, passed 5/5 at 2,971
+input tokens. B passed 1/5 at 2,767 and D 3/5 at 5,621. Keeping the code cost about 7% more than B.
+That is the target: B with kept code should approach E.
+
+Details the decision left open:
+- **What a candidate is** (`worker/summarize.code_candidates`): a fenced block in an assistant text
+  block. The opening fence is a line starting with ```` ``` ```` or `~~~` (a language may follow).
+  The closing fence is the same marker on its own line. The copied text is the whole fenced block,
+  fences included, exactly as it appears in the message. Text after a closing fence on the same
+  line means it's not a closing fence, as in Markdown.
+- **The reply.**
+  - `keep_code` is required by the schema. Its items are an `enum` of the offered ids when there
+    are any.
+  - A reply without it is read as an empty list, so the old shape still parses. Anything else
+    unexpected is still rejected.
+  - Ids that weren't offered, repeats and non-strings are dropped.
+- **Stored** in `exchange_summaries.kept_code` as JSON, one entry per chosen block: the item id,
+  the label `[assistant code, message N]`, the size and the text. A block over the per-exchange
+  limit is stored with no text and rendered as a note: "N characters of code, not kept here (over
+  the limit)".
+- **Rendered** (`plan/apply.frozen_text`).
+  - The "Code kept as is" section comes after the notes and before pinned items.
+  - The per-range budget (`CODE_PER_RANGE_CHARS`) is given to the newest exchanges first.
+  - Code from an item the user pinned is left to the pin, so it isn't shown twice.
+  - Labels and code have Liber's tags neutralized and are otherwise as they were.
+- **A refusal** under §6 says when kept code is part of what's counted.
+- **`PROMPT_VERSION` is 3**, so summaries written with v2 aren't reused. Each active session's past
+  exchanges are summarized again once, and `liber plan create --summarize-through` says "not
+  ready" until the worker catches up.
+
