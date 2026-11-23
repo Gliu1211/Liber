@@ -17,6 +17,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from liber.model.anthropic import parse
+from liber.model.items import Operation, OperationKind
+from liber.plan import versions
 from liber.session.chain import Identity, StoreBusy, canonical_json, content_hash, has_numbers, identify, same_json
 from liber.session.store import Store
 
@@ -389,6 +391,43 @@ async def test_only_a_leading_header_line_is_ignored(store: Store) -> None:
     c = await see(store, changed)
 
     assert len({a.session_id, b.session_id, c.session_id}) == 3
+
+
+async def test_the_header_is_only_ignored_in_the_first_system_block(store: Store) -> None:
+    def second_block(version: str) -> dict[str, Any]:
+        body = claude_code_request("hi")
+        body["system"][1]["text"] = f"x-anthropic-billing-header: cc_version={version};\nYou are Claude Code."
+        return body
+
+    a = await see(store, second_block("1"))
+    b = await see(store, second_block("2"))
+
+    assert b.session_id != a.session_id
+
+
+async def test_a_plain_string_system_prompt_with_the_header_is_handled(store: Store) -> None:
+    a = await see(store, request("hi", system="x-anthropic-billing-header: cc_version=1;\nYou are Claude Code."))
+    b = await see(
+        store, request("hi", "ok", "more", system="x-anthropic-billing-header: cc_version=2;\nYou are Claude Code.")
+    )
+
+    assert b.session_id == a.session_id and not b.new_session
+
+
+async def test_a_plan_made_before_a_client_update_still_applies_after_it(store: Store) -> None:
+    """The dogfooding bug was a lost plan: the resumed chat must come back with it."""
+    before = claude_code_request("u1", "a1", "u2")
+    a = await see(store, before)
+    assert a.session_id is not None
+    offload = Operation(kind=OperationKind.OFFLOAD, item_ids=(parse(before).items[0].id,), note="opening")
+    await versions.create(store, a.session_id, (offload,))
+    await versions.apply(store, a.session_id)
+
+    b = await see(store, claude_code_request("u1", "a1", "u2", "a2", "u3", version="2.1.326.2f5"))
+
+    assert b.session_id == a.session_id
+    assert b.plan.pending is not None and b.plan.apply_requested
+    assert b.plan.pending.plan.operations == (offload,)
 
 
 async def test_lines_after_the_header_in_the_same_block_still_count(store: Store) -> None:

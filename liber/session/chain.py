@@ -114,10 +114,11 @@ CLIENT_HEADER_PREFIX = "x-anthropic-billing-header:"
 
 
 def without_client_header(block: Any) -> Any:
-    """A system block without the client's billing-header line, for h_0 only.
+    """The first system block without the client's billing-header line, for h_0 only.
 
-    Only a text block whose text starts with the header loses it, and only its first line. The
-    request itself is forwarded untouched; this changes what Liber hashes, nothing else.
+    Only a text block whose text starts with the header loses it, and only its first line.
+    root_hash applies this to the first system block only, where Claude Code puts the header.
+    The request itself is forwarded untouched; this changes what Liber hashes, nothing else.
     """
     if not isinstance(block, dict) or block.get("type") != "text":
         return block
@@ -134,7 +135,10 @@ def root_hash(system: Any, tools: Any) -> str:
     Without the client's billing-header line (without_client_header): a resumed chat whose
     client updated in between is still the same conversation, with the same item ids.
     """
-    system_blocks = [without_cache_control(without_client_header(block)) for block in as_blocks(system)]
+    blocks = as_blocks(system)
+    if blocks:
+        blocks = [without_client_header(blocks[0]), *blocks[1:]]
+    system_blocks = [without_cache_control(block) for block in blocks]
     tool_definitions = [without_cache_control(tool) for tool in tools] if isinstance(tools, list) else []
     return sha256_hex(canonical_json({"system": system_blocks, "tools": tool_definitions}))
 

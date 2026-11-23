@@ -44,8 +44,9 @@ For (2):
   stays listed. Chosen.
 
 ## Decision
-1. **Identity** (`session/chain.py`): when hashing h_0, a system text block that starts with
-   `x-anthropic-billing-header:` loses its first line. Nothing else changes, and the request is
+1. **Identity** (`session/chain.py`): when hashing h_0, the first system block loses its first
+   line if it is a text block starting with `x-anthropic-billing-header:`, where Claude Code puts
+   it. Nothing else changes, and the request is
    still forwarded byte for byte; this only affects what Liber hashes.
    - The header anywhere else, and any other change to the system prompt or tools, still makes a
      different conversation.
@@ -53,6 +54,10 @@ For (2):
 2. **Dashboard** (`dashboard/views.side_branches`): the session list shows such branches in a
    collapsed "side requests (last message replaced)" list under the session, not as forks. They are
    still stored and still reachable; only the listing changes.
+   - Siblings are counted within a session: first messages of different sessions share the root
+     hash but don't replace each other.
+   - "Replaced" means a sibling was used after the branch was last used, so a branch the user
+     went back to is listed again. A tie folds nothing.
 
 ## Consequences
 - **A chat resumed after a client update keeps its session, item ids and plans.**
@@ -60,6 +65,11 @@ For (2):
   request of each existing chat starts a new session once. That only affects data recorded before
   the change, which today is the owner's test data.
 - **Other clients are unaffected.** A system prompt without the header hashes as before.
+- **One slower parse after an update.** ADR 0007's reuse cache compares the system prompt with
+  `==`, so the first request after a client update (or a CLI/IDE switch) is parsed in full. Only
+  speed; reuse stays correct, since it compares h_0, which now leaves the header out on both sides.
+- **ARCHITECTURE.md D7** should say "h_0 = H(system minus the client billing-header line ||
+  tools)" if this is accepted.
 - **Revisit if** Claude Code moves volatile data elsewhere (another header, the first user
   message), or if another client turns out to put per-version text in its system prompt. The
   same normalization would apply there.

@@ -32,6 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from liber.config import Settings
 from liber.dashboard import views
@@ -86,12 +87,7 @@ async def index(request: Request) -> Response:
     store = store_of(request)
     sessions = list(reversed(await store.list_sessions()))  # newest first
     branches = await store.run(lambda db: list(db.scalars(select(BranchRecord).order_by(BranchRecord.created_at))))
-    nodes = await store.run(
-        lambda db: [
-            views.NodeFacts(row.hash, row.parent_hash, row.created_at)
-            for row in db.execute(select(ChainNode.hash, ChainNode.parent_hash, ChainNode.created_at))
-        ]
-    )
+    nodes = await store.run(lambda db: branch_head_nodes(db, [branch.head_hash for branch in branches]))
     side = views.side_branches(branches, nodes)
     by_session: dict[str, list[BranchRecord]] = {}
     side_by_session: dict[str, list[BranchRecord]] = {}
@@ -110,6 +106,20 @@ async def index(request: Request) -> Response:
             "worker_on": request.app.state.worker is not None,
         },
     )
+
+
+def branch_head_nodes(db: Session, heads: list[str]) -> list[views.NodeFacts]:
+    """What views.side_branches needs: the branch heads, and the children of heads and of their
+    parents. Two small queries rather than every stored message."""
+    columns = (ChainNode.hash, ChainNode.parent_hash, ChainNode.session_id, ChainNode.branch_id, ChainNode.created_at)
+    head_rows = list(db.execute(select(*columns).where(ChainNode.hash.in_(heads)))) if heads else []
+    near = {row.hash for row in head_rows} | {row.parent_hash for row in head_rows}
+    child_rows = list(db.execute(select(*columns).where(ChainNode.parent_hash.in_(near)))) if near else []
+    rows = {row.hash: row for row in [*head_rows, *child_rows]}
+    return [
+        views.NodeFacts(row.hash, row.parent_hash, row.session_id, row.branch_id, row.created_at)
+        for row in rows.values()
+    ]
 
 
 @router.get("/sessions/{session_id}", response_class=HTMLResponse)

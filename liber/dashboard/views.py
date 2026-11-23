@@ -202,6 +202,8 @@ class NodeFacts:
 
     hash: str
     parent_hash: str
+    session_id: str
+    branch_id: str  # the branch that first contained the message
     created_at: datetime
 
 
@@ -213,18 +215,32 @@ def side_branches(branches: list[BranchRecord], nodes: list[NodeFacts]) -> set[s
     after a break, it sends your conversation plus a recap prompt as a side request, and your
     next real message forks again at the same point. A one-message rewind looks the same, and is
     equally finished. A branch that diverged further back is a real alternative and stays listed.
+
+    `nodes` must hold each branch's head, and every child of a head or of a head's parent.
+
+    - Siblings are counted per session: first messages share the root hash across sessions
+      (same system prompt and tools), but they are different sessions, not replacements.
+    - "Later" means the sibling was used after this branch was last used: when the sibling was
+      first sent, or its branch's last use. So a branch the user went back to (rewind, then resend
+      the same message) is current again, and the other one is folded.
+    - A tie on time folds nothing.
     """
     has_child = {node.parent_hash for node in nodes}
     by_hash = {node.hash: node for node in nodes}
-    newest_child: dict[str, datetime] = {}
-    for node in nodes:
-        if node.parent_hash not in newest_child or node.created_at > newest_child[node.parent_hash]:
-            newest_child[node.parent_hash] = node.created_at
+    last_used = {branch.id: branch.last_seen_at for branch in branches}
     side = set()
     for branch in branches:
         head = by_hash.get(branch.head_hash)
         if head is None or head.hash in has_child:
             continue  # unknown, or continued
-        if newest_child[head.parent_hash] > head.created_at:
-            side.add(branch.id)  # a later message replaced this branch's last one
+        for sibling in nodes:
+            if sibling.hash == head.hash or (sibling.session_id, sibling.parent_hash) != (
+                head.session_id,
+                head.parent_hash,
+            ):
+                continue
+            used = max(sibling.created_at, last_used.get(sibling.branch_id, sibling.created_at))
+            if used > branch.last_seen_at:
+                side.add(branch.id)  # a later message replaced this branch's last one
+                break
     return side
