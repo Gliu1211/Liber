@@ -9,6 +9,7 @@ tested on their own. Nothing here changes anything: actions go through plan/comm
   completed exchange (ADR 0013); the turn in progress has none yet.
 - `summary_ends`: the messages a new summary can end at (§5 boundaries), for the summarize form.
 - `usage_chart`: input tokens, cache reads and cache writes per request, as SVG polylines.
+- `side_branches`: branches whose last message was replaced, folded away in the session list.
 """
 
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from datetime import datetime
 from liber.model.items import Plan
 from liber.plan import commands, cost
 from liber.plan.commands import SessionView
-from liber.session.store import RequestRecord
+from liber.session.store import BranchRecord, RequestRecord
 
 NOT_SUMMARIZED = "not summarized yet"
 CURRENT_TURN = "current turn"
@@ -193,3 +194,53 @@ def plan_lines(view: SessionView) -> list[tuple[int, int, list[str]]]:
             described = [commands.describe_operation(op) for op in version.plan.operations]
             versions.append((version.number, version.parent, described))
     return versions
+
+
+@dataclass(frozen=True)
+class NodeFacts:
+    """What side_branches needs from a stored message (session/store.ChainNode)."""
+
+    hash: str
+    parent_hash: str
+    session_id: str
+    branch_id: str  # the branch that first contained the message
+    created_at: datetime
+
+
+def side_branches(branches: list[BranchRecord], nodes: list[NodeFacts]) -> set[str]:
+    """Ids of branches that end in a message that was later replaced.
+
+    Such a branch's newest message has no continuation, and a later message was sent in its
+    place (same parent). In Claude Code that is mostly its "welcome back" recap: when you return
+    after a break, it sends your conversation plus a recap prompt as a side request, and your
+    next real message forks again at the same point. A one-message rewind looks the same, and is
+    equally finished. A branch that diverged further back is a real alternative and stays listed.
+
+    `nodes` must hold each branch's head, and every child of a head or of a head's parent.
+
+    - Siblings are counted per session: first messages share the root hash across sessions
+      (same system prompt and tools), but they are different sessions, not replacements.
+    - "Later" means the sibling was used after this branch was last used: when the sibling was
+      first sent, or its branch's last use. So a branch the user went back to (rewind, then resend
+      the same message) is current again, and the other one is folded.
+    - A tie on time folds nothing.
+    """
+    has_child = {node.parent_hash for node in nodes}
+    by_hash = {node.hash: node for node in nodes}
+    last_used = {branch.id: branch.last_seen_at for branch in branches}
+    side = set()
+    for branch in branches:
+        head = by_hash.get(branch.head_hash)
+        if head is None or head.hash in has_child:
+            continue  # unknown, or continued
+        for sibling in nodes:
+            if sibling.hash == head.hash or (sibling.session_id, sibling.parent_hash) != (
+                head.session_id,
+                head.parent_hash,
+            ):
+                continue
+            used = max(sibling.created_at, last_used.get(sibling.branch_id, sibling.created_at))
+            if used > branch.last_seen_at:
+                side.add(branch.id)  # a later message replaced this branch's last one
+                break
+    return side

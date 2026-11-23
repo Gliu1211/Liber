@@ -22,6 +22,14 @@
     {% for branch in branches.get(session.id, []) %}
     <div class="branch"><span class="id">{{ branch.id[:8] }}</span> · {{ branch.head_depth }} messages{% if branch.parent_branch_id %} · forked after message {{ branch.fork_depth }}{% endif %} · last used {{ branch.last_seen_at.strftime("%Y-%m-%d %H:%M") }}</div>
     {% endfor %}
+    {% set side = side_branches.get(session.id, []) %}
+    {% if side %}
+    <details class="side-branches"><summary>{{ side|length }} side request{{ "s" if side|length != 1 }} (last message replaced, e.g. Claude Code's recap)</summary>
+    {% for branch in side %}
+    <div class="side-branch"><span class="id">{{ branch.id[:8] }}</span> · {{ branch.head_depth }} messages · last used {{ branch.last_seen_at.strftime("%Y-%m-%d %H:%M") }}</div>
+    {% endfor %}
+    </details>
+    {% endif %}
   </td>
 </tr>
 {% endfor %}

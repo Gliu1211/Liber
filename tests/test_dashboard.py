@@ -92,6 +92,23 @@ async def test_the_session_list_shows_sessions_with_their_branches(
     assert f'href="/liber/sessions/{session}"' in page.text
 
 
+async def test_a_recap_side_request_is_folded_away_in_the_session_list(
+    app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream
+) -> None:
+    """Claude Code's "welcome back" recap forks the conversation at its end; the real next message
+    forks again at the same point. Only the real branch is listed; the recap is folded away."""
+    await a_session(app, client, upstream)
+    for last in ("The user stepped away and is coming back. Recap in under 40 words.", "Now deploy it"):
+        await client.post("/v1/messages", content=json.dumps(conversation([*TURNS, "Shipped.", last])).encode())
+        await recorded(app)
+
+    page = await client.get("/liber/")
+
+    assert page.text.count('class="branch"') == 1
+    assert page.text.count('class="side-branch"') == 1
+    assert "1 side request (last message replaced" in page.text
+
+
 async def test_the_session_page_shows_items_topics_and_the_usage_chart(
     app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream
 ) -> None:
