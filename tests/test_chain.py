@@ -342,3 +342,62 @@ async def test_a_busy_database_makes_identification_give_up_quickly(store: Store
 
     assert all(isinstance(result, StoreBusy) for result in results)
     assert elapsed < 1.0, f"waited {elapsed:.2f}s"
+
+
+# --- The client's billing-header line (ADR 0018) ------------------------------------------------
+
+
+def claude_code_request(*texts: str, version: str = "2.1.325.157", entrypoint: str = "cli") -> dict[str, Any]:
+    """A request with Claude Code's system prompt layout: the billing-header line first."""
+    body = request(*texts)
+    body["system"] = [
+        {"type": "text", "text": f"x-anthropic-billing-header: cc_version={version}; cc_entrypoint={entrypoint};"},
+        {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}},
+    ]
+    return body
+
+
+async def test_a_resumed_chat_after_a_client_update_is_the_same_conversation(store: Store) -> None:
+    """Dogfooding, 2026-11-23: a chat resumed after Claude Code updated became a new session."""
+    before = claude_code_request("u1", "a1", "u2")
+    after = claude_code_request("u1", "a1", "u2", "a2", "u3", version="2.1.326.2f5")
+
+    a = await see(store, before)
+    b = await see(store, after)
+
+    assert (b.session_id, b.branch_id) == (a.session_id, a.branch_id)
+    assert (b.known_messages, b.new_messages) == (3, 2)
+    # The same item ids, so a plan made before the update still points at the right items.
+    assert [item.id for item in parse(after).items[:3]] == [item.id for item in parse(before).items]
+
+
+async def test_switching_between_cli_and_ide_is_the_same_conversation(store: Store) -> None:
+    a = await see(store, claude_code_request("u1", "a1", "u2"))
+    b = await see(store, claude_code_request("u1", "a1", "u2", "a2", "u3", entrypoint="claude-vscode"))
+
+    assert b.session_id == a.session_id and not b.new_session
+
+
+async def test_only_a_leading_header_line_is_ignored(store: Store) -> None:
+    """The header elsewhere in the prompt, or a change to the rest of it, still counts."""
+    a = await see(store, claude_code_request("hi"))
+    moved = claude_code_request("hi")
+    moved["system"][1]["text"] = "You are Claude Code.\nx-anthropic-billing-header: cc_version=9;"
+    b = await see(store, moved)
+    changed = claude_code_request("hi")
+    changed["system"][1]["text"] = "You are a pirate."
+    c = await see(store, changed)
+
+    assert len({a.session_id, b.session_id, c.session_id}) == 3
+
+
+async def test_lines_after_the_header_in_the_same_block_still_count(store: Store) -> None:
+    def with_block(rest: str) -> dict[str, Any]:
+        body = claude_code_request("hi")
+        body["system"][0]["text"] += "\n" + rest
+        return body
+
+    a = await see(store, with_block("Be brief."))
+    b = await see(store, with_block("Be verbose."))
+
+    assert b.session_id != a.session_id

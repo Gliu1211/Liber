@@ -19,7 +19,9 @@ new. Conversations form a tree:
 
 Canonicalization makes the hash ignore things that don't change the conversation: JSON key
 order and spacing, `cache_control` markers (Claude Code moves its marker to the newest message
-every turn), and the string-vs-block spelling of the same text.
+every turn), the string-vs-block spelling of the same text, and the client's billing-header
+line at the top of the system prompt (it carries Claude Code's version, so every update would
+otherwise start a new conversation: ADR 0018).
 """
 
 import asyncio
@@ -104,9 +106,35 @@ def as_blocks(content: Any) -> list[Any]:
     return []
 
 
+# Claude Code opens its system prompt with this line, e.g.
+#   x-anthropic-billing-header: cc_version=2.1.325.157; cc_entrypoint=cli; ...
+# It describes the client, not the conversation, and its version changes whenever Claude Code
+# updates (ADR 0018).
+CLIENT_HEADER_PREFIX = "x-anthropic-billing-header:"
+
+
+def without_client_header(block: Any) -> Any:
+    """A system block without the client's billing-header line, for h_0 only.
+
+    Only a text block whose text starts with the header loses it, and only its first line. The
+    request itself is forwarded untouched; this changes what Liber hashes, nothing else.
+    """
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return block
+    text = block.get("text")
+    if not isinstance(text, str) or not text.startswith(CLIENT_HEADER_PREFIX):
+        return block
+    _, _, rest = text.partition("\n")
+    return {**block, "text": rest}
+
+
 def root_hash(system: Any, tools: Any) -> str:
-    """h_0: the system prompt and tool definitions a conversation starts from."""
-    system_blocks = [without_cache_control(block) for block in as_blocks(system)]
+    """h_0: the system prompt and tool definitions a conversation starts from.
+
+    Without the client's billing-header line (without_client_header): a resumed chat whose
+    client updated in between is still the same conversation, with the same item ids.
+    """
+    system_blocks = [without_cache_control(without_client_header(block)) for block in as_blocks(system)]
     tool_definitions = [without_cache_control(tool) for tool in tools] if isinstance(tools, list) else []
     return sha256_hex(canonical_json({"system": system_blocks, "tools": tool_definitions}))
 

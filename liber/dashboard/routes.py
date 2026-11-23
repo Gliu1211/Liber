@@ -37,7 +37,7 @@ from liber.config import Settings
 from liber.dashboard import views
 from liber.plan import commands, versions
 from liber.plan.versions import PlanError
-from liber.session.store import BranchRecord, RequestRecord, Store
+from liber.session.store import BranchRecord, ChainNode, RequestRecord, Store
 
 HERE = Path(__file__).parent
 LOOPBACK_NAMES = {"127.0.0.1", "localhost", "[::1]"}
@@ -86,9 +86,18 @@ async def index(request: Request) -> Response:
     store = store_of(request)
     sessions = list(reversed(await store.list_sessions()))  # newest first
     branches = await store.run(lambda db: list(db.scalars(select(BranchRecord).order_by(BranchRecord.created_at))))
+    nodes = await store.run(
+        lambda db: [
+            views.NodeFacts(row.hash, row.parent_hash, row.created_at)
+            for row in db.execute(select(ChainNode.hash, ChainNode.parent_hash, ChainNode.created_at))
+        ]
+    )
+    side = views.side_branches(branches, nodes)
     by_session: dict[str, list[BranchRecord]] = {}
+    side_by_session: dict[str, list[BranchRecord]] = {}
     for branch in branches:
-        by_session.setdefault(branch.session_id, []).append(branch)
+        listing = side_by_session if branch.id in side else by_session
+        listing.setdefault(branch.session_id, []).append(branch)
     states = {session.id: await versions.load_state(store, session.id) for session in sessions}
     return page(
         request,
@@ -96,6 +105,7 @@ async def index(request: Request) -> Response:
         {
             "sessions": sessions,
             "branches": by_session,
+            "side_branches": side_by_session,
             "states": states,
             "worker_on": request.app.state.worker is not None,
         },

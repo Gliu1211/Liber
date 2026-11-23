@@ -9,6 +9,7 @@ tested on their own. Nothing here changes anything: actions go through plan/comm
   completed exchange (ADR 0013); the turn in progress has none yet.
 - `summary_ends`: the messages a new summary can end at (§5 boundaries), for the summarize form.
 - `usage_chart`: input tokens, cache reads and cache writes per request, as SVG polylines.
+- `side_branches`: branches whose last message was replaced, folded away in the session list.
 """
 
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from datetime import datetime
 from liber.model.items import Plan
 from liber.plan import commands, cost
 from liber.plan.commands import SessionView
-from liber.session.store import RequestRecord
+from liber.session.store import BranchRecord, RequestRecord
 
 NOT_SUMMARIZED = "not summarized yet"
 CURRENT_TURN = "current turn"
@@ -193,3 +194,37 @@ def plan_lines(view: SessionView) -> list[tuple[int, int, list[str]]]:
             described = [commands.describe_operation(op) for op in version.plan.operations]
             versions.append((version.number, version.parent, described))
     return versions
+
+
+@dataclass(frozen=True)
+class NodeFacts:
+    """What side_branches needs from a stored message (session/store.ChainNode)."""
+
+    hash: str
+    parent_hash: str
+    created_at: datetime
+
+
+def side_branches(branches: list[BranchRecord], nodes: list[NodeFacts]) -> set[str]:
+    """Ids of branches that end in a message that was later replaced.
+
+    Such a branch's newest message has no continuation, and a later message was sent in its
+    place (same parent). In Claude Code that is mostly its "welcome back" recap: when you return
+    after a break, it sends your conversation plus a recap prompt as a side request, and your
+    next real message forks again at the same point. A one-message rewind looks the same, and is
+    equally finished. A branch that diverged further back is a real alternative and stays listed.
+    """
+    has_child = {node.parent_hash for node in nodes}
+    by_hash = {node.hash: node for node in nodes}
+    newest_child: dict[str, datetime] = {}
+    for node in nodes:
+        if node.parent_hash not in newest_child or node.created_at > newest_child[node.parent_hash]:
+            newest_child[node.parent_hash] = node.created_at
+    side = set()
+    for branch in branches:
+        head = by_hash.get(branch.head_hash)
+        if head is None or head.hash in has_child:
+            continue  # unknown, or continued
+        if newest_child[head.parent_hash] > head.created_at:
+            side.add(branch.id)  # a later message replaced this branch's last one
+    return side
