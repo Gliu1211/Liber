@@ -70,11 +70,16 @@ sqlite3 ~/.liber/liber.db \
 ### Editing a session's context
 
 While `liber serve` runs, the dashboard is at <http://127.0.0.1:8484/liber/>
-([ADR 0014](docs/decisions/0014-dashboard.md)). It lists sessions and their branches. For each
-session it shows:
+([ADR 0014](docs/decisions/0014-dashboard.md)). It lists sessions and their branches, with how
+much of the context window each one's latest request used, what's left, and about how much it
+would have used without Liber ([ADR 0019](docs/decisions/0019-context-meter.md)). For each session
+it shows:
+- a context meter like Claude Code's `/context`: a grid of the window, with the system prompt,
+  tools and thinking, messages, Liber's summaries, the space Liber freed, and the free space;
 - a topic map with token totals;
 - every item, with its tokens, topic and status;
-- a chart of input tokens, cache reads and cache writes per request.
+- a chart of input tokens, cache reads and cache writes per request, with a dot for what Liber
+  did with each one (sent with the plan, sent unchanged, or fell back).
 
 From there you can offload, delete or summarize into a pending plan version, see what applying
 it costs and saves, and apply or undo it. The dashboard answers only on `127.0.0.1` or

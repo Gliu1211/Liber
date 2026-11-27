@@ -209,7 +209,8 @@ A background asyncio task (same process in v1) that processes new items:
 - Session list (with branches), item table: role, kind, tokens, topic, status.
 - Topic map: items grouped by topic with token totals.
 - Select items/ranges → offload / summarize / delete → **pending plan** with cost/payback preview → Apply → undo via version history.
-- Per-session chart of input tokens, cache reads vs writes over time.
+- Per-session chart of input tokens, cache reads vs writes over time, with what Liber did with each request.
+- Context meter per session: how full the window was on the latest request as sent (the API's count), what's left, and about how much it would be without Liber ([ADR 0019](docs/decisions/0019-context-meter.md), Proposed).
 
 ---
 

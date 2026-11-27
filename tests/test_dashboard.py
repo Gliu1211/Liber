@@ -13,6 +13,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from liber.dashboard import views
 from liber.model.anthropic import parse
 from liber.plan import commands, versions
 from liber.session.store import Store
@@ -210,6 +211,69 @@ async def test_apply_and_undo(app: FastAPI, client: httpx.AsyncClient, upstream:
     assert "applied plan version: 1" in in_use.text and "summarized (v1)" in in_use.text
     assert "Going back to plan version 0" in undone.text
     assert after_undo.pending is not None and after_undo.pending.number == 0 and after_undo.apply_requested
+
+
+async def test_every_chat_shows_how_much_context_it_uses_and_without_liber(
+    app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream
+) -> None:
+    """docs/decisions/0019: the API's count of the latest request, the window left, and (once Liber
+    edits a request) about how much it would have been without Liber."""
+    session = await a_session(app, client, upstream)
+    before = await client.get("/liber/")
+    # The latest request: 40 + 1,100 + 300 = 1,440 tokens, sent unchanged; a 1M window.
+    assert "1.4k/1.0M tokens (0.1%)" in before.text and "998.6k left" in before.text
+    assert "without Liber" not in before.text
+
+    await client.post(f"/liber/sessions/{session}/plan", data={"action": "summarize", "through": "1"}, headers=HX)
+    await client.post(f"/liber/sessions/{session}/apply", headers=HX)
+
+    async def smaller(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=reply_with_usage(5, 900, 200))
+
+    upstream.handler = smaller
+    await client.post("/v1/messages", content=json.dumps(conversation()).encode())  # the next clean turn
+    [*_, last] = await recorded(app)
+    assert last.liber_outcome == "rendered"
+    listing = await client.get("/liber/")
+    page = await client.get(f"/liber/sessions/{session}")
+
+    view = await commands.session_view(app.state.store, session)
+    meter = views.context_meter(last, view.state.applied, views.counted_items(view))
+    assert meter is not None and meter.saved is not None and meter.saved > 0
+    line = f"without Liber ~{views.compact(meter.without_liber)}"
+    assert "1.1k/1.0M tokens" in listing.text and line in listing.text
+    assert line in page.text and "sent with plan version 1" in page.text
+    # The grid: 20 x 10 squares for a 1M window, and a legend line per part.
+    assert page.text.count('<span class="sq ') == 200 + page.text.count('<li><span class="sq ')
+    assert "System prompt, tools and thinking" in page.text and "Free space" in page.text
+    # One dot per request on the chart, for what Liber did with it.
+    assert re.findall(r'data-outcome="([^"]+)"', page.text) == ["passthrough", "passthrough", "rendered"]
+
+
+async def test_the_session_list_handles_failed_requests_and_unknown_models(
+    app: FastAPI, client: httpx.AsyncClient, upstream: FakeUpstream
+) -> None:
+    async def failing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"type": "error", "error": {"type": "api_error", "message": "down"}})
+
+    async def answering(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=reply_with_usage(10, 2_000, 0))
+
+    upstream.handler = failing
+    await client.post("/v1/messages", content=json.dumps(conversation(["A chat that failed"])).encode())
+    upstream.handler = answering
+    other = {**conversation(["A chat on another model"]), "model": "some-other-model"}
+    await client.post("/v1/messages", content=json.dumps(other).encode())
+    records = await recorded(app)
+    assert len(records) == 2 and all(r.session_id for r in records)  # two sessions, both identified
+
+    listing = await client.get("/liber/")
+
+    assert listing.status_code == 200
+    contexts = re.findall(r'<td class="context">(.*?)</td>', listing.text, re.S)
+    assert len(contexts) == 2
+    assert any("no usage yet" in c for c in contexts)  # its only request has no usage
+    assert any("2.0k tokens" in c and "window unknown for <code>some-other-model</code>" in c for c in contexts)
 
 
 async def test_every_action_goes_through_the_cli_plan_code(

@@ -1,0 +1,9 @@
+{# One line: how full the window was on the latest request, as sent and without Liber (ADR 0019). #}
+{% if not meter %}<span class="muted">no usage yet</span>
+{% elif meter.window %}
+<code>{{ meter.model }}</code> · {{ compact(meter.used) }}/{{ compact(meter.window) }} tokens ({{ percent(meter.used, meter.window) }}) · <strong>{{ compact(meter.left) }} left</strong>
+{% if meter.saved %} · without Liber ~{{ compact(meter.without_liber) }} ({{ percent(meter.without_liber, meter.window) }}){% elif meter.saved is none %} · <span class="muted">without Liber: not known (sent with an earlier plan version)</span>{% endif %}
+{% else %}
+{{ compact(meter.used) }} tokens · <span class="muted">window unknown for <code>{{ meter.model or "this model" }}</code></span>
+{% if meter.saved %} · without Liber ~{{ compact(meter.without_liber) }}{% elif meter.saved is none %} · <span class="muted">without Liber: not known (sent with an earlier plan version)</span>{% endif %}
+{% endif %}

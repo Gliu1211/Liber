@@ -25,6 +25,23 @@
   svg { width: 100%; height: auto; border-bottom: 1px solid var(--line); }
   .legend span { margin-right: 16px; }
   .scroll { overflow-x: auto; }
+  /* The context meter (ADR 0019): a grid of squares, as Claude Code's /context draws it. */
+  .meter-body { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+  .grid { display: grid; gap: 2px; width: max-content; margin: 8px 0; }
+  .grid.cols-10 { grid-template-columns: repeat(10, 12px); }
+  .grid.cols-20 { grid-template-columns: repeat(20, 12px); }
+  .sq { display: inline-block; width: 12px; height: 12px; border-radius: 2px; box-sizing: border-box; vertical-align: middle; }
+  .sq.rest { background: var(--muted); }
+  .sq.messages { background: var(--accent); }
+  .sq.summaries { background: var(--ok); }
+  .sq.freed { border: 2px dashed var(--ok); }
+  .sq.free { border: 1px solid var(--line); }
+  ul.parts { list-style: none; padding: 0; margin: 4px 0; }
+  ul.parts li { margin: 2px 0; }
+  .mark.rendered, .dot.rendered { fill: var(--ok); background: var(--ok); }
+  .mark.passthrough, .mark.unknown, .dot.passthrough { fill: var(--muted); background: var(--muted); }
+  .mark.fallback, .dot.fallback { fill: var(--bad); background: var(--bad); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
 </style>
 </head>
 <body>

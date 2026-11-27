@@ -71,14 +71,20 @@ def at_clean_turn_boundary(messages: list[Any]) -> bool:
     return messages[-1].get("role") == "user" and not tool_results_in(messages[-1])
 
 
-def context_share(model: Any, estimated_tokens: int) -> float | None:
-    """The estimated share of the model's context window the request fills; None if unknown."""
+def context_window(model: Any) -> int | None:
+    """The model's context window in tokens, from CONTEXT_WINDOWS; None if it isn't listed."""
     if not isinstance(model, str):
         return None
     for prefix, window in CONTEXT_WINDOWS:
         if model.startswith(prefix):
-            return round(estimated_tokens / window, 4)
+            return window
     return None
+
+
+def context_share(model: Any, estimated_tokens: int) -> float | None:
+    """The estimated share of the model's context window the request fills; None if unknown."""
+    window = context_window(model)
+    return round(estimated_tokens / window, 4) if window is not None else None
 
 
 def pending_takes_effect(
