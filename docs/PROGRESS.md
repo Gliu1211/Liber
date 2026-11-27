@@ -407,3 +407,46 @@ Template:
 - make check: pass (491 tests; Tier 1 unchanged, eval gate passed)
 - Open issues: sessions stored before this change hashed the header, so each existing chat starts a new session once on its next request (owner's test data only). `chain_nodes.parent_hash` has no index, so the dashboard's child query scans the table; fine at local scale, worth an index if the dashboard slows.
 - Next step: owner decides ADR 0018, and keeps dogfooding.
+
+## 2026-11-27 — Context meter in the dashboard (ADR 0019, Proposed)
+- Asked by the owner: every chat should show how much context is left, after Liber's reduction too, the way Claude Code shows it.
+- Done:
+  - **Session list:** each chat's latest request, e.g. `claude-opus-5-5 · 69.3k/1.0M tokens (6.9%) · 930.7k left · without Liber ~100.3k (10.0%)`.
+    - Used is the API's count (uncached + cache reads + writes), so it's exact.
+    - Without Liber adds the estimated saving: message tokens without the applied plan minus with it, thinking on neither side, as in the §6 preview.
+  - **Session page:** the same line, plus a `/context`-style grid (10 × 10 for 200k, 20 × 10 for 1M) and legend. The parts are:
+    - "System prompt, tools and thinking": the rest of the API's count;
+    - messages (~);
+    - Liber's summaries (~);
+    - freed by Liber (~, outlined squares at the start of the free space);
+    - free space.
+  - **Usage chart:** a dot per request for what Liber did (sent with the plan, sent unchanged, fell back), so checking a plan took effect needs no database query.
+  - `policy.context_window`, shared with `context_share`.
+- Decisions (ADR 0019, Proposed):
+  - The saving and the breakdown are worked out only for a request sent with the applied version. After an undo, only the totals are shown, and the page says the saving isn't known.
+  - A plan that grew the messages shows no saving.
+  - The session list loads a session's items only when its latest request was edited with the applied version.
+- Tests:
+  - views:
+    - sent unchanged, edited, sent with another version or with none, a grown plan, a fallback;
+    - an unknown model (no grid), a 200k window with overflow cut, compact numbers;
+    - the chart's dots.
+  - routes:
+    - the list and the page before and after a summary takes effect, with the grid's 200 squares and one dot per request;
+    - a session whose only request failed ("no usage yet");
+    - a model without a known window.
+- Review: independent reviewer run.
+  - Must-fix: after an undo, the breakdown was drawn from the applied plan, not the one the request was sent with. Now only the totals are shown.
+  - Should-fix, all done:
+    - a negative saving is clamped to none;
+    - the session list skips loading items it can't use, and survives a session without stored items;
+    - the unknown-window line also says when the saving isn't known;
+    - the tests above.
+  - Nits done: a theme colour for the grey squares; the dots' docstring.
+- make check: pass (501 tests; Tier 1 unchanged, eval gate passed)
+- Open issues / proposed follow-ups (owner to decide):
+  - `CONTEXT_WINDOWS` lists Opus and Sonnet at 1M. A client running them at 200k shows "left" too high, and for those models the 10 × 10 grid never appears. A per-session or configured window may be wanted.
+  - The grey part lumps the system prompt, tools and thinking together. Splitting it, as `/context` does, would need estimates from the recorded body.
+  - A "without Liber" line for every past request on the chart would need the message estimate as sent, recorded on the request path.
+  - Claude Code's own meter may count the client's full conversation rather than what Liber sent. Not checked.
+- Next step: owner reviews ADR 0019 and tries the meter on a live session.

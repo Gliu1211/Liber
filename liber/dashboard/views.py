@@ -8,16 +8,21 @@ tested on their own. Nothing here changes anything: actions go through plan/comm
 - `topic_map`: items grouped by topic with token totals. Topics are the worker's, one per
   completed exchange (ADR 0013); the turn in progress has none yet.
 - `summary_ends`: the messages a new summary can end at (§5 boundaries), for the summarize form.
-- `usage_chart`: input tokens, cache reads and cache writes per request, as SVG polylines.
+- `usage_chart`: input tokens, cache reads and cache writes per request, as SVG polylines, with
+  a mark per request for what Liber did with it.
+- `context_meter`: how much of the model's context window the latest request filled, as Liber
+  sent it, and about how much it would have filled without Liber (docs/decisions/0019).
 - `side_branches`: branches whose last message was replaced, folded away in the session list.
 """
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from liber.model.items import Plan
-from liber.plan import commands, cost
+from liber.plan import commands, cost, policy
 from liber.plan.commands import SessionView
+from liber.plan.versions import PlanVersion
 from liber.session.store import BranchRecord, RequestRecord
 
 NOT_SUMMARIZED = "not summarized yet"
@@ -135,6 +140,15 @@ def summary_ends(view: SessionView) -> list[tuple[int, str]]:
 
 
 @dataclass(frozen=True)
+class Mark:
+    """What Liber did with one request: a dot at the bottom of the chart, at its x position."""
+
+    x: float
+    outcome: str  # "rendered", "passthrough", "fallback" or "unknown" (recorded before Liber said)
+    title: str  # shown on hover
+
+
+@dataclass(frozen=True)
 class Chart:
     width: int
     height: int
@@ -143,6 +157,7 @@ class Chart:
     requests: int
     first: datetime | None
     last: datetime | None
+    marks: tuple[Mark, ...] = ()
 
 
 CHART_SERIES = (
@@ -168,6 +183,10 @@ def usage_chart(requests: list[RequestRecord], width: int = 640, height: int = 1
         if len(coordinates) == 1:  # one request: a flat line across, since one point draws nothing
             coordinates.append((width, coordinates[0][1]))
         series.append((name, " ".join(f"{x:.1f},{y:.1f}" for x, y in coordinates)))
+    marks = tuple(
+        Mark(index * step, r.liber_outcome or "unknown", f"{r.created_at:%H:%M:%S}: {r.liber_outcome or 'unknown'}")
+        for index, r in enumerate(with_usage)
+    )
     return Chart(
         width,
         height,
@@ -176,7 +195,150 @@ def usage_chart(requests: list[RequestRecord], width: int = 640, height: int = 1
         len(with_usage),
         with_usage[0].created_at if with_usage else None,
         with_usage[-1].created_at if with_usage else None,
+        marks,
     )
+
+
+# --- How much of the context window is used (docs/decisions/0019) ------------------------------
+
+# Squares in the meter's grid, as Claude Code's /context draws them: 10 x 10 for a 200k window,
+# 20 x 10 for a 1M one. Each square is a fixed share of the window.
+SMALL_GRID = (10, 100)  # (columns, squares)
+LARGE_GRID = (20, 200)
+LARGE_WINDOW = 500_000  # windows at least this big get the large grid
+
+
+@dataclass(frozen=True)
+class MeterPart:
+    """One line of the meter's legend, and the squares it fills."""
+
+    name: str
+    css: str  # the class that colours its squares
+    tokens: int
+    estimate: bool  # from Liber's estimates, not the API's count
+
+
+@dataclass(frozen=True)
+class ContextMeter:
+    model: str | None
+    window: int | None  # None: the model isn't in policy.CONTEXT_WINDOWS
+    used: int  # exact: the latest request's input as the API counted it (uncached + cache reads + writes)
+    outcome: str | None  # what Liber did with that request
+    saved: int | None  # estimated message tokens Liber left out of it; 0: sent as is; None: unknown
+    plan_version: int | None = None  # the version it was sent with
+    parts: tuple[MeterPart, ...] = ()  # the legend, in grid order; empty when not broken down
+    squares: tuple[str, ...] = ()  # each square's class, in order
+    columns: int = 0
+
+    @property
+    def left(self) -> int | None:
+        return max(self.window - self.used, 0) if self.window is not None else None
+
+    @property
+    def without_liber(self) -> int | None:
+        return self.used + self.saved if self.saved is not None else None
+
+
+def input_tokens(record: RequestRecord) -> int:
+    """All of a request's input, as the API counted it: uncached, read from the cache, written to it."""
+    return (
+        (record.input_tokens or 0) + (record.cache_read_input_tokens or 0) + (record.cache_creation_input_tokens or 0)
+    )
+
+
+def latest_with_usage(requests: Sequence[RequestRecord]) -> RequestRecord | None:
+    """The newest request the API reported usage for (a failed one has none)."""
+    return next((r for r in reversed(requests) if r.input_tokens is not None), None)
+
+
+def context_meter(
+    latest: RequestRecord | None,
+    applied: PlanVersion,
+    items: Sequence[cost.ItemFacts] | None = None,
+) -> ContextMeter | None:
+    """How full the context window was on the latest request, as Liber sent it, and without Liber.
+
+    `items`: the session's items (exact counts where the worker has them). Without them, only the
+    totals: the session list leaves out the breakdown, and the saving for requests Liber edited.
+
+    - Used is the API's count, so it is exact, whatever Liber did.
+    - The saving is an estimate: the message tokens the applied plan takes out, as in a plan's
+      preview (plan/cost.py). Thinking isn't counted on either side, so stale thinking Liber left
+      out isn't in it: the real saving is at least this. A plan that grew the messages (§6 refuses
+      those when they're made) shows no saving. A request sent unchanged saved nothing.
+    - The saving and the breakdown are only worked out for a request sent with the applied
+      version: after an undo, the plan it was sent with isn't the one at hand, so only the totals.
+    - The breakdown estimates the messages as sent (kept items, then Liber's summaries and pointer
+      notes). The rest of the API's count is the system prompt, the tools and the thinking, which
+      Liber doesn't estimate apart.
+    """
+    if latest is None:
+        return None
+    used = input_tokens(latest)
+    window = policy.context_window(latest.model)
+    outcome = latest.liber_outcome
+    thinking = {item.id for item in items or () if item.kind == "thinking"}
+    edited = outcome == "rendered"
+    # Sent unchanged (a fallback too: its messages are the client's), or with the applied version.
+    known = not edited or latest.plan_version == applied.number
+    sent_plan = applied.plan if edited else Plan()
+    saved: int | None
+    if not edited:
+        saved = 0
+    elif items is None or not known:
+        saved = None  # sent with another version (an undo since), or not worked out here
+    else:
+        without = cost.rendered_tokens(list(items), Plan(), thinking)
+        saved = max(without - cost.rendered_tokens(list(items), sent_plan, thinking), 0)
+    meter = ContextMeter(latest.model, window, used, outcome, saved, latest.plan_version)
+    if window is None or items is None or not known:
+        return meter
+    summaries = cost.frozen_tokens(sent_plan)
+    messages = cost.rendered_tokens(list(items), sent_plan, thinking) - summaries
+    parts = [
+        MeterPart("System prompt, tools and thinking", "rest", max(used - messages - summaries, 0), False),
+        MeterPart("Messages", "messages", messages, True),
+        MeterPart("Liber's summaries", "summaries", summaries, True),
+        # Part of the free space: drawn before the rest of it, so the grid shows how much Liber made.
+        MeterPart("Freed by Liber (part of the free space)", "freed", max(saved or 0, 0), True),
+        MeterPart("Free space", "free", max(window - used, 0), False),
+    ]
+    columns, count = LARGE_GRID if window >= LARGE_WINDOW else SMALL_GRID
+    return replace(meter, parts=tuple(parts), squares=grid(parts, window, count), columns=columns)
+
+
+def grid(parts: Sequence[MeterPart], window: int, count: int) -> tuple[str, ...]:
+    """Each square's class: the parts in order, each up to where its running total reaches.
+
+    Rounding the running total (not each part) keeps the squares adding up to the grid; a part
+    smaller than half a square gets none, as in Claude Code's grid. Anything past the window is
+    cut: the freed space is also counted in the free space, which comes last.
+    """
+    squares: list[str] = []
+    running = 0
+    for part in parts:
+        running += part.tokens
+        end = min(round(running / window * count), count)
+        squares += [part.css] * max(end - len(squares), 0)
+    squares += ["free"] * (count - len(squares))
+    return tuple(squares)
+
+
+def compact(tokens: int | None) -> str:
+    """Token counts as Claude Code shows them: 950, 69.3k, 1.0M."""
+    if tokens is None:
+        return "?"
+    if abs(tokens) < 1_000:
+        return str(tokens)
+    if abs(tokens) < 1_000_000:
+        return f"{tokens / 1_000:.1f}k"
+    return f"{tokens / 1_000_000:.1f}M"
+
+
+def percent(tokens: int | None, window: int | None) -> str:
+    if tokens is None or not window:
+        return ""
+    return f"{tokens / window:.1%}"
 
 
 def estimate_lines(view: SessionView) -> list[str]:

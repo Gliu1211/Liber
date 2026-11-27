@@ -4,6 +4,9 @@ from datetime import UTC, datetime
 
 from liber.dashboard import views
 from liber.dashboard.views import usage_chart
+from liber.model.items import Operation, OperationKind, Plan
+from liber.plan.cost import CountedItem
+from liber.plan.versions import EMPTY, PlanVersion
 from liber.session.store import BranchRecord, RequestRecord
 
 
@@ -118,3 +121,125 @@ def test_ties_and_unknown_heads_fold_nothing() -> None:
 
     assert views.side_branches([branch("x", "x", 1), branch("y", "y", 1)], tie) == set()
     assert views.side_branches([branch("gone", "missing", 1)], tie) == set()
+
+
+# --- The context meter (docs/decisions/0019) ----------------------------------------------------
+
+
+def latest(
+    model: str = "claude-opus-5-5",
+    outcome: str | None = "passthrough",
+    plan_version: int | None = None,
+    usage: tuple[int, int, int] = (4, 69_271, 26),
+) -> RequestRecord:
+    uncached, read, written = usage
+    return RequestRecord(
+        model=model,
+        liber_outcome=outcome,
+        plan_version=plan_version,
+        input_tokens=uncached,
+        cache_read_input_tokens=read,
+        cache_creation_input_tokens=written,
+        created_at=datetime(2026, 11, 19, tzinfo=UTC),
+    )
+
+
+ITEMS = [
+    CountedItem("a", "text", 0, 20_000),
+    CountedItem("b", "tool_result", 1, 12_000),
+    CountedItem("t", "thinking", 1, 5_000),  # never counted: the estimate includes its signature
+    CountedItem("c", "text", 2, 8_000),
+]
+SUMMARY = "s" * 4_000  # 1,000 tokens by the frozen-block estimate
+SUMMARIZED = PlanVersion(
+    1, Plan(operations=(Operation(kind=OperationKind.SUMMARIZE, item_ids=("a", "b", "t"), summary=SUMMARY),))
+)
+
+
+def test_a_request_sent_unchanged_uses_the_apis_count_and_saved_nothing() -> None:
+    meter = views.context_meter(latest(usage=(2, 99_995, 81)), EMPTY, ITEMS)
+
+    assert meter is not None
+    assert meter.used == 100_078 and meter.window == 1_000_000 and meter.left == 899_922
+    assert meter.saved == 0 and meter.without_liber == 100_078
+    parts = {part.css: part.tokens for part in meter.parts}
+    assert parts["messages"] == 40_000 and parts["summaries"] == 0 and parts["freed"] == 0
+    assert parts["rest"] == 100_078 - 40_000  # system prompt, tools and thinking: the rest of the count
+    assert parts["free"] == 899_922
+    # 1M window: 20 x 10 squares, each 0.5% of the window; 10% used is 20 squares.
+    assert meter.columns == 20 and len(meter.squares) == 200
+    assert meter.squares.count("free") == 180
+
+
+def test_a_request_liber_edited_shows_what_it_freed() -> None:
+    meter = views.context_meter(latest(outcome="rendered", plan_version=1), SUMMARIZED, ITEMS)
+
+    assert meter is not None and meter.used == 69_301
+    # a and b (32,000) summarized into 1,000 tokens; thinking isn't counted on either side.
+    assert meter.saved == 31_000 and meter.without_liber == 100_301
+    parts = {part.css: part.tokens for part in meter.parts}
+    assert parts["messages"] == 8_000 and parts["summaries"] == 1_000 and parts["freed"] == 31_000
+    assert parts["rest"] == 69_301 - 9_000
+    assert parts["free"] == 1_000_000 - 69_301 == meter.left  # the freed space is part of it
+    # In order: the rest, messages, summaries, freed, free; the running totals set the boundaries.
+    assert [square for square in meter.squares if square != "free"] == (
+        ["rest"] * 12 + ["messages"] * 2 + ["freed"] * 6
+    )  # 60.3k -> 12, 68.3k -> 14, 69.3k -> 14 (no square for 1k), 100.3k -> 20
+    assert len(meter.squares) == 200
+
+
+def test_the_saving_is_unknown_when_sent_with_another_version_or_without_items() -> None:
+    undone = views.context_meter(latest(outcome="rendered", plan_version=1), EMPTY, ITEMS)
+    no_items = views.context_meter(latest(outcome="rendered", plan_version=1), SUMMARIZED)
+
+    assert undone is not None and undone.saved is None and undone.without_liber is None
+    assert no_items is not None and no_items.saved is None and no_items.parts == () and no_items.squares == ()
+    assert no_items.left == 1_000_000 - 69_301  # the totals don't need the items
+    # After an undo the plan at hand isn't the one it was sent with: no breakdown from the wrong plan.
+    assert undone.parts == () and undone.squares == ()
+    no_version = views.context_meter(latest(outcome="rendered", plan_version=None), SUMMARIZED, ITEMS)
+    assert no_version is not None and no_version.saved is None and no_version.parts == ()
+
+
+def test_a_plan_that_grew_the_messages_shows_no_saving() -> None:
+    longer = PlanVersion(
+        1, Plan(operations=(Operation(kind=OperationKind.SUMMARIZE, item_ids=("c",), summary="s" * 40_000),))
+    )
+    meter = views.context_meter(latest(outcome="rendered", plan_version=1), longer, ITEMS)
+
+    assert meter is not None and meter.saved == 0 and meter.without_liber == meter.used
+
+
+def test_a_fallback_saved_nothing_and_a_model_without_a_known_window_has_no_grid() -> None:
+    fallback = views.context_meter(latest(outcome="fallback", plan_version=1), SUMMARIZED, ITEMS)
+    unknown = views.context_meter(latest(model="some-other-model"), EMPTY, ITEMS)
+
+    assert fallback is not None and fallback.saved == 0
+    assert unknown is not None and unknown.window is None and unknown.left is None and unknown.squares == ()
+    assert unknown.used == 69_301
+    assert views.context_meter(None, EMPTY, ITEMS) is None
+
+
+def test_a_200k_window_gets_ten_by_ten_squares_and_overflow_is_cut() -> None:
+    meter = views.context_meter(latest(model="claude-haiku-4-5", usage=(0, 250_000, 0)), EMPTY, ITEMS)
+
+    assert meter is not None and meter.columns == 10 and len(meter.squares) == 100
+    assert "free" not in meter.squares and meter.left == 0
+
+
+def test_the_latest_request_with_usage_and_the_compact_numbers() -> None:
+    first, failed = request(10), request(None)
+    assert views.latest_with_usage([first, failed]) is first
+    assert views.latest_with_usage([failed]) is None
+    assert [views.compact(n) for n in (950, 69_301, 1_000_000, None)] == ["950", "69.3k", "1.0M", "?"]
+    assert views.percent(69_301, 1_000_000) == "6.9%" and views.percent(5, None) == ""
+
+
+def test_each_request_gets_a_mark_for_what_liber_did() -> None:
+    records = [request(10), request(None), request(20)]
+    records[0].liber_outcome, records[2].liber_outcome = "passthrough", "rendered"
+
+    chart = usage_chart(records, width=100)
+
+    assert [(mark.x, mark.outcome) for mark in chart.marks] == [(0.0, "passthrough"), (100.0, "rendered")]
+    assert usage_chart([request(5)]).marks[0].outcome == "unknown"  # recorded before Liber said

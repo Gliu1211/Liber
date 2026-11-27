@@ -4,6 +4,24 @@
 {% if message %}<p class="message">{{ message }}</p>{% endif %}
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
+<h2>Context window</h2>
+<div class="panel meter">
+  <p>{% include "_context_line.html" %}</p>
+  {% if meter and meter.squares %}
+  <div class="meter-body">
+  <div class="grid cols-{{ meter.columns }}" role="img" aria-label="context window: {{ meter.parts | map(attribute='name') | join(', ') }}">{% for square in meter.squares %}<span class="sq {{ square }}"></span>{% endfor %}</div>
+  <ul class="parts">
+    {% for part in meter.parts %}{% if part.tokens or part.css in ("messages", "free") %}
+    <li><span class="sq {{ part.css }}"></span> {{ part.name }}: {{ "~" if part.estimate }}{{ compact(part.tokens) }} tokens ({{ percent(part.tokens, meter.window) }})</li>
+    {% endif %}{% endfor %}
+  </ul>
+  </div>
+  {% endif %}
+  {% if meter %}
+  <p class="muted">The latest request, which Liber {{ {"rendered": "sent with plan version " ~ meter.plan_version, "passthrough": "sent unchanged", "fallback": "sent unchanged (it fell back)"}.get(meter.outcome, "recorded") }}. Used is the API's count; <code>~</code> marks Liber's estimates, which leave thinking out, so the saving is at least what's shown. Claude Code also keeps a reserve before it compacts on its own (its autocompact buffer), not shown here.</p>
+  {% endif %}
+</div>
+
 <div class="panel">
   <p>applied plan version: {{ view.state.applied.number }}
   {% if view.state.pending %}
@@ -79,11 +97,15 @@
   {% for name, points in chart.series %}
   <polyline data-series="{{ name }}" points="{{ points }}" fill="none" stroke="{{ colors[name] }}" stroke-width="2"/>
   {% endfor %}
+  {% for mark in chart.marks %}
+  <circle class="mark {{ mark.outcome }}" data-outcome="{{ mark.outcome }}" cx="{{ '%.1f' % mark.x }}" cy="{{ chart.height - 4 }}" r="3"><title>{{ mark.title }}</title></circle>
+  {% endfor %}
 </svg>
 <p class="legend muted">
   <span style="color:#d1495b">■ uncached input</span><span style="color:#2457c5">■ cache reads</span><span style="color:#e0a800">■ cache writes</span>
   {{ chart.requests }} request{{ '' if chart.requests == 1 else 's' }} · top of chart {{ "{:,}".format(chart.largest) }} tokens
 </p>
+<p class="legend muted">Dots, what Liber did: <span><span class="dot rendered"></span> sent with the plan</span><span><span class="dot passthrough"></span> sent unchanged</span><span><span class="dot fallback"></span> fell back</span></p>
 {% else %}
 <p class="muted">No recorded usage yet.</p>
 {% endif %}

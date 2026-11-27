@@ -1,7 +1,7 @@
 """The dashboard's pages and actions, served by the proxy's own app under /liber/ (ARCHITECTURE.md §10, D11).
 
-    GET  /liber/                              sessions, with their branches
-    GET  /liber/sessions/{id}                 one session: plan, topic map, items, usage chart
+    GET  /liber/                              sessions, with their branches and context used
+    GET  /liber/sessions/{id}                 one session: context meter, plan, topic map, items, usage chart
     POST /liber/sessions/{id}/plan            offload / summarize / delete -> a pending version
     POST /liber/sessions/{id}/apply           apply the pending version at the next clean turn
     POST /liber/sessions/{id}/undo            go back one version, at the next clean turn
@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from liber.config import Settings
@@ -95,6 +95,20 @@ async def index(request: Request) -> Response:
         listing = side_by_session if branch.id in side else by_session
         listing.setdefault(branch.session_id, []).append(branch)
     states = {session.id: await versions.load_state(store, session.id) for session in sessions}
+    latest = await store.run(latest_requests)
+    meters = {}
+    for session in sessions:
+        record = latest.get(session.id)
+        applied = states[session.id].applied
+        items = None
+        # Only a request Liber edited with the applied version needs the items, for its saving.
+        if record is not None and record.liber_outcome == "rendered" and record.plan_version == applied.number:
+            try:
+                view = await commands.session_view(store, session.id, summary_model=settings_of(request).summary_model)
+                items = views.counted_items(view)
+            except PlanError:  # no items stored for it: the line shows the totals only
+                items = None
+        meters[session.id] = views.context_meter(record, applied, items)
     return page(
         request,
         "index.html",
@@ -103,9 +117,23 @@ async def index(request: Request) -> Response:
             "branches": by_session,
             "side_branches": side_by_session,
             "states": states,
+            "meters": meters,
+            "compact": views.compact,
+            "percent": views.percent,
             "worker_on": request.app.state.worker is not None,
         },
     )
+
+
+def latest_requests(db: Session) -> dict[str, RequestRecord]:
+    """Each session's newest request with usage, in one query."""
+    newest = (
+        select(func.max(RequestRecord.id))
+        .where(RequestRecord.session_id.is_not(None), RequestRecord.input_tokens.is_not(None))
+        .group_by(RequestRecord.session_id)
+    )
+    records = db.scalars(select(RequestRecord).where(RequestRecord.id.in_(newest)))
+    return {record.session_id: record for record in records if record.session_id is not None}
 
 
 def branch_head_nodes(db: Session, heads: list[str]) -> list[views.NodeFacts]:
@@ -234,6 +262,9 @@ async def render_session(
         "estimate": views.estimate_lines(view),
         "versions": views.plan_lines(view),
         "chart": views.usage_chart(requests),
+        "meter": views.context_meter(views.latest_with_usage(requests), view.state.applied, views.counted_items(view)),
+        "compact": views.compact,
+        "percent": views.percent,
         "message": message,
         "error": error,
         "worker_on": request.app.state.worker is not None,

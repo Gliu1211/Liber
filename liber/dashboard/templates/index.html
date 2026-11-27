@@ -9,13 +9,14 @@
 {% else %}
 <div class="scroll">
 <table>
-<thead><tr><th>Session</th><th>Started</th><th class="num">Applied</th><th class="num">Pending</th><th>Branches</th></tr></thead>
+<thead><tr><th>Session</th><th>Started</th><th>Context (latest request)</th><th class="num">Applied</th><th class="num">Pending</th><th>Branches</th></tr></thead>
 <tbody>
 {% for session in sessions %}
 {% set state = states[session.id] %}
 <tr>
   <td><a class="id" href="/liber/sessions/{{ session.id }}">{{ session.id[:16] }}</a></td>
   <td>{{ session.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+  <td class="context">{% set meter = meters[session.id] %}{% include "_context_line.html" %}</td>
   <td class="num">{{ state.applied.number }}</td>
   <td class="num">{% if state.pending %}{{ state.pending.number }}{% if state.apply_requested %} (requested){% endif %}{% else %}–{% endif %}</td>
   <td>
